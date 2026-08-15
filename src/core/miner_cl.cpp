@@ -1,7 +1,8 @@
-// SOAT Miner - CUDA build entry point (NVIDIA).
+// SOAT Miner - OpenCL build entry point (AMD, Intel, NVIDIA).
 //
-// All the logic lives in run.cpp; this only picks the algorithm, reports the
-// device, and hands over.
+// Same run loop as the CUDA build; only the Algorithm differs. This is the
+// portable binary: OpenCL compiles its kernels at runtime, so one build runs
+// on any vendor's GPU without a per-vendor toolchain.
 
 #include <signal.h>
 
@@ -11,6 +12,13 @@
 #include <string>
 
 #include "run.h"
+
+namespace om {
+Algorithm *makeAutolykos2CL();
+const char *clDeviceName();
+double clDeviceMemGB();
+const char *clDriverVersion();
+}  // namespace om
 
 static volatile sig_atomic_t g_stop = 0;
 static void onSignal(int) { g_stop = 1; }
@@ -28,17 +36,15 @@ static BOOL WINAPI consoleHandler(DWORD type) {
 int main(int argc, char **argv) {
     using namespace om;
 
-    std::string algoName = "autolykos2";
     RunOptions opt;
-    opt.backendLabel = "CUDA";
+    opt.backendLabel = "OpenCL";
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
             return (i + 1 < argc) ? argv[++i] : std::string();
         };
-        if (a == "--algo") algoName = next();
-                else if (a == "--pool") {
+        if (a == "--pool") {
             std::string v = next();
             const size_t c = v.rfind(':');
             if (c != std::string::npos) {
@@ -59,14 +65,11 @@ int main(int argc, char **argv) {
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--plain") opt.plain = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
-        else if (a == "--list-algos") {
-            for (const auto &n : availableAlgorithms()) printf("%s\n", n.c_str());
-            return 0;
-        } else if (a == "--help" || a == "-h") {
+        else if (a == "--algo") { /* only autolykos2 for now */ (void)next(); }
+        else if (a == "--list-algos") { printf("autolykos2\n"); return 0; }
+        else if (a == "--help" || a == "-h") {
             printf(
-                "SOAT Miner (CUDA) - open-source GPU miner\n\n"
-                "  --algo NAME       algorithm (default autolykos2)\n"
-                "  --list-algos      list compiled-in algorithms\n"
+                "SOAT Miner (OpenCL) - open-source GPU miner\n\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
@@ -95,22 +98,15 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 #endif
 
-    std::unique_ptr<Algorithm> algo(createAlgorithm(algoName));
+    std::unique_ptr<Algorithm> algo(makeAutolykos2CL());
     if (!algo) {
-        fprintf(stderr, "unknown algorithm '%s' (try --list-algos)\n", algoName.c_str());
+        fprintf(stderr, "failed to initialise OpenCL backend\n");
         return 1;
     }
 
-    cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
-        fprintf(stderr, "no CUDA device found\n");
-        return 1;
-    }
-    char arch[32];
-    snprintf(arch, sizeof(arch), "sm_%d%d", prop.major, prop.minor);
-
-    const int rc = runMiner(algo.get(), opt, prop.name, prop.totalGlobalMem / 1e9,
-                            arch, &g_stop);
+    std::string arch = std::string("OpenCL ") + clDriverVersion();
+    const int rc = runMiner(algo.get(), opt, clDeviceName(), clDeviceMemGB(),
+                            arch.c_str(), &g_stop);
     platformShutdown();
     return rc;
 }

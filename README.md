@@ -34,7 +34,8 @@ test that proves it computes the right thing.
 | Hashrate | **217 MH/s** on an RTX 4090 @ 183 W (1.30 MH/W) |
 | Dev fee | **none** |
 | Correctness | verified against real mainnet blocks — see below |
-| Work source | solo, via your own Ergo node. **Pool/stratum not yet implemented.** |
+| Backends | **CUDA** (NVIDIA) and **OpenCL** (AMD / Intel / NVIDIA) - both 217 MH/s |
+| Work source | **pools (stratum)** and solo via your own node |
 | Platforms | Linux (tested), Windows (builds; untested on hardware) |
 
 For reference, lolMiner does ~265 MH/s on the same card and takes a 0.75–1%
@@ -67,7 +68,12 @@ Run these after any change. If they pass, the miner agrees with consensus.
 **Linux**
 
 ```bash
-make                    # defaults to sm_89 (Ada / RTX 40xx)
+make                    # builds BOTH backends
+make cuda               # NVIDIA only
+make opencl             # AMD / Intel / NVIDIA - no vendor toolchain needed
+make package            # release tarball
+
+make ARCH=sm_89         # defaults to sm_89 (Ada / RTX 40xx)
 make ARCH=sm_86         # Ampere / RTX 30xx
 make ARCH=sm_75         # Turing / RTX 20xx, 16xx
 ```
@@ -98,10 +104,38 @@ per interval instead of redrawing a panel into your log file:
  "eff_mh_w":1.185,"epoch":1851444,"accepted":0,"rejected":0}
 ```
 
-### You need an Ergo node
+### Pool mining
 
-This mines **solo**, against your own node's `/mining/candidate` API. There is
-no pool support yet, so a synced node is currently mandatory.
+Edit `config.txt`, then run the launcher:
+
+```bash
+./soat-miner.sh            # Linux
+soat-miner.bat             # Windows
+```
+
+```ini
+WALLET=9yourErgoAddress...
+POOL=ergo.herominers.com:1180
+WORKER=rig1
+BACKEND=auto               # auto | cuda | opencl
+```
+
+Or directly:
+
+```bash
+./soat-miner --pool ergo.herominers.com:1180 --wallet 9yourAddr --worker rig1
+```
+
+The stratum protocol was captured from live pools rather than taken from
+documentation, because Ergo stratum is a de-facto standard with no spec. Two
+details that are easy to get wrong and are handled here: `mining.notify`
+param 6 is the target in **decimal**, not a difficulty and not hex; and the
+subscribe reply's extranonce is a **prefix** of the 8-byte nonce, so nonces
+must be generated inside that subspace or every share is rejected.
+
+### Solo mining
+
+Leave `POOL` empty in `config.txt` and point it at your own node.
 
 ```bash
 # on the node, ergo.conf:
@@ -226,9 +260,21 @@ rides in `Job::extra` and stays opaque to the core.
 To add a pool instead of an algorithm, implement `JobSource` in
 `src/core/miner.cu` — that is the only thing stratum support requires.
 
-## Not done yet
+## Two backends
 
-- **Stratum / pool support.** Solo only for now, so a node is required.
+`soat-miner` is the CUDA build; `soat-miner-cl` is the OpenCL build. They are
+verified to produce byte-identical hits, and on an RTX 4090 they benchmark the
+same (217 MH/s), so OpenCL is not a slow fallback - it is a genuine portable
+build that happens to also be the only one AMD can run.
+
+OpenCL compiles its kernels at runtime, which is why an AMD build needs no AMD
+machine and no ROCm/HIP toolchain to produce.
+
+One OpenCL-specific constraint: `CL_DEVICE_MAX_MEM_ALLOC_SIZE` is commonly a
+quarter of VRAM (6.3 GB on a 24 GB card) while the dataset is 7.27 GB, so the
+dataset is split across up to four buffers and addressed across them.
+
+## Not done yet
 - **Windows is built but untested on real hardware.** The platform shim covers
   Winsock, `_isatty`, and MSVC's lack of `__int128`; it compiles, but nobody
   has run it on Windows yet.

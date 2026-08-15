@@ -1,0 +1,39 @@
+# SOAT Miner configuration
+#
+# Edit this file, then run ./soat-miner.sh (Linux) or soat-miner.bat (Windows).
+# Anything you set here is passed to the miner; command-line flags override it.
+
+# ---------------------------------------------------------------- POOL MODE
+# Your Ergo payout address. REQUIRED for pool mining.
+WALLET=9YOUR_ERGO_ADDRESS_HERE
+
+# Pool to mine to. Some known Ergo pools:
+#   ergo.herominers.com:1180
+#   pool.woolypooly.com:3100
+#   ergo.2miners.com:8888
+POOL=ergo.herominers.com:1180
+
+# Worker name shown on the pool dashboard.
+WORKER=rig1
+
+# Pool password. Almost always "x".
+PASSWORD=x
+
+# ---------------------------------------------------------------- SOLO MODE
+# Leave POOL empty above and set these to mine solo against your own node.
+# The payout address is configured on the NODE in solo mode, not here.
+NODE=127.0.0.1
+NODE_PORT=9053
+
+# ------------------------------------------------------------------ TUNING
+# Nonces per GPU launch. Larger = slightly better throughput, coarser stop.
+BATCH=4194304
+
+# Seconds between readouts.
+INTERVAL=5
+
+# Backend: auto | cuda | opencl
+#   auto   - use CUDA if an NVIDIA GPU is present, else OpenCL
+#   cuda   - NVIDIA only
+#   opencl - AMD, Intel, or NVIDIA
+BACKEND=auto

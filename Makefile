@@ -11,14 +11,21 @@ ARCH    ?= sm_89
 NVCC    ?= nvcc
 NVFLAGS  = -O3 -arch=$(ARCH) --std=c++17 -lineinfo
 BIN      = soat-miner
+BIN_CL   = soat-miner-cl
 BUILD    = build
+CXX     ?= g++
+CXXFLAGS = -O3 --std=c++17 -Isrc
 
 ALGO_OBJS = $(BUILD)/autolykos2.o
-CORE_OBJS = $(BUILD)/miner.o $(BUILD)/registry.o
+CORE_OBJS = $(BUILD)/miner.o $(BUILD)/registry.o $(BUILD)/run_cuda.o $(BUILD)/stratum_cuda.o
+CL_OBJS   = $(BUILD)/miner_cl.o $(BUILD)/algo_cl.o $(BUILD)/kernel_cl.o $(BUILD)/run_cl.o $(BUILD)/stratum_cl.o
 
-.PHONY: all clean test bench install dirs
+.PHONY: all cuda opencl clean test bench install dirs package
 
-all: $(BIN)
+all: cuda opencl
+
+cuda: $(BIN)
+opencl: $(BIN_CL)
 
 dirs:
 	@mkdir -p $(BUILD)
@@ -35,8 +42,36 @@ $(BUILD)/autolykos2.o: src/algos/autolykos2/algo.cu \
                        src/core/blake2b.cuh src/core/algo.h | dirs
 	$(NVCC) $(NVFLAGS) -dc $< -o $@
 
+$(BUILD)/stratum_cuda.o: src/core/stratum.cpp src/core/stratum.h | dirs
+	$(NVCC) $(NVFLAGS) -dc -x cu $< -o $@
+
+$(BUILD)/stratum_cl.o: src/core/stratum.cpp src/core/stratum.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/run_cuda.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
+	$(NVCC) $(NVFLAGS) -dc -x cu $< -o $@
+
 $(BIN): $(CORE_OBJS) $(ALGO_OBJS)
 	$(NVCC) $(NVFLAGS) $^ -o $@
+
+# --- OpenCL build: portable, no vendor toolchain needed --------------------
+$(BUILD)/kernel_cl.cpp: src/algos/autolykos2/kernel.cl scripts/embed_kernel.py | dirs
+	python3 scripts/embed_kernel.py $< $@
+
+$(BUILD)/kernel_cl.o: $(BUILD)/kernel_cl.cpp | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/algo_cl.o: src/algos/autolykos2/algo_cl.cpp src/core/algo.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/run_cl.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/miner_cl.o: src/core/miner_cl.cpp src/core/run.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_CL): $(CL_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -lOpenCL -ldl -lpthread -o $@
 
 # --- correctness gates -----------------------------------------------------
 # test_hit is the one that matters: it rebuilds the real dataset and
@@ -60,4 +95,20 @@ install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)/usr/local/bin/$(BIN)
 
 clean:
-	rm -rf $(BUILD) $(BIN) tests/test_element tests/test_hit
+	rm -rf $(BUILD) $(BIN) $(BIN_CL) tests/test_element tests/test_hit tests/test_opencl
+
+# --- release packaging (lolMiner-style flat archive) -----------------------
+VERSION ?= 0.1.0
+PKGNAME  = soat-miner_v$(VERSION)_Lin64
+package: cuda opencl
+	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)
+	cp $(BIN) $(BIN_CL) $(BUILD)/$(PKGNAME)/
+	cp packaging/soat-miner.sh packaging/soat-miner.bat packaging/config.txt \
+	   README.md LICENSE $(BUILD)/$(PKGNAME)/
+	cp scripts/soat-miner-guard.py scripts/guard.conf.example \
+	   scripts/soat-miner.service scripts/soat-miner-guard.service \
+	   $(BUILD)/$(PKGNAME)/
+	chmod +x $(BUILD)/$(PKGNAME)/soat-miner.sh
+	cd $(BUILD) && tar czf $(PKGNAME).tar.gz $(PKGNAME)
+	@sha256sum $(BUILD)/$(PKGNAME).tar.gz | tee $(BUILD)/$(PKGNAME).tar.gz.sha256
+	@echo "packaged: $(BUILD)/$(PKGNAME).tar.gz"
