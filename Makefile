@@ -104,7 +104,7 @@ clean:
 	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit tests/test_opencl
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
-VERSION ?= 0.1.0
+VERSION ?= 0.1.1
 PKGNAME  = soat-miner_v$(VERSION)_Lin64
 package: cuda vulkan
 	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)
