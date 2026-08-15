@@ -25,12 +25,21 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     // Banner before any network or GPU work. Connecting to a pool and
     // building the dataset take ~15s combined, and printing nothing for that
     // long reads as a hang - it is the first thing a new user sees.
-    stats.source = opt.bench ? "benchmark (no pool/node)"
+    stats.source = opt.bench ? "BENCHMARK ONLY - not mining, nothing submitted"
                  : (!opt.poolHost.empty()
                         ? opt.poolHost + ":" + std::to_string(opt.poolPort) + " (pool)"
                         : "ergo node " + opt.target.host + ":" +
                               std::to_string(opt.target.port) + " (solo)");
     printBanner(stats, tty);
+
+    if (opt.bench) {
+        logLine(tty, "warn",
+                "benchmark mode: measuring hashrate only. No pool, no wallet, "
+                "no shares, no payouts.");
+        logLine(tty, "info",
+                "to actually mine, use a mine_ergo_* script (edit WALLET first) "
+                "or pass --pool HOST:PORT --wallet <address>");
+    }
 
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
@@ -38,6 +47,21 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     if (opt.bench) {
         stats.source = "benchmark (no pool/node)";
     } else if (!opt.poolHost.empty()) {
+        // Catch the obvious cases before spending a connection on them.
+        const std::string &w = opt.wallet;
+        const bool looksLikeErgo =
+            w.size() >= 40 && w.size() <= 60 && w[0] == '9' &&
+            w.find_first_of(" \t") == std::string::npos;
+        if (w.empty() || w.rfind("9YOUR", 0) == 0 || !looksLikeErgo) {
+            logLine(tty, "error",
+                    w.empty() ? "no --wallet given; pool mining needs your Ergo "
+                                "payout address"
+                              : "'" + w + "' is not a valid Ergo address");
+            logLine(tty, "error",
+                    "edit WALLET in the mine_ergo_* script (or config.txt) to a "
+                    "real address - they start with 9 and are about 51 chars");
+            return 1;
+        }
         logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
                                  std::to_string(opt.poolPort) + " ...");
         auto *st = new StratumSource(opt.poolHost, opt.poolPort, opt.wallet,
@@ -57,6 +81,15 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             if (st->fetch(&probe)) break;
             sleepSeconds(0);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (st->loginRejected()) {
+            logLine(tty, "error",
+                    "pool REJECTED the login: " + st->loginError());
+            logLine(tty, "error",
+                    "check --wallet is a real Ergo address (starts with 9, "
+                    "~51 chars). The placeholder in the example scripts will "
+                    "not work.");
+            return 1;
         }
         noncePrefix = st->noncePrefix();
         nonceBits = st->nonceBitsOwned();
@@ -87,6 +120,15 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         if (!opt.bench) {
             Job fresh;
             if (!source->fetch(&fresh)) {
+                auto *st = dynamic_cast<StratumSource *>(source.get());
+                if (st && st->loginRejected()) {
+                    logLine(tty, "error",
+                            "pool REJECTED the login: " + st->loginError());
+                    logLine(tty, "error",
+                            "check --wallet is a real Ergo address (starts "
+                            "with 9, ~51 chars).");
+                    return 1;
+                }
                 logLine(tty, "warn", std::string("cannot reach ") +
                                          source->describe() + " - retrying in 5s");
                 sleepSeconds(5);

@@ -227,6 +227,27 @@ void StratumSource::handleLine(const std::string &line) {
         return;
     }
 
+    // mining.authorize reply. A pool refusing the login looks exactly like a
+    // dead connection from the outside - it just stops sending - so without
+    // reading this the miner reports "cannot reach pool" when the real
+    // problem is a bad wallet address.
+    {
+        std::string idRaw2, result, err;
+        if (rawValue(line, "id", &idRaw2) && idRaw2 == "2") {
+            rawValue(line, "result", &result);
+            rawValue(line, "error", &err);
+            const bool refused =
+                (result == "false") || (!err.empty() && err != "null");
+            if (refused) {
+                std::lock_guard<std::mutex> lk(mu_);
+                loginError_ = err.empty() || err == "null"
+                                  ? "pool refused the login"
+                                  : err;
+                loginRejected_ = true;
+            }
+        }
+    }
+
     // A response. The only one we care about is the subscribe reply, which
     // carries the extranonce prefix.
     std::string idRaw;

@@ -81,6 +81,13 @@ class StratumSource : public JobSource {
 
     bool submit(const Job &job, const Solution &sol, std::string *err) override;
 
+    /** Set if the pool explicitly refused mining.authorize. */
+    bool loginRejected() const { return loginRejected_.load(); }
+    std::string loginError() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return loginError_;
+    }
+
     /** Nonce prefix imposed by the pool's extranonce, and how many bits we own. */
     uint64_t noncePrefix() const { return noncePrefix_; }
     int nonceBitsOwned() const { return nonceBitsOwned_; }
@@ -107,6 +114,8 @@ class StratumSource : public JobSource {
     int nonceBitsOwned_ = 64;
 
     std::atomic<int> nextId_{10};
+    std::atomic<bool> loginRejected_{false};
+    std::string loginError_;
     std::atomic<int> accepted_{0};
     std::atomic<int> rejected_{0};
     std::string lastSubmitError_;

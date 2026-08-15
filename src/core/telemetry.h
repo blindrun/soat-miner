@@ -46,11 +46,19 @@ namespace om {
  * processing is switched on, so without this the readout renders as literal
  * escape-code garbage on Windows 10/11. Enabling it is a no-op elsewhere.
  */
+inline bool g_asciiOnly = false;
+
 inline void enableAnsiOnWindows() {
 #if defined(_WIN32)
     static bool done = false;
     if (done) return;
     done = true;
+
+    // Without this the box-drawing and sparkline characters, which are UTF-8,
+    // render as mojibake: Windows consoles default to CP437/1252. Setting the
+    // mode alone (below) is not enough - that only handles ANSI escapes.
+    if (!SetConsoleOutputCP(CP_UTF8)) g_asciiOnly = true;
+
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD mode = 0;
@@ -58,8 +66,21 @@ inline void enableAnsiOnWindows() {
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
-    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    if (!SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        g_asciiOnly = true;  // no VT support: fall back to a plain frame
 #endif
+}
+
+// Frame glyphs. The ASCII set is used when the console cannot be put into
+// UTF-8 + VT mode, and via --ascii.
+struct FrameChars {
+    const char *tl, *tr, *bl, *br, *h, *v, *ml, *mr;
+};
+inline FrameChars frameChars() {
+    if (g_asciiOnly)
+        return {"+", "+", "+", "+", "-", "|", "+", "+"};
+    return {"\u250c", "\u2510", "\u2514", "\u2518",
+            "\u2500", "\u2502", "\u251c", "\u2524"};
 }
 
 inline bool stdoutIsTty() {
@@ -308,8 +329,10 @@ inline std::string formatCount(double n) {
 
 /** A unicode sparkline of recent hashrate, scaled to its own min/max. */
 inline std::string sparkline(const std::vector<double> &v) {
-    static const char *bars[] = {"\u2581", "\u2582", "\u2583", "\u2584",
-                                 "\u2585", "\u2586", "\u2587", "\u2588"};
+    static const char *uni[] = {"\u2581", "\u2582", "\u2583", "\u2584",
+                                "\u2585", "\u2586", "\u2587", "\u2588"};
+    static const char *ascii[] = {"_", ".", ",", "-", "=", "+", "*", "#"};
+    const char *const *bars = g_asciiOnly ? ascii : uni;
     if (v.size() < 2) return "";
     double lo = v[0], hi = v[0];
     for (double x : v) {
@@ -397,54 +420,55 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
         return;
     }
 
-    // Redraw in place. The cursor must move back up by EXACTLY the number of
-    // lines printed - hardcoding it drifted by 1-2 lines per refresh and
-    // stacked a fresh copy of the frame every interval.
-    int lines = 0;
-    const char *B = "  " C_DIM;
+    // Redrawn in place each interval.
+    //
+    // Two things this deliberately avoids, both of which broke it before:
+    //  * a hardcoded cursor-up count - it must match the lines actually
+    //    printed, or the frame drifts and stacks a new copy every refresh;
+    //  * a right-hand border - padding to a fixed column is unreliable once
+    //    ANSI colour codes are in the string, since they take width in the
+    //    buffer but none on screen.
+    const FrameChars fc = frameChars();
+    std::string rule;
+    for (int i = 0; i < 60; i++) rule += fc.h;
 
-    printf("\r%s┌──────────────────────────────────────────────────────────┐" C_RESET "\n", B);
+    int lines = 0;
+    printf("\r  %s%s%s\n", C_DIM, rule.c_str(), C_RESET);
     lines++;
 
-    printf("%s│" C_RESET "  " C_BOLD C_GREEN "%9.2f MH/s" C_RESET "  " C_DIM "avg" C_RESET
-           " %7.2f   %s%-18s" C_RESET " %s│" C_RESET "\n",
-           B, s.hashrate, s.hashrateAvg, C_BLUE, sparkline(s.history).c_str(), B);
+    printf("   " C_BOLD C_GREEN "%9.2f MH/s" C_RESET "   " C_DIM "avg" C_RESET
+           " %7.2f   %s%s" C_RESET "\033[K\n",
+           s.hashrate, s.hashrateAvg, C_BLUE, sparkline(s.history).c_str());
     lines++;
 
     if (t.valid) {
-        printf("%s│" C_RESET "  %6.0f W   %s%3u\u00b0C" C_RESET "   fan %3u%%   " C_DIM
-               "eff" C_RESET " %5.2f MH/W        %s│" C_RESET "\n",
-               B, watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent,
-               eff, B);
+        printf("   %6.0f W   %s%3u C" C_RESET "   fan %3u%%   " C_DIM "eff" C_RESET
+               " %5.2f MH/W\033[K\n",
+               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff);
         lines++;
-        printf("%s│" C_RESET "  " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET
-               " %6u MHz                       %s│" C_RESET "\n",
-               B, t.smClockMhz, t.memClockMhz, B);
-        lines++;
+        if (t.smClockMhz || t.memClockMhz) {
+            printf("   " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET
+                   " %6u MHz\033[K\n", t.smClockMhz, t.memClockMhz);
+            lines++;
+        }
     } else {
-        printf("%s│" C_RESET "  " C_DIM "power/thermals unavailable" C_RESET
-               "                            %s│" C_RESET "\n", B, B);
+        printf("   " C_DIM "power/thermals unavailable" C_RESET "\033[K\n");
         lines++;
     }
 
-    printf("%s├──────────────────────────────────────────────────────────┤" C_RESET "\n", B);
+    printf("   " C_DIM "epoch" C_RESET " %-9llu " C_DIM "dataset" C_RESET
+           " %5.2f GB   " C_DIM "nonces" C_RESET " %s\033[K\n",
+           (unsigned long long)s.epoch, s.datasetGB,
+           formatCount((double)s.totalNonces).c_str());
     lines++;
 
-    printf("%s│" C_RESET "  " C_DIM "epoch" C_RESET " %-9llu " C_DIM "dataset" C_RESET
-           " %5.2f GB   " C_DIM "nonces" C_RESET " %-8s   %s│" C_RESET "\n",
-           B, (unsigned long long)s.epoch, s.datasetGB,
-           formatCount((double)s.totalNonces).c_str(), B);
-    lines++;
-
-    printf("%s│" C_RESET "  " C_GREEN "%llu accepted" C_RESET, B,
-           (unsigned long long)s.accepted);
+    printf("   " C_GREEN "%llu accepted" C_RESET, (unsigned long long)s.accepted);
     if (s.rejected)
         printf("   " C_RED "%llu rejected" C_RESET, (unsigned long long)s.rejected);
-    printf("   " C_DIM "up" C_RESET " %-12s", formatDuration(s.uptimeSeconds).c_str());
-    printf("      %s│" C_RESET "\n", B);
+    printf("   " C_DIM "up" C_RESET " %s\033[K\n", formatDuration(s.uptimeSeconds).c_str());
     lines++;
 
-    printf("%s└──────────────────────────────────────────────────────────┘" C_RESET "\n", B);
+    printf("  %s%s%s\033[K\n", C_DIM, rule.c_str(), C_RESET);
     lines++;
 
     printf("\033[%dA", lines);  // back to the top of the frame

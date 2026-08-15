@@ -66,6 +66,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--plain") opt.plain = true;
+        else if (a == "--ascii") om::g_asciiOnly = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
         else if (a == "--algo") { /* only autolykos2 for now */ (void)next(); }
         else if (a == "--device") deviceIndex = atoi(next().c_str());
@@ -86,6 +87,7 @@ int main(int argc, char **argv) {
                 "  --batch N         nonces per launch (default 4194304)\n"
                 "  --interval N      seconds between readouts (default 5)\n"
                 "  --plain           one-line JSON output, for logs/systemd\n"
+                "  --ascii           plain ASCII frame (no box-drawing glyphs)\n"
                 "  --bench           benchmark, no node required\n"
                 "  --bench-height H  height to benchmark at\n");
             return 0;

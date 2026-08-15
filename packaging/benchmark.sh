@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Benchmark without a pool or node.
+# BENCHMARK ONLY - measures hashrate. It does NOT mine: no pool, no wallet,
+# no shares, no payouts. That is why no address is needed here.
+# To actually mine, edit WALLET in mine_ergo_herominers.sh and run that.
 #
 # Hashrate depends heavily on the dataset size, which grows with chain height.
 # Pass a height to compare against older figures:
