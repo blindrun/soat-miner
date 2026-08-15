@@ -1,0 +1,7 @@
+build/
+soat-miner
+tests/test_element
+tests/test_hit
+tests/__pycache__/
+*.o
+*.log

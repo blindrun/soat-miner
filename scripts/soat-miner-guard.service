@@ -1,0 +1,25 @@
+[Unit]
+Description=SOAT Miner guard (starts/stops mining around real GPU work)
+Documentation=file:///opt/soat-miner/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+# Needs root: it drives systemctl and sets the GPU power limit.
+User=root
+ExecStart=/usr/bin/python3 /opt/soat-miner/soat-miner-guard.py
+Environment=SOAT_MINER_CONFIG=/etc/soat-miner/guard.conf
+
+Restart=always
+RestartSec=10
+
+# On shutdown, make sure mining is stopped and full power is restored rather
+# than leaving the card power-limited for whatever runs next.
+ExecStopPost=/bin/sh -c '/usr/bin/systemctl stop soat-miner.service || true; \
+    /usr/bin/nvidia-smi -pl 450 >/dev/null 2>&1 || true'
+
+StandardOutput=append:/var/log/soat-miner/guard.log
+StandardError=append:/var/log/soat-miner/guard.log
+
+[Install]
+WantedBy=multi-user.target

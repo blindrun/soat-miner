@@ -1,0 +1,56 @@
+[Unit]
+Description=SOAT Miner (Autolykos v2 / Ergo)
+Documentation=file:///opt/soat-miner/README.md
+After=network-online.target
+Wants=network-online.target
+# Started and stopped by soat-miner-guard, not by a timer or on boot.
+
+[Service]
+Type=simple
+User=soatminer
+Group=soatminer
+WorkingDirectory=/opt/soat-miner
+
+EnvironmentFile=-/etc/soat-miner/miner.conf
+ExecStart=/opt/soat-miner/soat-miner \
+    --algo ${ALGO} \
+    --node ${NODE_HOST} \
+    --port ${NODE_PORT} \
+    --plain \
+    --interval 30
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Stop promptly: the whole point is releasing the GPU for real work.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+StandardOutput=append:/var/log/soat-miner/miner.log
+StandardError=append:/var/log/soat-miner/miner.log
+
+# --- hardening -------------------------------------------------------------
+# The miner needs the NVIDIA devices and the network, nothing else. In
+# particular it must not be able to read the operator's home directory, which
+# on this host holds fleet SSH keys and a GitHub token.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/log/soat-miner
+DeviceAllow=/dev/nvidia* rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia-uvm-tools rw
+
+[Install]
+WantedBy=multi-user.target

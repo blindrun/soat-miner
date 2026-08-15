@@ -1,0 +1,54 @@
+# /etc/soat-miner/guard.conf
+#
+# When it is acceptable to mine. Every value here is also overridable by an
+# environment variable of the same name.
+
+# --- when ------------------------------------------------------------------
+# Comma-separated HH:MM-HH:MM windows in LOCAL time. Windows may wrap midnight.
+#
+#   SUMMER (default): overnight only, avoiding the heat of the day.
+MINE_WINDOWS=20:00-10:00
+#
+#   WINTER: uncomment for all day - the GPU's waste heat is not a problem then.
+# MINE_WINDOWS=00:00-23:59
+#
+#   Or split windows, e.g. overnight plus a cool morning slot:
+# MINE_WINDOWS=20:00-10:00,11:00-13:00
+
+# Backstop independent of the clock, in case the room is hot anyway.
+GPU_TEMP_MAX_C=70
+
+# --- what counts as "the GPU is busy" --------------------------------------
+# Ollama and ComfyUI expose exact "am I busy" endpoints. These beat polling GPU
+# utilisation, because ComfyUI holds ~390 MB of VRAM while completely idle.
+OLLAMA_URL=http://127.0.0.1:11434
+COMFYUI_URL=http://127.0.0.1:8188
+
+# Any OTHER process holding more than this much VRAM counts as busy. Keep it
+# above ComfyUI's idle footprint (~390 MB) or mining will never start.
+FOREIGN_VRAM_MB=500
+
+# These names mean "GPU work is starting" the moment the process appears, at
+# any VRAM size. This matters on a 24 GB card: qwen3:8k alone needs ~21.9 GB
+# and the Autolykos dataset is 7.3 GB, so they cannot coexist. Waiting for a
+# VRAM threshold to trip would mean reacting after the allocation has already
+# failed.
+BUSY_PROCESS_NAMES=llama-server,ollama
+
+# --- timing ----------------------------------------------------------------
+# Stopping is immediate; only starting is delayed. Losing a few seconds of
+# mining is free, making an interactive prompt wait is not.
+POLL_SECONDS=1
+IDLE_SETTLE_POLLS=5
+
+# --- power -----------------------------------------------------------------
+# 183 W is the measured sweet spot on an RTX 4090: 217.2 MH/s at 167 W actual
+# draw, versus 217.5 MH/s at 221 W unlimited. 0.3 MH/s for 24% less power.
+POWER_LIMIT_MINING_W=183
+POWER_LIMIT_IDLE_W=450
+
+GPU_INDEX=0
+MINER_UNIT=soat-miner.service
+
+# Set true to log decisions without touching the miner or the power limit.
+DRY_RUN=false
