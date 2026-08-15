@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -67,6 +68,17 @@ struct Buffer {
 
 /** Workgroup size. Fed to the shader as a specialization constant. */
 static const uint32_t kLocalSize = 256;
+
+/**
+ * Wave/subgroup size. 0 lets the driver choose (wave64 on RDNA2).
+ * Overridable with SOAT_SUBGROUP=32|64 for A/B testing: this workload is
+ * memory-latency bound, and narrower waves can keep more independent memory
+ * requests in flight.
+ */
+static uint32_t subgroupSizeOverride() {
+    const char *e = getenv("SOAT_SUBGROUP");
+    return e ? (uint32_t)atoi(e) : 0u;
+}
 
 class Autolykos2VK : public Algorithm {
    public:
@@ -183,6 +195,12 @@ class Autolykos2VK : public Algorithm {
         f12.shaderInt8 = VK_TRUE;
         f12.storageBuffer8BitAccess = VK_TRUE;
 
+        VkPhysicalDeviceVulkan13Features f13{};
+        f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        f13.subgroupSizeControl = VK_TRUE;
+        f13.computeFullSubgroups = VK_TRUE;
+        f12.pNext = &f13;
+
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
@@ -226,6 +244,10 @@ class Autolykos2VK : public Algorithm {
 
         // Specialization constant 0 = local_size_x, so host and shader can
         // never disagree about the workgroup size.
+        // Only local_size is specialized. N was tried as a spec constant too:
+        // it gave no measurable gain (the search path is memory bound, not
+        // arithmetic bound) and it baked N into the pipeline at init, which
+        // would silently break at the next epoch where N grows.
         VkSpecializationMapEntry specEntry{};
         specEntry.constantID = 0;
         specEntry.offset = 0;
@@ -243,6 +265,16 @@ class Autolykos2VK : public Algorithm {
         stage.module = shader_;
         stage.pName = "main";
         stage.pSpecializationInfo = &spec;
+
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sgInfo{};
+        const uint32_t wantSg = subgroupSizeOverride();
+        if (wantSg == 32u || wantSg == 64u) {
+            sgInfo.sType =
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+            sgInfo.requiredSubgroupSize = wantSg;
+            stage.pNext = &sgInfo;
+            fprintf(stderr, "[vulkan] forcing subgroup size %u\n", wantSg);
+        }
 
         VkComputePipelineCreateInfo cpci{};
         cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
