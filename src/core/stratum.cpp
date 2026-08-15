@@ -116,8 +116,11 @@ bool StratumSource::start(std::string *err) {
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo *res = nullptr;
     const std::string port = std::to_string(port_);
-    if (getaddrinfo(host_.c_str(), port.c_str(), &hints, &res) != 0) {
-        *err = "cannot resolve " + host_;
+    const int gai = getaddrinfo(host_.c_str(), port.c_str(), &hints, &res);
+    if (gai != 0 || res == nullptr) {
+        *err = "DNS lookup for '" + host_ + "' failed (getaddrinfo=" +
+               std::to_string(gai) + ") - check the pool hostname and that "
+               "this machine has working DNS";
         return false;
     }
     fd_ = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
@@ -128,10 +131,17 @@ bool StratumSource::start(std::string *err) {
     }
     socketTimeout(fd_, 30);
     if (::connect(fd_, res->ai_addr, (int)res->ai_addrlen) != 0) {
+#if defined(_WIN32)
+        const int se = WSAGetLastError();
+#else
+        const int se = errno;
+#endif
         OM_CLOSESOCKET(fd_);
         fd_ = OM_INVALID_SOCKET;
         freeaddrinfo(res);
-        *err = "cannot connect to " + desc_;
+        *err = "TCP connect to " + desc_ + " failed (error " +
+               std::to_string(se) +
+               ") - a firewall or the port being blocked is the usual cause";
         return false;
     }
     freeaddrinfo(res);

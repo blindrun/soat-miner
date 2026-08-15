@@ -74,13 +74,23 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
         source.reset(st);
         stats.source = source->describe();
-        logLine(tty, "ok", "connected, waiting for first job");
-        // Give the pool a moment to deliver extranonce + first job.
-        for (int i = 0; i < 50; i++) {
+        logLine(tty, "ok", "TCP connected, waiting for first job...");
+        // Wait up to 20s: some pools are slow to send the first mining.notify,
+        // and 5s was not always enough.
+        bool gotJob = false;
+        for (int i = 0; i < 200; i++) {
             Job probe;
-            if (st->fetch(&probe)) break;
-            sleepSeconds(0);
+            if (st->fetch(&probe)) { gotJob = true; break; }
+            if (st->loginRejected()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!gotJob && !st->loginRejected()) {
+            logLine(tty, "error",
+                    "connected to the pool but it sent no job in 20s. The "
+                    "socket is open, so this is not a firewall - the pool "
+                    "may have refused the wallet silently, or the port is "
+                    "for a different algorithm.");
+            return 1;
         }
         if (st->loginRejected()) {
             logLine(tty, "error",

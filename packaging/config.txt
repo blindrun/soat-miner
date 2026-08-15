@@ -5,7 +5,7 @@
 
 # ---------------------------------------------------------------- POOL MODE
 # Your Ergo payout address. REQUIRED for pool mining.
-WALLET=9YOUR_ERGO_ADDRESS_HERE
+WALLET=9ea2QrXbTTmEhRA92qcnDVD98aeENUc4oJdDGxF7GKMBZ47wLTR
 
 # Pool to mine to. Some known Ergo pools:
 #   ergo.herominers.com:1180
