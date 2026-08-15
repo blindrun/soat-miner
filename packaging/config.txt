@@ -32,8 +32,10 @@ BATCH=4194304
 # Seconds between readouts.
 INTERVAL=5
 
-# Backend: auto | cuda | opencl
-#   auto   - use CUDA if an NVIDIA GPU is present, else OpenCL
-#   cuda   - NVIDIA only
-#   opencl - AMD, Intel, or NVIDIA
+# Backend: auto | cuda | vulkan
+#   auto   - use CUDA if an NVIDIA GPU is present, else Vulkan
+#   cuda   - NVIDIA only, currently much faster (217 vs 2.9 MH/s on a 4090)
+#   vulkan - AMD, Intel, or NVIDIA. Correct, but see the README: the search
+#            kernel is heavily underperforming on NVIDIA and the cause is not
+#            yet found. Untested on AMD - that is what this build is for.
 BACKEND=auto

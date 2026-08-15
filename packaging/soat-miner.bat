@@ -11,9 +11,9 @@ for /f "usebackq tokens=1,* delims==" %%A in ("config.txt") do (
 
 if "%BACKEND%"=="" set BACKEND=auto
 if /i "%BACKEND%"=="auto" (
-  where nvidia-smi >nul 2>&1 && ( set BACKEND=cuda ) || ( set BACKEND=opencl )
+  where nvidia-smi >nul 2>&1 && ( set BACKEND=cuda ) || ( set BACKEND=vulkan )
 )
-if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-cl.exe )
+if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-vk.exe )
 
 if not "%POOL%"=="" (
   echo SOAT Miner -^> pool %POOL% as %WORKER% [%BACKEND%]

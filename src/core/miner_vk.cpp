@@ -1,8 +1,8 @@
-// SOAT Miner - OpenCL build entry point (AMD, Intel, NVIDIA).
+// SOAT Miner - Vulkan build entry point (AMD, NVIDIA, Intel).
 //
 // Same run loop as the CUDA build; only the Algorithm differs. This is the
-// portable binary: OpenCL compiles its kernels at runtime, so one build runs
-// on any vendor's GPU without a per-vendor toolchain.
+// portable binary: the SPIR-V shader is compiled into it and every vendor's
+// Vulkan driver consumes the same module, so one build runs anywhere.
 
 #include <signal.h>
 
@@ -14,11 +14,11 @@
 #include "run.h"
 
 namespace om {
-Algorithm *makeAutolykos2CL(int deviceIndex);
-void clListDevices();
-const char *clDeviceName();
-double clDeviceMemGB();
-const char *clDriverVersion();
+Algorithm *makeAutolykos2VK(int deviceIndex);
+void vkListDevices();
+const char *vkDeviceName();
+double vkDeviceMemGB();
+const char *vkDriverVersion();
 }  // namespace om
 
 static volatile sig_atomic_t g_stop = 0;
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     using namespace om;
 
     RunOptions opt;
-    opt.backendLabel = "OpenCL";
+    opt.backendLabel = "Vulkan";
     int deviceIndex = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -69,11 +69,11 @@ int main(int argc, char **argv) {
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
         else if (a == "--algo") { /* only autolykos2 for now */ (void)next(); }
         else if (a == "--device") deviceIndex = atoi(next().c_str());
-        else if (a == "--list-devices") { clListDevices(); return 0; }
+        else if (a == "--list-devices") { vkListDevices(); return 0; }
         else if (a == "--list-algos") { printf("autolykos2\n"); return 0; }
         else if (a == "--help" || a == "-h") {
             printf(
-                "SOAT Miner (OpenCL) - open-source GPU miner\n\n"
+                "SOAT Miner (Vulkan) - open-source GPU miner\n\n"
                 "  --device N        GPU index (default: largest VRAM)\n"
                 "  --list-devices    list OpenCL GPUs and exit\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
@@ -104,14 +104,14 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 #endif
 
-    std::unique_ptr<Algorithm> algo(makeAutolykos2CL(deviceIndex));
+    std::unique_ptr<Algorithm> algo(makeAutolykos2VK(deviceIndex));
     if (!algo) {
-        fprintf(stderr, "failed to initialise OpenCL backend\n");
+        fprintf(stderr, "failed to initialise Vulkan backend\n");
         return 1;
     }
 
-    std::string arch = std::string("OpenCL ") + clDriverVersion();
-    const int rc = runMiner(algo.get(), opt, clDeviceName(), clDeviceMemGB(),
+    std::string arch = vkDriverVersion();
+    const int rc = runMiner(algo.get(), opt, vkDeviceName(), vkDeviceMemGB(),
                             arch.c_str(), &g_stop);
     platformShutdown();
     return rc;

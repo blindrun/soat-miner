@@ -12,14 +12,14 @@ if [[ "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     BACKEND=cuda
   else
-    BACKEND=opencl
+    BACKEND=vulkan
   fi
 fi
 
 case "$BACKEND" in
   cuda)   BIN=./soat-miner ;;
-  opencl) BIN=./soat-miner-cl ;;
-  *) echo "unknown BACKEND '$BACKEND' (use auto|cuda|opencl)"; exit 1 ;;
+  vulkan) BIN=./soat-miner-vk ;;
+  *) echo "unknown BACKEND '$BACKEND' (use auto|cuda|vulkan)"; exit 1 ;;
 esac
 [[ -x "$BIN" ]] || { echo "$BIN not found or not executable"; exit 1; }
 

@@ -1,0 +1,462 @@
+#version 450
+// Autolykos v2 as a Vulkan compute shader.
+//
+// Ported from the CUDA implementation in this directory, which is verified
+// against the Ergo node's AutolykosPowScheme.scala and against real mainnet
+// blocks. All three backends must produce identical hits; tests/ checks it.
+//
+// Vulkan over OpenCL for one practical reason: every gaming-oriented AMD
+// distribution ships a working Vulkan driver, while AMD OpenCL needs ROCm,
+// amdgpu-pro or Mesa rusticl and is frequently absent. Performance is
+// unaffected either way - this workload is memory-bandwidth bound.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 256) in;
+
+// The dataset is split across four buffers. Vulkan only guarantees
+// maxStorageBufferRange per binding (4 GB - 1 even on a 24 GB RTX 4090)
+// against a 7.27 GB dataset, so a single binding cannot hold it.
+// uvec4 rather than uint64_t[]: this gives two 16-byte vector loads per
+// element instead of four separate 8-byte loads. With 33 random lookups per
+// nonce that difference dominates everything else in the kernel.
+layout(std430, binding = 0) buffer Chunk0 { uvec4 d[]; } c0;
+layout(std430, binding = 1) buffer Chunk1 { uvec4 d[]; } c1;
+layout(std430, binding = 2) buffer Chunk2 { uvec4 d[]; } c2;
+layout(std430, binding = 3) buffer Chunk3 { uvec4 d[]; } c3;
+
+// 5 words per solution: nonce followed by the 4 hit limbs.
+layout(std430, binding = 4) buffer Out { uint64_t v[]; } outbuf;
+
+// Separate 32-bit counter. A 64-bit atomic would need GL_EXT_shader_atomic_int64,
+// which is not universally available on AMD drivers; a 32-bit atomicAdd is core.
+layout(std430, binding = 5) buffer Cnt { uint n; } cnt;
+
+layout(push_constant) uniform Push {
+    uint64_t msg0, msg1, msg2, msg3;   // 32-byte header digest, LE words
+    uint64_t t0, t1, t2, t3;           // 256-bit target, t0 least significant
+    uint64_t baseNonce;
+    uint N;
+    uint height;
+    uint chunkShift;   // chunkElems is 1<<chunkShift, so lookup is shift+mask
+    uint mode;        // 0 = build dataset, 1 = search, 2 = verify one nonce
+    uint buildFirst;  // dataset build: first element index
+    uint buildCount;  // dataset build: elements in this chunk
+    uint buildChunk;  // dataset build: which chunk buffer to write
+    uint maxOut;
+} pc;
+
+const uint AL_K = 32;
+
+// ---------------------------------------------------------------- blake2b --
+const uint64_t IV0 = 0x6a09e667f3bcc908UL;
+const uint64_t IV1 = 0xbb67ae8584caa73bUL;
+const uint64_t IV2 = 0x3c6ef372fe94f82bUL;
+const uint64_t IV3 = 0xa54ff53a5f1d36f1UL;
+const uint64_t IV4 = 0x510e527fade682d1UL;
+const uint64_t IV5 = 0x9b05688c2b3e6c1fUL;
+const uint64_t IV6 = 0x1f83d9abfb41bd6bUL;
+const uint64_t IV7 = 0x5be0cd19137e2179UL;
+
+uint64_t rotr64(uint64_t x, int n) {
+    return (x >> n) | (x << (64 - n));
+}
+
+#define G(a, b, c, d, x, y)      \
+    a = a + b + (x);             \
+    d = rotr64(d ^ a, 32);       \
+    c = c + d;                   \
+    b = rotr64(b ^ c, 24);       \
+    a = a + b + (y);             \
+    d = rotr64(d ^ a, 16);       \
+    c = c + d;                   \
+    b = rotr64(b ^ c, 63);
+
+/**
+ * Blake2b compression, fully unrolled.
+ *
+ * The obvious form - a loop over rounds indexing m[SIGMA[r][k]] - is a trap in
+ * GLSL: the dynamic index forces the message and working arrays out of
+ * registers and into scratch memory, and this kernel then runs about 75x
+ * slower (measured: 2.9 MH/s versus 217 MH/s). Unrolling with literal indices
+ * keeps all 32 words in registers.
+ */
+void compressU(inout uint64_t h[8], uint64_t m0, uint64_t m1, uint64_t m2, uint64_t m3, uint64_t m4, uint64_t m5, uint64_t m6, uint64_t m7, uint64_t m8, uint64_t m9, uint64_t m10, uint64_t m11, uint64_t m12, uint64_t m13, uint64_t m14, uint64_t m15, uint64_t t, bool last) {
+    uint64_t v0; uint64_t v1; uint64_t v2; uint64_t v3; uint64_t v4; uint64_t v5; uint64_t v6; uint64_t v7; uint64_t v8; uint64_t v9; uint64_t v10; uint64_t v11; uint64_t v12; uint64_t v13; uint64_t v14; uint64_t v15;
+    v0 = h[0];
+    v1 = h[1];
+    v2 = h[2];
+    v3 = h[3];
+    v4 = h[4];
+    v5 = h[5];
+    v6 = h[6];
+    v7 = h[7];
+    v8 = IV0;
+    v9 = IV1;
+    v10 = IV2;
+    v11 = IV3;
+    v12 = IV4;
+    v13 = IV5;
+    v14 = IV6;
+    v15 = IV7;
+    v12 ^= t;
+    if (last) v14 = ~v14;
+
+    // round 0
+    G(v0, v4, v8, v12, m0, m1)
+    G(v1, v5, v9, v13, m2, m3)
+    G(v2, v6, v10, v14, m4, m5)
+    G(v3, v7, v11, v15, m6, m7)
+    G(v0, v5, v10, v15, m8, m9)
+    G(v1, v6, v11, v12, m10, m11)
+    G(v2, v7, v8, v13, m12, m13)
+    G(v3, v4, v9, v14, m14, m15)
+    // round 1
+    G(v0, v4, v8, v12, m14, m10)
+    G(v1, v5, v9, v13, m4, m8)
+    G(v2, v6, v10, v14, m9, m15)
+    G(v3, v7, v11, v15, m13, m6)
+    G(v0, v5, v10, v15, m1, m12)
+    G(v1, v6, v11, v12, m0, m2)
+    G(v2, v7, v8, v13, m11, m7)
+    G(v3, v4, v9, v14, m5, m3)
+    // round 2
+    G(v0, v4, v8, v12, m11, m8)
+    G(v1, v5, v9, v13, m12, m0)
+    G(v2, v6, v10, v14, m5, m2)
+    G(v3, v7, v11, v15, m15, m13)
+    G(v0, v5, v10, v15, m10, m14)
+    G(v1, v6, v11, v12, m3, m6)
+    G(v2, v7, v8, v13, m7, m1)
+    G(v3, v4, v9, v14, m9, m4)
+    // round 3
+    G(v0, v4, v8, v12, m7, m9)
+    G(v1, v5, v9, v13, m3, m1)
+    G(v2, v6, v10, v14, m13, m12)
+    G(v3, v7, v11, v15, m11, m14)
+    G(v0, v5, v10, v15, m2, m6)
+    G(v1, v6, v11, v12, m5, m10)
+    G(v2, v7, v8, v13, m4, m0)
+    G(v3, v4, v9, v14, m15, m8)
+    // round 4
+    G(v0, v4, v8, v12, m9, m0)
+    G(v1, v5, v9, v13, m5, m7)
+    G(v2, v6, v10, v14, m2, m4)
+    G(v3, v7, v11, v15, m10, m15)
+    G(v0, v5, v10, v15, m14, m1)
+    G(v1, v6, v11, v12, m11, m12)
+    G(v2, v7, v8, v13, m6, m8)
+    G(v3, v4, v9, v14, m3, m13)
+    // round 5
+    G(v0, v4, v8, v12, m2, m12)
+    G(v1, v5, v9, v13, m6, m10)
+    G(v2, v6, v10, v14, m0, m11)
+    G(v3, v7, v11, v15, m8, m3)
+    G(v0, v5, v10, v15, m4, m13)
+    G(v1, v6, v11, v12, m7, m5)
+    G(v2, v7, v8, v13, m15, m14)
+    G(v3, v4, v9, v14, m1, m9)
+    // round 6
+    G(v0, v4, v8, v12, m12, m5)
+    G(v1, v5, v9, v13, m1, m15)
+    G(v2, v6, v10, v14, m14, m13)
+    G(v3, v7, v11, v15, m4, m10)
+    G(v0, v5, v10, v15, m0, m7)
+    G(v1, v6, v11, v12, m6, m3)
+    G(v2, v7, v8, v13, m9, m2)
+    G(v3, v4, v9, v14, m8, m11)
+    // round 7
+    G(v0, v4, v8, v12, m13, m11)
+    G(v1, v5, v9, v13, m7, m14)
+    G(v2, v6, v10, v14, m12, m1)
+    G(v3, v7, v11, v15, m3, m9)
+    G(v0, v5, v10, v15, m5, m0)
+    G(v1, v6, v11, v12, m15, m4)
+    G(v2, v7, v8, v13, m8, m6)
+    G(v3, v4, v9, v14, m2, m10)
+    // round 8
+    G(v0, v4, v8, v12, m6, m15)
+    G(v1, v5, v9, v13, m14, m9)
+    G(v2, v6, v10, v14, m11, m3)
+    G(v3, v7, v11, v15, m0, m8)
+    G(v0, v5, v10, v15, m12, m2)
+    G(v1, v6, v11, v12, m13, m7)
+    G(v2, v7, v8, v13, m1, m4)
+    G(v3, v4, v9, v14, m10, m5)
+    // round 9
+    G(v0, v4, v8, v12, m10, m2)
+    G(v1, v5, v9, v13, m8, m4)
+    G(v2, v6, v10, v14, m7, m6)
+    G(v3, v7, v11, v15, m1, m5)
+    G(v0, v5, v10, v15, m15, m11)
+    G(v1, v6, v11, v12, m9, m14)
+    G(v2, v7, v8, v13, m3, m12)
+    G(v3, v4, v9, v14, m13, m0)
+    // round 10
+    G(v0, v4, v8, v12, m0, m1)
+    G(v1, v5, v9, v13, m2, m3)
+    G(v2, v6, v10, v14, m4, m5)
+    G(v3, v7, v11, v15, m6, m7)
+    G(v0, v5, v10, v15, m8, m9)
+    G(v1, v6, v11, v12, m10, m11)
+    G(v2, v7, v8, v13, m12, m13)
+    G(v3, v4, v9, v14, m14, m15)
+    // round 11
+    G(v0, v4, v8, v12, m14, m10)
+    G(v1, v5, v9, v13, m4, m8)
+    G(v2, v6, v10, v14, m9, m15)
+    G(v3, v7, v11, v15, m13, m6)
+    G(v0, v5, v10, v15, m1, m12)
+    G(v1, v6, v11, v12, m0, m2)
+    G(v2, v7, v8, v13, m11, m7)
+    G(v3, v4, v9, v14, m5, m3)
+
+    h[0] ^= v0 ^ v8;
+    h[1] ^= v1 ^ v9;
+    h[2] ^= v2 ^ v10;
+    h[3] ^= v3 ^ v11;
+    h[4] ^= v4 ^ v12;
+    h[5] ^= v5 ^ v13;
+    h[6] ^= v6 ^ v14;
+    h[7] ^= v7 ^ v15;
+}
+
+void initState(out uint64_t h[8]) {
+    h[0] = IV0 ^ 0x01010020UL;
+    h[1] = IV1; h[2] = IV2; h[3] = IV3;
+    h[4] = IV4; h[5] = IV5; h[6] = IV6; h[7] = IV7;
+}
+
+/** Single-block hash of a message shorter than 128 bytes. */
+void b2b256_short(inout uint8_t inb[72], uint len, out uint8_t outb[32]) {
+    uint64_t h[8];
+    initState(h);
+    uint64_t m[16];
+    for (int i = 0; i < 16; i++) {
+        uint64_t w = 0UL;
+        for (int j = 0; j < 8; j++) {
+            uint idx = uint(i * 8 + j);
+            if (idx < len) w |= uint64_t(uint(inb[idx])) << (8 * j);
+        }
+        m[i] = w;
+    }
+    compressU(h, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15], uint64_t(len), true);
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++)
+            outb[i * 8 + j] = uint8_t((h[i] >> (8 * j)) & 0xFFUL);
+}
+
+/** M's little-endian message word at index w is bswap64(w). */
+uint64_t mWord(uint w) {
+    uint64_t v = uint64_t(w);
+    return ((v & 0x00000000000000ffUL) << 56) | ((v & 0x000000000000ff00UL) << 40) |
+           ((v & 0x0000000000ff0000UL) << 24) | ((v & 0x00000000ff000000UL) << 8) |
+           ((v & 0x000000ff00000000UL) >> 8)  | ((v & 0x0000ff0000000000UL) >> 24) |
+           ((v & 0x00ff000000000000UL) >> 40) | ((v & 0xff00000000000000UL) >> 56);
+}
+
+uint bswap32(uint v) {
+    return ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8) |
+           ((v & 0x00ff0000u) >> 8)  | ((v & 0xff000000u) >> 24);
+}
+
+/** H(idx | height | M) with the leading byte dropped, as 4 limbs. */
+void genElement(uint idx, uint height, out uint64_t limb[4]) {
+    uint64_t h[8];
+    initState(h);
+    uint64_t m[16];
+    uint64_t t = 0UL;
+
+    // block 0: idx(4 BE) | height(4 BE) | M[0..119]
+    m[0] = uint64_t(bswap32(idx)) | (uint64_t(bswap32(height)) << 32);
+    for (int j = 1; j < 16; j++) m[j] = mWord(uint(j - 1));
+    t += 128UL;
+    compressU(h, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15], t, false);
+
+    // blocks 1..63: pure M
+    for (uint b = 1u; b < 64u; b++) {
+        uint base = 15u + (b - 1u) * 16u;
+        for (int j = 0; j < 16; j++) m[j] = mWord(base + uint(j));
+        t += 128UL;
+        compressU(h, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15], t, false);
+    }
+
+    // final block: M word 1023 (8 bytes)
+    m[0] = mWord(1023u);
+    for (int j = 1; j < 16; j++) m[j] = 0UL;
+    compressU(h, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15], 8200UL, true);
+
+    uint8_t d[32];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++)
+            d[i * 8 + j] = uint8_t((h[i] >> (8 * j)) & 0xFFUL);
+
+    // d[1] is the most significant byte, d[31] the least.
+    for (int l = 0; l < 4; l++) {
+        int off = (3 - l) * 8;
+        uint64_t v = 0UL;
+        for (int j = 0; j < 8; j++) {
+            uint bv = (off + j == 0) ? 0u : uint(d[off + j]);
+            v = (v << 8) | uint64_t(bv);
+        }
+        limb[l] = v;
+    }
+}
+
+uvec4 packLo(uint64_t a, uint64_t b) {
+    return uvec4(uint(a & 0xFFFFFFFFUL), uint(a >> 32),
+                 uint(b & 0xFFFFFFFFUL), uint(b >> 32));
+}
+
+void storeElement(uint chunk, uint slot, uint64_t limb[4]) {
+    uint base = slot * 2u;
+    uvec4 lo = packLo(limb[0], limb[1]);
+    uvec4 hi = packLo(limb[2], limb[3]);
+    if (chunk == 0u)      { c0.d[base] = lo; c0.d[base + 1u] = hi; }
+    else if (chunk == 1u) { c1.d[base] = lo; c1.d[base + 1u] = hi; }
+    else if (chunk == 2u) { c2.d[base] = lo; c2.d[base + 1u] = hi; }
+    else                  { c3.d[base] = lo; c3.d[base + 1u] = hi; }
+}
+
+uint64_t joinLo(uvec4 v, int part) {
+    return (part == 0) ? (uint64_t(v.x) | (uint64_t(v.y) << 32))
+                       : (uint64_t(v.z) | (uint64_t(v.w) << 32));
+}
+
+void loadElement(uint i, out uint64_t limb[4]) {
+    uint which = i >> pc.chunkShift;
+    uint base = (i & ((1u << pc.chunkShift) - 1u)) * 2u;
+    uvec4 lo, hi;
+    if (which == 0u)      { lo = c0.d[base]; hi = c0.d[base + 1u]; }
+    else if (which == 1u) { lo = c1.d[base]; hi = c1.d[base + 1u]; }
+    else if (which == 2u) { lo = c2.d[base]; hi = c2.d[base + 1u]; }
+    else                  { lo = c3.d[base]; hi = c3.d[base + 1u]; }
+    limb[0] = joinLo(lo, 0); limb[1] = joinLo(lo, 1);
+    limb[2] = joinLo(hi, 0); limb[3] = joinLo(hi, 1);
+}
+
+void add256(inout uint64_t acc[4], uint64_t v[4]) {
+    uint64_t carry = 0UL;
+    for (int i = 0; i < 4; i++) {
+        uint64_t s = acc[i] + v[i];
+        uint64_t c1v = (s < acc[i]) ? 1UL : 0UL;
+        uint64_t s2 = s + carry;
+        uint64_t c2v = (s2 < s) ? 1UL : 0UL;
+        acc[i] = s2;
+        carry = c1v + c2v;
+    }
+}
+
+bool lt256(uint64_t a[4], uint64_t b[4]) {
+    for (int i = 3; i >= 0; i--) {
+        if (a[i] != b[i]) return a[i] < b[i];
+    }
+    return false;
+}
+
+/** The Autolykos v2 hit for one nonce. */
+void computeHit(uint64_t nonce, out uint64_t hit[4]) {
+    uint8_t msg[32];
+    for (int j = 0; j < 8; j++) {
+        msg[j]      = uint8_t((pc.msg0 >> (8 * j)) & 0xFFUL);
+        msg[8 + j]  = uint8_t((pc.msg1 >> (8 * j)) & 0xFFUL);
+        msg[16 + j] = uint8_t((pc.msg2 >> (8 * j)) & 0xFFUL);
+        msg[24 + j] = uint8_t((pc.msg3 >> (8 * j)) & 0xFFUL);
+    }
+
+    uint8_t buf[72];
+    for (int i = 0; i < 32; i++) buf[i] = msg[i];
+    for (int i = 0; i < 8; i++)
+        buf[32 + i] = uint8_t((nonce >> (8 * (7 - i))) & 0xFFUL);
+
+    uint8_t d[32];
+    b2b256_short(buf, 40u, d);
+
+    uint64_t prei8 = 0UL;
+    for (int i = 24; i < 32; i++) prei8 = (prei8 << 8) | uint64_t(uint(d[i]));
+    uint i0 = uint(prei8 % uint64_t(pc.N));
+
+    uint64_t limb[4];
+    loadElement(i0, limb);
+
+    // the element's 31 bytes, big-endian
+    uint8_t f[31];
+    for (int j = 0; j < 7; j++) f[j] = uint8_t((limb[3] >> (8 * (6 - j))) & 0xFFUL);
+    for (int l = 0; l < 3; l++) {
+        uint64_t x = limb[2 - l];
+        for (int j = 0; j < 8; j++)
+            f[7 + l * 8 + j] = uint8_t((x >> (8 * (7 - j))) & 0xFFUL);
+    }
+
+    for (int i = 0; i < 31; i++) buf[i] = f[i];
+    for (int i = 0; i < 32; i++) buf[31 + i] = msg[i];
+    for (int i = 0; i < 8; i++)
+        buf[63 + i] = uint8_t((nonce >> (8 * (7 - i))) & 0xFFUL);
+    b2b256_short(buf, 71u, d);
+
+    uint8_t ext[35];
+    for (int i = 0; i < 32; i++) ext[i] = d[i];
+    ext[32] = d[0]; ext[33] = d[1]; ext[34] = d[2];
+
+    uint64_t acc[4];
+    acc[0] = 0UL; acc[1] = 0UL; acc[2] = 0UL; acc[3] = 0UL;
+    for (uint j = 0u; j < AL_K; j++) {
+        uint v = (uint(ext[j]) << 24) | (uint(ext[j + 1u]) << 16) |
+                 (uint(ext[j + 2u]) << 8) | uint(ext[j + 3u]);
+        uint64_t e[4];
+        loadElement(v % pc.N, e);
+        add256(acc, e);
+    }
+
+    uint8_t sumbe[72];
+    for (int l = 0; l < 4; l++) {
+        uint64_t x = acc[3 - l];
+        for (int j = 0; j < 8; j++)
+            sumbe[l * 8 + j] = uint8_t((x >> (8 * (7 - j))) & 0xFFUL);
+    }
+    b2b256_short(sumbe, 32u, d);
+
+    for (int l = 0; l < 4; l++) {
+        uint64_t x = 0UL;
+        for (int j = 0; j < 8; j++) x = (x << 8) | uint64_t(uint(d[(3 - l) * 8 + j]));
+        hit[l] = x;
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0u) {  // build dataset
+        if (gid >= pc.buildCount) return;
+        uint64_t limb[4];
+        genElement(pc.buildFirst + gid, pc.height, limb);
+        storeElement(pc.buildChunk, gid, limb);
+        return;
+    }
+
+    if (pc.mode == 2u) {  // verify a single nonce
+        if (gid != 0u) return;
+        uint64_t hit[4];
+        computeHit(pc.baseNonce, hit);
+        for (uint l = 0u; l < 4u; l++) outbuf.v[l] = hit[l];
+        return;
+    }
+
+    // search
+    uint64_t nonce = pc.baseNonce + uint64_t(gid);
+    uint64_t hit[4];
+    computeHit(nonce, hit);
+
+    uint64_t target[4];
+    target[0] = pc.t0; target[1] = pc.t1; target[2] = pc.t2; target[3] = pc.t3;
+
+    if (lt256(hit, target)) {
+        uint slot = atomicAdd(cnt.n, 1u);
+        if (slot < pc.maxOut) {
+            uint base = slot * 5u;
+            outbuf.v[base] = nonce;
+            for (uint l = 0u; l < 4u; l++) outbuf.v[base + 1u + l] = hit[l];
+        }
+    }
+}

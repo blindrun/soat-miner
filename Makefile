@@ -11,21 +11,21 @@ ARCH    ?= sm_89
 NVCC    ?= nvcc
 NVFLAGS  = -O3 -arch=$(ARCH) --std=c++17 -lineinfo
 BIN      = soat-miner
-BIN_CL   = soat-miner-cl
+BIN_VK   = soat-miner-vk
 BUILD    = build
 CXX     ?= g++
 CXXFLAGS = -O3 --std=c++17 -Isrc
 
 ALGO_OBJS = $(BUILD)/autolykos2.o
 CORE_OBJS = $(BUILD)/miner.o $(BUILD)/registry.o $(BUILD)/run_cuda.o $(BUILD)/stratum_cuda.o
-CL_OBJS   = $(BUILD)/miner_cl.o $(BUILD)/algo_cl.o $(BUILD)/kernel_cl.o $(BUILD)/run_cl.o $(BUILD)/stratum_cl.o
+VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/algo_vk.o $(BUILD)/spirv.o $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o
 
-.PHONY: all cuda opencl clean test bench install dirs package
+.PHONY: all cuda vulkan clean test bench install dirs package
 
-all: cuda opencl
+all: cuda vulkan
 
 cuda: $(BIN)
-opencl: $(BIN_CL)
+vulkan: $(BIN_VK)
 
 dirs:
 	@mkdir -p $(BUILD)
@@ -54,24 +54,30 @@ $(BUILD)/run_cuda.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
 $(BIN): $(CORE_OBJS) $(ALGO_OBJS)
 	$(NVCC) $(NVFLAGS) $^ -o $@
 
-# --- OpenCL build: portable, no vendor toolchain needed --------------------
-$(BUILD)/kernel_cl.cpp: src/algos/autolykos2/kernel.cl scripts/embed_kernel.py | dirs
-	python3 scripts/embed_kernel.py $< $@
+# --- Vulkan build: portable, one SPIR-V module for every vendor ------------
+$(BUILD)/kernel.spv: src/algos/autolykos2/kernel.comp | dirs
+	glslangValidator -V --target-env vulkan1.2 $< -o $@
 
-$(BUILD)/kernel_cl.o: $(BUILD)/kernel_cl.cpp | dirs
+$(BUILD)/spirv.cpp: $(BUILD)/kernel.spv scripts/embed_spirv.py | dirs
+	python3 scripts/embed_spirv.py $< $@
+
+$(BUILD)/spirv.o: $(BUILD)/spirv.cpp | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/algo_cl.o: src/algos/autolykos2/algo_cl.cpp src/core/algo.h | dirs
+$(BUILD)/algo_vk.o: src/algos/autolykos2/algo_vk.cpp src/core/algo.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/run_cl.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
+$(BUILD)/run_vk.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/miner_cl.o: src/core/miner_cl.cpp src/core/run.h | dirs
+$(BUILD)/stratum_vk.o: src/core/stratum.cpp src/core/stratum.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BIN_CL): $(CL_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -lOpenCL -ldl -lpthread -o $@
+$(BUILD)/miner_vk.o: src/core/miner_vk.cpp src/core/run.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_VK): $(VK_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -lvulkan -ldl -lpthread -o $@
 
 # --- correctness gates -----------------------------------------------------
 # test_hit is the one that matters: it rebuilds the real dataset and
@@ -95,14 +101,14 @@ install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)/usr/local/bin/$(BIN)
 
 clean:
-	rm -rf $(BUILD) $(BIN) $(BIN_CL) tests/test_element tests/test_hit tests/test_opencl
+	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit tests/test_opencl
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
 VERSION ?= 0.1.0
 PKGNAME  = soat-miner_v$(VERSION)_Lin64
-package: cuda opencl
+package: cuda vulkan
 	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)
-	cp $(BIN) $(BIN_CL) $(BUILD)/$(PKGNAME)/
+	cp $(BIN) $(BIN_VK) $(BUILD)/$(PKGNAME)/
 	cp packaging/soat-miner.sh packaging/soat-miner.bat packaging/config.txt \
 	   README.md LICENSE $(BUILD)/$(PKGNAME)/
 	cp scripts/soat-miner-guard.py scripts/guard.conf.example \
