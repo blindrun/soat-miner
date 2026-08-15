@@ -33,6 +33,17 @@ class JobSource {
     virtual const char *describe() const = 0;
     virtual bool fetch(Job *job) = 0;
     virtual bool submit(const Job &job, const Solution &sol, std::string *err) = 0;
+
+    /**
+     * Share counts as confirmed by the far end, for sources that answer.
+     * Returning false means "this source cannot tell you" - which is the
+     * honest answer for solo, where the node's HTTP reply is synchronous.
+     */
+    virtual bool poolCounters(uint64_t *accepted, uint64_t *rejected,
+                              uint64_t *pending, std::string *lastError) const {
+        (void)accepted; (void)rejected; (void)pending; (void)lastError;
+        return false;
+    }
 };
 
 /** Solo mining against an Ergo node's /mining API. */

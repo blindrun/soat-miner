@@ -115,6 +115,8 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     uint64_t nonceCounter = ((uint64_t)time(nullptr) << 16) & nonceMask;
     uint64_t nonce = noncePrefix | nonceCounter;
     uint64_t intervalHashes = 0;
+    uint64_t hostRejected = 0;  // failures this side of the wire, kept separate
+                                // from what the pool rejected
     const auto tStart = std::chrono::steady_clock::now();
     auto tReport = tStart;
     std::vector<Solution> sols;
@@ -181,7 +183,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         for (const auto &s : sols) {
             char buf[160];
             if (!algo->verify(job, s)) {
-                stats.rejected++;
+                hostRejected++;
                 snprintf(buf, sizeof(buf),
                          "candidate failed host verification (unstable clocks?) "
                          "nonce=%016llx - NOT submitted",
@@ -192,12 +194,23 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             if (opt.bench) continue;
             std::string err;
             if (source->submit(job, s, &err)) {
-                stats.accepted++;
-                snprintf(buf, sizeof(buf), "SOLUTION ACCEPTED  nonce=%016llx",
-                         (unsigned long long)s.nonce);
-                logLine(tty, "ok", buf);
+                uint64_t a = 0, r = 0, p = 0;
+                std::string le;
+                // "submitted" is all that is known at this point for a pool -
+                // the verdict comes back on the reader thread. Only solo, which
+                // cannot report counters, can call it accepted here.
+                if (source->poolCounters(&a, &r, &p, &le)) {
+                    snprintf(buf, sizeof(buf), "share submitted   nonce=%016llx",
+                             (unsigned long long)s.nonce);
+                    logLine(tty, "info", buf);
+                } else {
+                    stats.accepted++;
+                    snprintf(buf, sizeof(buf), "SOLUTION ACCEPTED  nonce=%016llx",
+                             (unsigned long long)s.nonce);
+                    logLine(tty, "ok", buf);
+                }
             } else {
-                stats.rejected++;
+                hostRejected++;
                 snprintf(buf, sizeof(buf), "solution rejected  nonce=%016llx  %s",
                          (unsigned long long)s.nonce, err.c_str());
                 logLine(tty, "error", buf);
@@ -208,6 +221,23 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         nonce = noncePrefix | nonceCounter;
         intervalHashes += opt.batch;
         stats.totalNonces += opt.batch;
+
+        // Surface each pool rejection once, with the pool's own words. Without
+        // this a miner that is being refused every share looks identical to
+        // one that is being paid for every share.
+        {
+            auto *st = dynamic_cast<StratumSource *>(source.get());
+            if (st) {
+                const std::string v = st->takeSubmitVerdict();
+                if (!v.empty())
+                    logLine(tty, "error", "pool REJECTED the share: " + v);
+                uint64_t a = 0, r = 0, p = 0;
+                std::string le;
+                st->poolCounters(&a, &r, &p, &le);
+                stats.accepted = a;
+                stats.rejected = hostRejected + r;
+            }
+        }
 
         const auto now = std::chrono::steady_clock::now();
         const double el = std::chrono::duration<double>(now - tReport).count();

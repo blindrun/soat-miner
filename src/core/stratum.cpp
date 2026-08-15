@@ -258,6 +258,37 @@ void StratumSource::handleLine(const std::string &line) {
         }
     }
 
+    // A submit reply. Reading this is not optional: a pool that refuses every
+    // share looks exactly like a pool that accepts every share if you only
+    // check that the send succeeded. That is how a 3-param mining.submit
+    // shipped - the pool answered "Invalid params" to all of them and the
+    // miner reported every one as accepted.
+    {
+        std::string idRaw3;
+        if (rawValue(line, "id", &idRaw3)) {
+            const int rid = atoi(idRaw3.c_str());
+            if (rid >= kFirstSubmitId) {
+                std::string result, errv;
+                rawValue(line, "result", &result);
+                rawValue(line, "error", &errv);
+                const bool ok = (result == "true") &&
+                                (errv.empty() || errv == "null");
+                std::lock_guard<std::mutex> lk(mu_);
+                if (ok) {
+                    accepted_++;
+                    verdict_ = "";
+                } else {
+                    rejected_++;
+                    lastSubmitError_ = (errv.empty() || errv == "null")
+                                           ? "pool rejected the share"
+                                           : errv;
+                    verdict_ = lastSubmitError_;
+                }
+                return;
+            }
+        }
+    }
+
     // A response. The only one we care about is the subscribe reply, which
     // carries the extranonce prefix.
     std::string idRaw;
@@ -292,27 +323,56 @@ void StratumSource::handleLine(const std::string &line) {
 bool StratumSource::submit(const Job &job, const Solution &sol, std::string *err) {
     (void)job;
     std::string id;
+    int ownedBits;
     {
         std::lock_guard<std::mutex> lk(mu_);
         id = jobId_;
+        ownedBits = nonceBitsOwned_;
     }
     char nhex[17];
     snprintf(nhex, sizeof(nhex), "%016llx", (unsigned long long)sol.nonce);
+
+    // params[2] is extraNonce2: the part of the nonce this miner owns, i.e.
+    // the full nonce with the pool's extranonce prefix stripped off.
+    const int prefixNibbles = (64 - ownedBits) / 4;
+    const char *xn2 = nhex + (prefixNibbles < 16 ? prefixNibbles : 16);
 
     std::lock_guard<std::mutex> lk(submitMu_);
     const int rid = nextId_++;
     char payload[512];
     snprintf(payload, sizeof(payload),
-             "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\"]}",
-             rid, login_.c_str(), id.c_str(), nhex);
+             "{\"id\":%d,\"method\":\"mining.submit\",\"params\":"
+             "[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
+             rid, login_.c_str(), id.c_str(), xn2, kNTime, nhex);
     if (!sendLine(payload)) {
         *err = "submit send failed";
         return false;
     }
-    // Optimistic: the pool replies asynchronously and the reader thread would
-    // have to correlate ids. Shares are cheap and the host already verified
-    // the hit, so a send failure is the only thing treated as a rejection.
+    // The pool's verdict arrives asynchronously on the reader thread, which
+    // matches it back to this id. A send failure is the only thing this call
+    // can report; poolCounters() carries what the pool actually said.
+    {
+        std::lock_guard<std::mutex> pk(mu_);
+        submitted_++;
+    }
     return connected_;
+}
+
+bool StratumSource::poolCounters(uint64_t *accepted, uint64_t *rejected,
+                                 uint64_t *pending, std::string *lastError) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    *accepted = accepted_;
+    *rejected = rejected_;
+    *pending = (submitted_ > accepted_ + rejected_) ? submitted_ - accepted_ - rejected_ : 0;
+    *lastError = lastSubmitError_;
+    return true;
+}
+
+std::string StratumSource::takeSubmitVerdict() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string v;
+    v.swap(verdict_);
+    return v;
 }
 
 }  // namespace om

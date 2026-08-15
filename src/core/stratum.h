@@ -92,6 +92,13 @@ class StratumSource : public JobSource {
     uint64_t noncePrefix() const { return noncePrefix_; }
     int nonceBitsOwned() const { return nonceBitsOwned_; }
 
+    /** What the POOL said about our shares, not what we hoped it said. */
+    bool poolCounters(uint64_t *accepted, uint64_t *rejected, uint64_t *pending,
+                      std::string *lastError) const override;
+
+    /** Pops the most recent rejection reason, so it is logged exactly once. */
+    std::string takeSubmitVerdict();
+
    private:
     void readerLoop();
     bool sendLine(const std::string &s);
@@ -113,12 +120,17 @@ class StratumSource : public JobSource {
     uint64_t noncePrefix_ = 0;
     int nonceBitsOwned_ = 64;
 
-    std::atomic<int> nextId_{10};
+    /** Submit request ids start here, so a reply is identifiable by id alone. */
+    static const int kFirstSubmitId = 10;
+    /** params[3] is nTime. Ergo's mining.notify carries none, and pools only
+     *  use it to de-duplicate submissions, so a constant is correct here. */
+    static constexpr const char *kNTime = "00000000";
+
+    std::atomic<int> nextId_{kFirstSubmitId};
     std::atomic<bool> loginRejected_{false};
     std::string loginError_;
-    std::atomic<int> accepted_{0};
-    std::atomic<int> rejected_{0};
-    std::string lastSubmitError_;
+    uint64_t submitted_ = 0, accepted_ = 0, rejected_ = 0;
+    std::string lastSubmitError_, verdict_;
     std::mutex submitMu_;
 };
 
