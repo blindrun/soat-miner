@@ -5,3 +5,4 @@ tests/test_hit
 tests/__pycache__/
 *.o
 *.log
+tests/test_vulkan

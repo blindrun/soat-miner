@@ -11,12 +11,20 @@ NO CUDA BUILD IN THIS ARCHIVE
   The CUDA binary cannot be cross-compiled from Linux (nvcc requires MSVC on a
   Windows host), so this archive ships the Vulkan build only.
 
-  That matters if you have an NVIDIA card: NVIDIA's Vulkan compute path is very
-  slow for this workload - about 5.8 MH/s on an RTX 4090, versus 217 MH/s
-  through CUDA. On NVIDIA, build the CUDA target from source:
+  The Vulkan build is fine on NVIDIA now - 267.6 MH/s on an RTX 5080 and
+  162.5 on a 4090. (It used to be about 3-6 MH/s: the dataset was not a
+  dedicated allocation, so it never got large pages and the random lookups
+  missed the TLB. Fixed.)
 
-      cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
+  CUDA is still faster on NVIDIA - 217 MH/s on a 4090 against 162.5 through
+  Vulkan - so building it is worth it if you have the toolkit:
+
+      cmake -B build
       cmake --build build --config Release
+
+  That needs the CUDA Toolkit and Visual Studio Build Tools. RTX 50-series
+  needs CUDA 12.8 or newer for native code; older toolkits still work through
+  the PTX the build embeds for exactly this reason.
 
   On AMD, the Vulkan build IS the right one and there is nothing to miss.
 
@@ -34,6 +42,7 @@ REQUIREMENTS
   with 8 GB or more.
 
 TESTED
-  This binary is cross-compiled and its imports verified (KERNEL32, WS2_32,
-  msvcrt, vulkan-1 - nothing else), but it has NOT been run on Windows.
-  You are the first. Please report what happens.
+  This binary is cross-compiled from Linux and its imports verified (KERNEL32,
+  WS2_32, msvcrt, vulkan-1 - nothing else). The Vulkan path is tested on Linux
+  on both NVIDIA and AMD; Windows itself is only lightly exercised, so please
+  report what happens.

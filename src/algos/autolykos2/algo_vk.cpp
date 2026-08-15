@@ -494,10 +494,38 @@ class Autolykos2VK : public Algorithm {
             return false;
         }
 
+        // Dedicated allocation. This one flag is worth 72x on NVIDIA.
+        //
+        // The Vulkan backend used to collapse as the dataset grew - on a 4090,
+        // same code, only the height changing: 119 MH/s at 2.15 GB, 5.4 at
+        // 3.86, 2.9 at 7.27, while CUDA stayed flat near 218 across all three.
+        // Two plausible causes were both wrong. It was not the four-way
+        // if/else that picks a chunk buffer on every gather: removing that
+        // branch entirely changed nothing. It was not register spilling
+        // either: an RTX 5080 with essentially no spilling (48 bytes, against
+        // 336-448 on the 4090) was just as slow.
+        //
+        // It is TLB reach. Confining the gathers to the first 2.15 GB of a
+        // full 7.27 GB allocation restored the fast number exactly (88.5 vs
+        // 89.3 MH/s), which rules out every code path and leaves only how far
+        // the random gathers span. Without this flag the driver does not back
+        // the dataset with large pages, and 33 random gathers per nonce across
+        // several GB miss the TLB nearly every time - the card sat at 100%
+        // "utilisation" with 4% memory utilisation and half its power budget
+        // unused, which is a stalled kernel, not a saturated one.
+        //
+        // Measured at 7.27 GB with the flag: 4090 2.1 -> 153 MH/s,
+        // 5080 5.7 -> 267 MH/s, memory utilisation 4% -> 99%. CUDA never
+        // showed this because cudaMalloc gets large pages already.
+        VkMemoryDedicatedAllocateInfo mdai{};
+        mdai.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        mdai.buffer = b->buf;
+
         VkMemoryAllocateInfo mai{};
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = type;
+        mai.pNext = &mdai;
         VKCHECK(vkAllocateMemory(dev_, &mai, nullptr, &b->mem));
         VKCHECK(vkBindBufferMemory(dev_, b->buf, b->mem, 0));
         b->size = size;

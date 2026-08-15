@@ -34,7 +34,7 @@ the right thing.
 | | |
 |---|---|
 | Algorithms | Autolykos v2 (Ergo) — more planned |
-| Hashrate | **217** RTX 4090 (CUDA) · **151.9** RX 7900 XT · **82.9** RX 6700 XT (Vulkan) MH/s |
+| Hashrate | **267.6** RTX 5080 · **217** RTX 4090 (CUDA) · **162.5** RTX 4090 · **151.9** RX 7900 XT · **82.9** RX 6700 XT (Vulkan) MH/s |
 | Dev fee | **none** |
 | Correctness | verified against real mainnet blocks — see below |
 | Backends | **CUDA** (NVIDIA) · **Vulkan** (AMD, Intel, NVIDIA) |
@@ -59,13 +59,39 @@ binary, only `--bench-height` changed:
 Most published Autolykos figures date from 2022, when the dataset was ~2.9 GB.
 Compare like with like before concluding a miner is slow — including this one.
 
+### The dataset must be a dedicated allocation
+
+Vulkan buffers are not automatically backed by large pages. Without
+`VkMemoryDedicatedAllocateInfo` on the dataset, NVIDIA's driver maps it in a
+way that makes 33 random gathers per nonce miss the TLB almost every time, and
+the miner collapses as the dataset grows — on a 4090, 119 MH/s at 2.15 GB but
+2.9 MH/s at 7.27 GB, while CUDA stayed flat near 218. Two obvious explanations
+were both wrong: it was not the branch that selects a chunk buffer (removing it
+changed nothing) and not register spilling (a 5080 with essentially none was
+just as slow). Confining the gathers to the first 2.15 GB of a full 7.27 GB
+allocation restored the fast number exactly, which leaves only how far the
+gathers span. One flag fixed it:
+
+| GPU | before | after |
+|---|---|---|
+| RTX 5080 | 5.7 | **267.6** |
+| RTX 4090 | 2.9 | **162.5** |
+| RX 6700 XT | 82.9 | 82.9 (unaffected) |
+
+Memory utilisation went from 4% to 99% on the 5080 — the kernel had been
+TLB-stalled, not bandwidth-bound. AMD is unchanged, so this is an NVIDIA
+mapping behaviour, not an algorithm problem. CUDA never showed it because
+`cudaMalloc` gets large pages already.
+
 ### It is bandwidth-bound, and the numbers show it
 
 Measured across three cards at the same chain height:
 
 | GPU | Backend | MH/s | Peak BW | Useful BW | % of peak |
 |---|---|---|---|---|---|
+| RTX 5080 | Vulkan | 267.6 | 960 GB/s | 282 GB/s | 29.4% |
 | RTX 4090 | CUDA | 217.0 | 1008 GB/s | 229 GB/s | 22.7% |
+| RTX 4090 | Vulkan | 162.5 | 1008 GB/s | 171 GB/s | 17.0% |
 | RX 7900 XT | Vulkan | 151.9 | 800 GB/s | 160 GB/s | 20.0% |
 | RX 6700 XT | Vulkan | 82.9 | 384 GB/s | 88 GB/s | 22.8% |
 
@@ -345,9 +371,9 @@ quarter of VRAM (6.3 GB on a 24 GB card) while the dataset is 7.27 GB, so the
 dataset is split across up to four buffers and addressed across them.
 
 ## Not done yet
-- **Windows is built but untested on real hardware.** The platform shim covers
-  Winsock, `_isatty`, and MSVC's lack of `__int128`; it compiles, but nobody
-  has run it on Windows yet.
+- **Windows is built but only lightly exercised.** The platform shim covers
+  Winsock, `_isatty`, and MSVC's lack of `__int128`. The Vulkan `.exe` has been
+  run; the CUDA build on Windows has not.
 - Multi-GPU. Single device today.
 
 ## License
