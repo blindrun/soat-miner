@@ -31,15 +31,50 @@ test that proves it computes the right thing.
 | | |
 |---|---|
 | Algorithm | Autolykos v2 (Ergo) |
-| Hashrate | **217 MH/s** on an RTX 4090 @ 183 W (1.30 MH/W) |
+| Hashrate | **217 MH/s** RTX 4090 (CUDA) · **82.9 MH/s** RX 6700 XT (Vulkan) |
 | Dev fee | **none** |
 | Correctness | verified against real mainnet blocks — see below |
 | Backends | **CUDA** (NVIDIA) and **OpenCL** (AMD / Intel / NVIDIA) - both 217 MH/s |
 | Work source | **pools (stratum)** and solo via your own node |
 | Platforms | Linux (tested), Windows (builds; untested on hardware) |
 
-For reference, lolMiner does ~265 MH/s on the same card and takes a 0.75–1%
-dev fee. This is ~82% of that with none, and you can read it.
+For reference, lolMiner does ~265 MH/s on a 4090 and takes a 0.75–1% dev fee.
+This is ~82% of that with none, and you can read it.
+
+### Hashrate depends on the chain height, a lot
+
+Autolykos v2's dataset grows over time, and this workload is memory bound, so
+hashrate falls as the dataset outgrows cache. Measured on one RX 6700 XT, same
+binary, only `--bench-height` changed:
+
+| Epoch | Dataset | Hashrate |
+|---|---|---|
+| 2021 (h=614,400) | 2.25 GB | **235.2 MH/s** |
+| 2023 (h=1,200,000) | 3.86 GB | **154.2 MH/s** |
+| today (h=1,851,444) | **7.27 GB** | **82.9 MH/s** |
+
+Most published Autolykos figures date from 2022, when the dataset was ~2.9 GB.
+Compare like with like before concluding a miner is slow — including this one.
+
+### Both paths are at hardware limits
+
+The dataset build is ALU-saturated on both vendors, and the difference between
+the cards is exactly the difference in their ALUs:
+
+| GPU | Build | Throughput | % of ALU peak |
+|---|---|---|---|
+| RX 6700 XT | 9.86 s | 5.03 T ops/s | 81.3% |
+| RTX 4090 | 1.47 s | 33.76 T ops/s | 81.8% |
+
+Build-time ratio 6.71×, ALU capacity ratio 6.66×. The search path is memory
+bound: removing its 33 random gathers takes it from 82.9 to 780 MH/s.
+
+Optimisations tried and **rejected as measurably useless or harmful**, so
+nobody repeats them: LDS-cached `M` table (cost 11 MH/s to occupancy),
+`N` as a specialization constant (no change, and it baked `N` into the
+pipeline so it would break at the next epoch), wave32 vs wave64 (no change),
+8-wide batched loads for memory-level parallelism (71.4 vs 82.9), unrolling
+the message-array fills (no change — the compiler already did it).
 
 ## Correctness
 
@@ -112,6 +147,17 @@ Edit `config.txt`, then run the launcher:
 ./soat-miner.sh            # Linux
 soat-miner.bat             # Windows
 ```
+
+Or use a ready-made script — edit `WALLET` at the top and run it:
+
+| Script | What it does |
+|---|---|
+| `mine_ergo_herominers.sh` / `.bat` | pool mine to HeroMiners |
+| `mine_ergo_woolypooly.sh` / `.bat` | pool mine to WoolyPooly |
+| `mine_ergo_solo.sh` / `.bat` | solo against your own node |
+| `benchmark.sh` / `.bat` | benchmark, no pool or node needed |
+
+Command-line flags override `config.txt`, so these work without editing it.
 
 ```ini
 WALLET=9yourErgoAddress...

@@ -15,6 +15,15 @@ if /i "%BACKEND%"=="auto" (
 )
 if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-vk.exe )
 
+REM Command-line args override config.txt, so the mine_ergo_*.bat wrappers
+REM can pass their own --pool/--wallet.
+echo %* | findstr /C:"--pool" /C:"--node" >nul
+if %errorlevel%==0 (
+  echo SOAT Miner [%BACKEND%] - using command-line pool/node settings
+  %BIN% --batch %BATCH% --interval %INTERVAL% %*
+  goto :eof
+)
+
 if not "%POOL%"=="" (
   echo SOAT Miner -^> pool %POOL% as %WORKER% [%BACKEND%]
   %BIN% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %*

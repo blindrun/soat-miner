@@ -109,12 +109,12 @@ PKGNAME  = soat-miner_v$(VERSION)_Lin64
 package: cuda vulkan
 	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)
 	cp $(BIN) $(BIN_VK) $(BUILD)/$(PKGNAME)/
-	cp packaging/soat-miner.sh packaging/soat-miner.bat packaging/config.txt \
+	cp packaging/*.sh packaging/*.bat packaging/config.txt \
 	   README.md LICENSE $(BUILD)/$(PKGNAME)/
 	cp scripts/soat-miner-guard.py scripts/guard.conf.example \
 	   scripts/soat-miner.service scripts/soat-miner-guard.service \
 	   $(BUILD)/$(PKGNAME)/
-	chmod +x $(BUILD)/$(PKGNAME)/soat-miner.sh
+	chmod +x $(BUILD)/$(PKGNAME)/*.sh
 	cd $(BUILD) && tar czf $(PKGNAME).tar.gz $(PKGNAME)
 	@sha256sum $(BUILD)/$(PKGNAME).tar.gz | tee $(BUILD)/$(PKGNAME).tar.gz.sha256
 	@echo "packaged: $(BUILD)/$(PKGNAME).tar.gz"
