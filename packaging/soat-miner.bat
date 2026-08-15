@@ -32,9 +32,9 @@ if not exist "%BIN%" (
 
 REM Command-line args override config.txt, so the mine_ergo_*.bat wrappers
 REM can pass their own --pool/--wallet.
-echo %* | findstr /C:"--pool" /C:"--node" >nul
+echo %* | findstr /C:"--pool" /C:"--node" /C:"--bench" /C:"--list-devices" /C:"--list-algos" /C:"--help" >nul
 if %errorlevel%==0 (
-  echo SOAT Miner [%BACKEND%] - using command-line pool/node settings
+  echo SOAT Miner [%BACKEND%] - using command-line settings
   %BIN% --batch %BATCH% --interval %INTERVAL% %*
   goto :eof
 )

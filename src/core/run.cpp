@@ -22,12 +22,24 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     stats.backend = opt.backendLabel;
     stats.gpuMemGB = gpuMemGB;
 
+    // Banner before any network or GPU work. Connecting to a pool and
+    // building the dataset take ~15s combined, and printing nothing for that
+    // long reads as a hang - it is the first thing a new user sees.
+    stats.source = opt.bench ? "benchmark (no pool/node)"
+                 : (!opt.poolHost.empty()
+                        ? opt.poolHost + ":" + std::to_string(opt.poolPort) + " (pool)"
+                        : "ergo node " + opt.target.host + ":" +
+                              std::to_string(opt.target.port) + " (solo)");
+    printBanner(stats, tty);
+
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
     int nonceBits = 64;
     if (opt.bench) {
         stats.source = "benchmark (no pool/node)";
     } else if (!opt.poolHost.empty()) {
+        logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
+                                 std::to_string(opt.poolPort) + " ...");
         auto *st = new StratumSource(opt.poolHost, opt.poolPort, opt.wallet,
                                      opt.worker, opt.password);
         std::string err;
@@ -38,6 +50,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
         source.reset(st);
         stats.source = source->describe();
+        logLine(tty, "ok", "connected, waiting for first job");
         // Give the pool a moment to deliver extranonce + first job.
         for (int i = 0; i < 50; i++) {
             Job probe;
@@ -51,8 +64,6 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         source.reset(new ErgoNodeSource(opt.target));
         stats.source = source->describe();
     }
-
-    printBanner(stats, tty);
 
     Job job;
     uint64_t preparedEpoch = ~0ULL;
@@ -90,6 +101,14 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         if (!job.valid) { sleepSeconds(1); continue; }
 
         if (job.epoch != preparedEpoch) {
+            {
+                char pre[160];
+                snprintf(pre, sizeof(pre),
+                         "epoch %llu - building %.2f GB dataset, please wait...",
+                         (unsigned long long)job.epoch,
+                         algo->memoryBytes(job) / 1e9);
+                logLine(tty, "info", pre);
+            }
             const auto t0 = std::chrono::steady_clock::now();
             if (!algo->prepare(job)) return 1;
             const double secs =
@@ -98,9 +117,8 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             stats.datasetGB = algo->memoryBytes(job) / 1e9;
             char buf[160];
             snprintf(buf, sizeof(buf),
-                     "epoch %llu - built %.2f GB dataset in %.2fs",
-                     (unsigned long long)job.epoch, stats.datasetGB, secs);
-            logLine(tty, "info", buf);
+                     "dataset ready in %.2fs - mining", secs);
+            logLine(tty, "ok", buf);
             preparedEpoch = job.epoch;
             stats.epochs++;
         }

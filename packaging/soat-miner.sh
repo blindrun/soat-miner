@@ -11,11 +11,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck disable=SC1091
 set -a; source ./config.txt; set +a
 
-# Did the caller specify a work source themselves?
+# Did the caller already say where work comes from (or that it needs none)?
+# --bench belongs here too: a benchmark needs no pool, node or wallet, and
+# leaving it out made benchmark.sh fail with "set WALLET in config.txt".
 EXPLICIT_SOURCE=0
 for a in "$@"; do
   case "$a" in
-    --pool|--node) EXPLICIT_SOURCE=1 ;;
+    --pool|--node|--bench|--list-devices|--list-algos|--help|-h) EXPLICIT_SOURCE=1 ;;
   esac
 done
 
@@ -38,7 +40,7 @@ esac
 ARGS=(--batch "${BATCH:-4194304}" --interval "${INTERVAL:-5}")
 
 if [[ "$EXPLICIT_SOURCE" == "1" ]]; then
-  echo "SOAT Miner [$BACKEND] - using command-line pool/node settings"
+  echo "SOAT Miner [$BACKEND] - using command-line settings"
 elif [[ -n "${POOL:-}" ]]; then
   if [[ -z "${WALLET:-}" || "$WALLET" == 9YOUR_ERGO_ADDRESS_HERE ]]; then
     echo "Set WALLET in config.txt to your Ergo address before pool mining."
