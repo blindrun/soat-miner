@@ -12,11 +12,6 @@ and an algorithm only answers "test these nonces, tell me which won".
 - **NVIDIA runs on CUDA.**
 - **Linux and Windows.**
 
-Vulkan was chosen for AMD because of driver availability, not speed. Every
-gaming-oriented AMD distribution ships a working Vulkan driver — RADV ran this
-on Bazzite with no setup at all — whereas AMD OpenCL needs ROCm, amdgpu-pro or
-Mesa rusticl and is frequently missing entirely.
-
 Every mainstream Autolykos miner is a closed-source binary. That is a poor fit
 for a machine that also holds SSH keys, API tokens and real work — so this one
 is source-available end to end and ships with the test that proves it computes
