@@ -15,6 +15,21 @@ if /i "%BACKEND%"=="auto" (
 )
 if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-vk.exe )
 
+REM The Windows archive ships the Vulkan build only - CUDA cannot be
+REM cross-compiled from Linux (nvcc needs MSVC). Fall back rather than fail
+REM with a confusing "not found" on an NVIDIA machine.
+if not exist "%BIN%" (
+  if exist "soat-miner-vk.exe" (
+    echo [!] %BIN% not present, using soat-miner-vk.exe ^(Vulkan^)
+    echo [!] NOTE: Vulkan is very slow on NVIDIA. Build the CUDA target from
+    echo [!]       source with CMake for full speed on NVIDIA cards.
+    set BIN=soat-miner-vk.exe
+  ) else (
+    echo No miner binary found in this folder.
+    exit /b 1
+  )
+)
+
 REM Command-line args override config.txt, so the mine_ergo_*.bat wrappers
 REM can pass their own --pool/--wallet.
 echo %* | findstr /C:"--pool" /C:"--node" >nul

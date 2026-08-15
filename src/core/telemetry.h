@@ -35,8 +35,30 @@ namespace om {
 #define C_BLUE "\033[38;5;39m"
 #define C_ORANGE "\033[38;5;208m"
 
+/**
+ * Windows consoles do not interpret ANSI escapes unless virtual-terminal
+ * processing is switched on, so without this the readout renders as literal
+ * escape-code garbage on Windows 10/11. Enabling it is a no-op elsewhere.
+ */
+inline void enableAnsiOnWindows() {
+#if defined(_WIN32)
+    static bool done = false;
+    if (done) return;
+    done = true;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0;
+    if (!GetConsoleMode(h, &mode)) return;
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+}
+
 inline bool stdoutIsTty() {
 #if defined(_WIN32)
+    enableAnsiOnWindows();
     return _isatty(_fileno(stdout)) != 0;
 #else
     return isatty(fileno(stdout)) != 0;

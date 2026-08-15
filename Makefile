@@ -118,3 +118,45 @@ package: cuda vulkan
 	cd $(BUILD) && tar czf $(PKGNAME).tar.gz $(PKGNAME)
 	@sha256sum $(BUILD)/$(PKGNAME).tar.gz | tee $(BUILD)/$(PKGNAME).tar.gz.sha256
 	@echo "packaged: $(BUILD)/$(PKGNAME).tar.gz"
+
+# --- Windows cross-build (Vulkan only; CUDA needs MSVC on a Windows host) ---
+WINCXX  ?= x86_64-w64-mingw32-g++
+WINDIR   = $(BUILD)/win
+WINFLAGS = -O3 -std=c++17 -Isrc -I$(WINDIR)/include -static -static-libgcc -static-libstdc++
+WINPKG   = soat-miner_v$(VERSION)_Win64
+
+.PHONY: windows windows-package
+
+$(WINDIR)/include/vulkan:
+	@mkdir -p $(WINDIR)/include
+	cp -r /usr/include/vulkan $(WINDIR)/include/
+	-cp -r /usr/include/vk_video $(WINDIR)/include/
+
+# Import library for vulkan-1.dll, generated from the symbols we call.
+$(WINDIR)/libvulkan-1.a: | $(WINDIR)/include/vulkan
+	@mkdir -p $(WINDIR)
+	@{ echo "LIBRARY vulkan-1.dll"; echo "EXPORTS"; \
+	   grep -ohE '\bvk[A-Z][A-Za-z0-9]*\s*\(' src/algos/autolykos2/algo_vk.cpp \
+	   | tr -d '( ' | sort -u \
+	   | grep -vE '^vk(DeviceMemGB|DeviceName|DriverVersion|ListDevices)$$' \
+	   | sed 's/^/    /'; } > $(WINDIR)/vulkan-1.def
+	x86_64-w64-mingw32-dlltool -d $(WINDIR)/vulkan-1.def -l $@
+
+windows: $(BUILD)/spirv.cpp $(WINDIR)/libvulkan-1.a
+	$(WINCXX) $(WINFLAGS) -c src/algos/autolykos2/algo_vk.cpp -o $(WINDIR)/algo_vk.o
+	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv.cpp              -o $(WINDIR)/spirv.o
+	$(WINCXX) $(WINFLAGS) -c src/core/run.cpp                -o $(WINDIR)/run.o
+	$(WINCXX) $(WINFLAGS) -c src/core/stratum.cpp            -o $(WINDIR)/stratum.o
+	$(WINCXX) $(WINFLAGS) -c src/core/miner_vk.cpp           -o $(WINDIR)/miner_vk.o
+	$(WINCXX) $(WINFLAGS) $(WINDIR)/miner_vk.o $(WINDIR)/algo_vk.o $(WINDIR)/spirv.o \
+	    $(WINDIR)/run.o $(WINDIR)/stratum.o $(WINDIR)/libvulkan-1.a -lws2_32 \
+	    -o $(WINDIR)/soat-miner-vk.exe
+	@x86_64-w64-mingw32-objdump -p $(WINDIR)/soat-miner-vk.exe | grep -i "DLL Name" | sort -u
+
+windows-package: windows
+	@rm -rf $(BUILD)/$(WINPKG) && mkdir -p $(BUILD)/$(WINPKG)
+	cp $(WINDIR)/soat-miner-vk.exe $(BUILD)/$(WINPKG)/
+	cp packaging/*.bat packaging/config.txt packaging/README-WINDOWS.txt README.md LICENSE $(BUILD)/$(WINPKG)/
+	cd $(BUILD) && zip -qr $(WINPKG).zip $(WINPKG)
+	@sha256sum $(BUILD)/$(WINPKG).zip | tee $(BUILD)/$(WINPKG).zip.sha256
+	@echo "packaged: $(BUILD)/$(WINPKG).zip"
