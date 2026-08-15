@@ -39,7 +39,7 @@ the right thing.
 | | |
 |---|---|
 | Algorithms | Autolykos v2 (Ergo) — more planned |
-| Hashrate | **217 MH/s** RTX 4090 (CUDA) · **82.9 MH/s** RX 6700 XT (Vulkan) |
+| Hashrate | **217** RTX 4090 (CUDA) · **151.9** RX 7900 XT · **82.9** RX 6700 XT (Vulkan) MH/s |
 | Dev fee | **none** |
 | Correctness | verified against real mainnet blocks — see below |
 | Backends | **CUDA** (NVIDIA) · **Vulkan** (AMD, Intel, NVIDIA) |
@@ -63,6 +63,27 @@ binary, only `--bench-height` changed:
 
 Most published Autolykos figures date from 2022, when the dataset was ~2.9 GB.
 Compare like with like before concluding a miner is slow — including this one.
+
+### It is bandwidth-bound, and the numbers show it
+
+Measured across three cards at the same chain height:
+
+| GPU | Backend | MH/s | Peak BW | Useful BW | % of peak |
+|---|---|---|---|---|---|
+| RTX 4090 | CUDA | 217.0 | 1008 GB/s | 229 GB/s | 22.7% |
+| RX 7900 XT | Vulkan | 151.9 | 800 GB/s | 160 GB/s | 20.0% |
+| RX 6700 XT | Vulkan | 82.9 | 384 GB/s | 88 GB/s | 22.8% |
+
+Three different GPUs, two vendors, two APIs — and all three land within a
+couple of points of the same fraction of their own memory bandwidth. That is
+the signature of a kernel limited by its 33 random gathers per nonce and
+nothing else.
+
+The 7900 XT has 2.08x the 6700 XT's bandwidth and delivers 1.83x the
+hashrate: 88% of the bandwidth-predicted scaling.
+
+Practical consequence: **for this algorithm, memory bandwidth is the spec that
+matters.** Shader count and clocks barely move it.
 
 ### Both paths are at hardware limits
 
