@@ -377,7 +377,11 @@ inline void printBanner(const MinerStats &s, bool tty) {
            C_RESET "\n");
     printf(C_ORANGE "  |___/  \\___/  /_/ \\_\\   |_|     |_|  |_|_|_||_\\___|_|"
            C_RESET "\n");
-    printf("  " C_DIM "open source, no dev fee" C_RESET "\n\n");
+    // Pure ASCII on purpose: these lines print identically under --ascii and
+    // on a Windows console that never got UTF-8, so there is no second layout
+    // to keep in sync.
+    printf("  " C_ORANGE "May Your Hashrate Be High and Watts Low" C_RESET "\n");
+    printf("  " C_DIM "open source, no dev fee - sonofatech.com" C_RESET "\n\n");
     printf("  " C_DIM "GPU     " C_RESET "%s " C_DIM "(%s, %.1f GB)" C_RESET "\n",
            s.gpuName.c_str(), s.arch.c_str(), s.gpuMemGB);
     printf("  " C_DIM "Algo    " C_RESET "%s " C_DIM "via" C_RESET " %s\n",
