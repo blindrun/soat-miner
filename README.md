@@ -1,28 +1,36 @@
 # SOAT Miner
 
-An open-source CUDA miner for **Autolykos v2** (Ergo), built to be read rather
-than trusted. Linux and Windows.
+An open-source GPU miner built to be read rather than trusted. **No dev fee.**
+
+**Currently supporting Autolykos2 (Ergo)**, with the structure in place to add
+more algorithms — the core owns the nonce counter, job lifecycle and reporting,
+and an algorithm only answers "test these nonces, tell me which won".
+
+- **AMD runs on Vulkan compute** — and as far as we can find, this is the
+  first Vulkan implementation of Autolykos anywhere. The existing open AMD
+  miners are all OpenCL, and the NVIDIA ones are CUDA.
+- **NVIDIA runs on CUDA.**
+- **Linux and Windows.**
+
+Vulkan was chosen for AMD because of driver availability, not speed. Every
+gaming-oriented AMD distribution ships a working Vulkan driver — RADV ran this
+on Bazzite with no setup at all — whereas AMD OpenCL needs ROCm, amdgpu-pro or
+Mesa rusticl and is frequently missing entirely.
 
 Every mainstream Autolykos miner is a closed-source binary. That is a poor fit
 for a machine that also holds SSH keys, API tokens and real work — so this one
-is source-available end to end, has **no developer fee**, and ships with the
-test that proves it computes the right thing.
+is source-available end to end and ships with the test that proves it computes
+the right thing.
 
 ```
   SOAT Miner  autolykos2
   ────────────────────────────────────────────────────────────
-  GPU        NVIDIA GeForce RTX 4090 (sm_89)
-  Source     ergo node 127.0.0.1:9053 (solo)
+  GPU        AMD Radeon RX 6700 XT (RADV NAVI22) (Vulkan 1.4, 12.9 GB)
+  Source     ergo.herominers.com:1180 (pool)
   ────────────────────────────────────────────────────────────
-  Hashrate     216.86 MH/s    avg 216.71 MH/s
-  Power             167 W     efficiency 1.30 MH/W
-  Temp               48 C     fan 31%
-  Clocks           2340 MHz   mem 10251 MHz
-  ────────────────────────────────────────────────────────────
-  Epoch         1851444       dataset 7.27 GB
-  Solutions  0 accepted
-  Nonces        7.02 G
-  Uptime      00:00:36
+  Hashrate      82.90 MH/s    ▂▄▅▆▇█▇▆
+  Epoch       1851444         dataset 7.27 GB
+  Solutions  2 accepted
   ────────────────────────────────────────────────────────────
 ```
 
@@ -30,11 +38,11 @@ test that proves it computes the right thing.
 
 | | |
 |---|---|
-| Algorithm | Autolykos v2 (Ergo) |
+| Algorithms | Autolykos v2 (Ergo) — more planned |
 | Hashrate | **217 MH/s** RTX 4090 (CUDA) · **82.9 MH/s** RX 6700 XT (Vulkan) |
 | Dev fee | **none** |
 | Correctness | verified against real mainnet blocks — see below |
-| Backends | **CUDA** (NVIDIA) and **OpenCL** (AMD / Intel / NVIDIA) - both 217 MH/s |
+| Backends | **CUDA** (NVIDIA) · **Vulkan** (AMD, Intel, NVIDIA) |
 | Work source | **pools (stratum)** and solo via your own node |
 | Platforms | Linux (tested), Windows (builds; untested on hardware) |
 
