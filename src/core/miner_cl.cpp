@@ -14,7 +14,8 @@
 #include "run.h"
 
 namespace om {
-Algorithm *makeAutolykos2CL();
+Algorithm *makeAutolykos2CL(int deviceIndex);
+void clListDevices();
 const char *clDeviceName();
 double clDeviceMemGB();
 const char *clDriverVersion();
@@ -38,6 +39,7 @@ int main(int argc, char **argv) {
 
     RunOptions opt;
     opt.backendLabel = "OpenCL";
+    int deviceIndex = -1;
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -66,10 +68,14 @@ int main(int argc, char **argv) {
         else if (a == "--plain") opt.plain = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
         else if (a == "--algo") { /* only autolykos2 for now */ (void)next(); }
+        else if (a == "--device") deviceIndex = atoi(next().c_str());
+        else if (a == "--list-devices") { clListDevices(); return 0; }
         else if (a == "--list-algos") { printf("autolykos2\n"); return 0; }
         else if (a == "--help" || a == "-h") {
             printf(
                 "SOAT Miner (OpenCL) - open-source GPU miner\n\n"
+                "  --device N        GPU index (default: largest VRAM)\n"
+                "  --list-devices    list OpenCL GPUs and exit\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
@@ -98,7 +104,7 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 #endif
 
-    std::unique_ptr<Algorithm> algo(makeAutolykos2CL());
+    std::unique_ptr<Algorithm> algo(makeAutolykos2CL(deviceIndex));
     if (!algo) {
         fprintf(stderr, "failed to initialise OpenCL backend\n");
         return 1;

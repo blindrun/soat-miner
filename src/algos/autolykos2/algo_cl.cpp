@@ -41,16 +41,13 @@ class Autolykos2CL : public Algorithm {
         return (size_t)calcN(job.epoch) * 32ULL;
     }
 
-    bool init() {
-        cl_uint n = 0;
-        if (clGetPlatformIDs(0, nullptr, &n) != CL_SUCCESS || n == 0) {
-            fprintf(stderr, "no OpenCL platform found\n");
-            return false;
-        }
-        std::vector<cl_platform_id> plats(n);
-        clGetPlatformIDs(n, plats.data(), nullptr);
-
-        // Prefer a GPU on any platform; first match wins.
+    /** Every GPU across every OpenCL platform, in enumeration order. */
+    static std::vector<std::pair<cl_platform_id, cl_device_id>> enumerateGpus() {
+        std::vector<std::pair<cl_platform_id, cl_device_id>> out;
+        cl_uint np = 0;
+        if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) return out;
+        std::vector<cl_platform_id> plats(np);
+        clGetPlatformIDs(np, plats.data(), nullptr);
         for (auto p : plats) {
             cl_uint nd = 0;
             if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) != CL_SUCCESS ||
@@ -58,14 +55,47 @@ class Autolykos2CL : public Algorithm {
                 continue;
             std::vector<cl_device_id> devs(nd);
             clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, nd, devs.data(), nullptr);
-            plat_ = p;
-            dev_ = devs[0];
-            break;
+            for (auto d : devs) out.push_back({p, d});
         }
-        if (!dev_) {
-            fprintf(stderr, "no OpenCL GPU device found\n");
+        return out;
+    }
+
+    /**
+     * Picks a device. With no explicit index, the one with the most VRAM wins -
+     * on a machine with an iGPU and a discrete card that is reliably the right
+     * answer, and it is what "autodetect the card" has to mean in practice.
+     */
+    bool init(int requestedIndex = -1) {
+        const auto gpus = enumerateGpus();
+        if (gpus.empty()) {
+            fprintf(stderr,
+                    "no OpenCL GPU found.\n"
+                    "  NVIDIA: install the driver (OpenCL is included)\n"
+                    "  AMD:    install an OpenCL runtime - ROCm, amdgpu-pro, or "
+                    "Mesa rusticl\n"
+                    "  check with: clinfo -l\n");
             return false;
         }
+
+        size_t pick = 0;
+        if (requestedIndex >= 0) {
+            if ((size_t)requestedIndex >= gpus.size()) {
+                fprintf(stderr, "device %d requested but only %zu GPU(s) found\n",
+                        requestedIndex, gpus.size());
+                return false;
+            }
+            pick = (size_t)requestedIndex;
+        } else {
+            cl_ulong best = 0;
+            for (size_t i = 0; i < gpus.size(); i++) {
+                cl_ulong mem = 0;
+                clGetDeviceInfo(gpus[i].second, CL_DEVICE_GLOBAL_MEM_SIZE,
+                                sizeof(mem), &mem, nullptr);
+                if (mem > best) { best = mem; pick = i; }
+            }
+        }
+        plat_ = gpus[pick].first;
+        dev_ = gpus[pick].second;
 
         clGetDeviceInfo(dev_, CL_DEVICE_NAME, sizeof(devName_), devName_, nullptr);
         clGetDeviceInfo(dev_, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(maxAlloc_),
@@ -289,9 +319,9 @@ Autolykos2CL *g_instance = nullptr;
 
 }  // namespace
 
-Algorithm *makeAutolykos2CL() {
+Algorithm *makeAutolykos2CL(int deviceIndex) {
     auto *a = new Autolykos2CL();
-    if (!a->init()) {
+    if (!a->init(deviceIndex)) {
         delete a;
         return nullptr;
     }
@@ -303,6 +333,41 @@ const char *clDeviceName() { return g_instance ? g_instance->deviceName() : "unk
 double clDeviceMemGB() { return g_instance ? g_instance->deviceMemGB() : 0.0; }
 const char *clDriverVersion() {
     return g_instance ? g_instance->driverVersion() : "";
+}
+
+/** Prints every OpenCL GPU the machine exposes, for --list-devices. */
+void clListDevices() {
+    cl_uint np = 0;
+    if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) {
+        printf("no OpenCL platforms found\n");
+        return;
+    }
+    std::vector<cl_platform_id> plats(np);
+    clGetPlatformIDs(np, plats.data(), nullptr);
+    int idx = 0;
+    for (auto p : plats) {
+        char pname[256] = {0};
+        clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(pname), pname, nullptr);
+        cl_uint nd = 0;
+        if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) != CL_SUCCESS ||
+            nd == 0)
+            continue;
+        std::vector<cl_device_id> devs(nd);
+        clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, nd, devs.data(), nullptr);
+        for (auto d : devs) {
+            char dn[256] = {0};
+            cl_ulong mem = 0, alloc = 0;
+            cl_uint cu = 0;
+            clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof(dn), dn, nullptr);
+            clGetDeviceInfo(d, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem), &mem, nullptr);
+            clGetDeviceInfo(d, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(alloc), &alloc,
+                            nullptr);
+            clGetDeviceInfo(d, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, nullptr);
+            printf("  [%d] %-38s %5.1f GB  max alloc %4.1f GB  %3u CUs  (%s)\n",
+                   idx++, dn, mem / 1e9, alloc / 1e9, cu, pname);
+        }
+    }
+    if (idx == 0) printf("no OpenCL GPU devices found\n");
 }
 
 }  // namespace om
