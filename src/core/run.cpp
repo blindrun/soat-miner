@@ -10,8 +10,8 @@ namespace om {
 
 int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
              double gpuMemGB, const char *archLabel, volatile sig_atomic_t *stop) {
-    Nvml nvml;
-    const bool haveNvml = nvml.open(0);
+    GpuMonitor gpu;
+    gpu.open();
 
     const bool tty = stdoutIsTty() && !opt.plain;
 
@@ -168,7 +168,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     : 0.0;
             stats.epoch = job.epoch;
             stats.pushSample(stats.hashrate);
-            printReadout(stats, haveNvml ? nvml.sample() : GpuTelemetry{}, tty);
+            printReadout(stats, gpu.sample(), tty);
             intervalHashes = 0;
             tReport = now;
         }
@@ -177,7 +177,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     if (tty) printf("\n");
     logLine(tty, "info", "stopping");
     algo->release();
-    nvml.close();
+    gpu.close();
     return 0;
 }
 

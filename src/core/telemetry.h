@@ -9,10 +9,16 @@
 
 #include <stdint.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <filesystem>
+#endif
 
 #if defined(_WIN32)
 #include <io.h>
@@ -139,6 +145,128 @@ class Nvml {
     UintFn getPower_ = nullptr, getFan_ = nullptr;
     TempFn getTemp_ = nullptr;
     ClockFn getClock_ = nullptr;
+};
+
+
+/**
+ * AMD telemetry via sysfs hwmon.
+ *
+ * NVML is NVIDIA-only, so on AMD the readout previously showed nothing for
+ * power, temperature and fan. amdgpu exposes all of it under
+ * /sys/class/drm/card*\/device/hwmon/hwmon*\/ instead.
+ *
+ * Picking the right card matters on a machine with an iGPU: this selects the
+ * amdgpu node with the largest VRAM, which is the same rule the Vulkan
+ * backend uses to choose its device, so the two agree.
+ */
+class AmdSysfs {
+   public:
+    bool open() {
+#if defined(_WIN32)
+        return false;  // sysfs is Linux-only
+#else
+        namespace fs = std::filesystem;
+        unsigned long long bestVram = 0;
+        std::error_code ec;
+        for (const auto &card : fs::directory_iterator("/sys/class/drm", ec)) {
+            const std::string name = card.path().filename().string();
+            if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos)
+                continue;
+            const fs::path dev = card.path() / "device";
+
+            const fs::path hw = dev / "hwmon";
+            if (!fs::exists(hw, ec)) continue;
+
+            for (const auto &h : fs::directory_iterator(hw, ec)) {
+                if (readStr(h.path() / "name") != "amdgpu") continue;
+                const unsigned long long vram =
+                    readU64(dev / "mem_info_vram_total");
+                if (vram >= bestVram) {
+                    bestVram = vram;
+                    hwmon_ = h.path().string();
+                    device_ = dev.string();
+                }
+            }
+        }
+        ok_ = !hwmon_.empty();
+        return ok_;
+#endif
+    }
+
+    GpuTelemetry sample() const {
+        GpuTelemetry t;
+        if (!ok_) return t;
+        // power1_average is the meaningful one on discrete cards; some parts
+        // only expose power1_input.
+        unsigned long long uw = readU64(hwmon_ + "/power1_average");
+        if (uw == 0) uw = readU64(hwmon_ + "/power1_input");
+        t.powerMilliwatts = (unsigned)(uw / 1000ULL);
+        t.temperatureC = (unsigned)(readU64(hwmon_ + "/temp1_input") / 1000ULL);
+
+        const unsigned long long pwm = readU64(hwmon_ + "/pwm1");
+        if (pwm > 0) t.fanPercent = (unsigned)(pwm * 100ULL / 255ULL);
+
+        // freq1_input is the shader clock, freq2_input the memory clock.
+        t.smClockMhz = (unsigned)(readU64(hwmon_ + "/freq1_input") / 1000000ULL);
+        t.memClockMhz = (unsigned)(readU64(hwmon_ + "/freq2_input") / 1000000ULL);
+        t.valid = true;
+        return t;
+    }
+
+    void close() { ok_ = false; }
+
+   private:
+    static std::string readStr(const std::string &p) {
+        std::ifstream f(p);
+        std::string s;
+        if (f) std::getline(f, s);
+        return s;
+    }
+#if !defined(_WIN32)
+    static std::string readStr(const std::filesystem::path &p) {
+        return readStr(p.string());
+    }
+    static unsigned long long readU64(const std::filesystem::path &p) {
+        return readU64(p.string());
+    }
+#endif
+    static unsigned long long readU64(const std::string &p) {
+        const std::string s = readStr(p);
+        if (s.empty()) return 0;
+        errno = 0;
+        return strtoull(s.c_str(), nullptr, 10);
+    }
+
+    std::string hwmon_, device_;
+    bool ok_ = false;
+};
+
+/** Tries NVML first, then AMD sysfs. Whichever answers wins. */
+class GpuMonitor {
+   public:
+    void open() {
+        if (nvml_.open(0)) { which_ = Nv; return; }
+        if (amd_.open()) { which_ = Amd; return; }
+        which_ = None;
+    }
+    GpuTelemetry sample() const {
+        switch (which_) {
+            case Nv: return nvml_.sample();
+            case Amd: return amd_.sample();
+            default: return GpuTelemetry{};
+        }
+    }
+    void close() {
+        if (which_ == Nv) nvml_.close();
+        else if (which_ == Amd) amd_.close();
+    }
+    bool available() const { return which_ != None; }
+
+   private:
+    enum Which { None, Nv, Amd };
+    Which which_ = None;
+    Nvml nvml_;
+    AmdSysfs amd_;
 };
 
 /** Everything the readout displays. */
@@ -269,41 +397,57 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
         return;
     }
 
+    // Redraw in place. The cursor must move back up by EXACTLY the number of
+    // lines printed - hardcoding it drifted by 1-2 lines per refresh and
+    // stacked a fresh copy of the frame every interval.
+    int lines = 0;
     const char *B = "  " C_DIM;
-    printf("\033[s");  // save cursor so event lines can scroll above
 
     printf("\r%s┌──────────────────────────────────────────────────────────┐" C_RESET "\n", B);
+    lines++;
+
     printf("%s│" C_RESET "  " C_BOLD C_GREEN "%9.2f MH/s" C_RESET "  " C_DIM "avg" C_RESET
            " %7.2f   %s%-18s" C_RESET " %s│" C_RESET "\n",
            B, s.hashrate, s.hashrateAvg, C_BLUE, sparkline(s.history).c_str(), B);
+    lines++;
 
     if (t.valid) {
         printf("%s│" C_RESET "  %6.0f W   %s%3u\u00b0C" C_RESET "   fan %3u%%   " C_DIM
                "eff" C_RESET " %5.2f MH/W        %s│" C_RESET "\n",
                B, watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent,
                eff, B);
+        lines++;
         printf("%s│" C_RESET "  " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET
                " %6u MHz                       %s│" C_RESET "\n",
                B, t.smClockMhz, t.memClockMhz, B);
+        lines++;
     } else {
-        printf("%s│" C_RESET "  " C_DIM "power/thermals unavailable (no NVML)" C_RESET
-               "                  %s│" C_RESET "\n", B, B);
+        printf("%s│" C_RESET "  " C_DIM "power/thermals unavailable" C_RESET
+               "                            %s│" C_RESET "\n", B, B);
+        lines++;
     }
 
     printf("%s├──────────────────────────────────────────────────────────┤" C_RESET "\n", B);
+    lines++;
+
     printf("%s│" C_RESET "  " C_DIM "epoch" C_RESET " %-9llu " C_DIM "dataset" C_RESET
            " %5.2f GB   " C_DIM "nonces" C_RESET " %-8s   %s│" C_RESET "\n",
            B, (unsigned long long)s.epoch, s.datasetGB,
            formatCount((double)s.totalNonces).c_str(), B);
+    lines++;
+
     printf("%s│" C_RESET "  " C_GREEN "%llu accepted" C_RESET, B,
            (unsigned long long)s.accepted);
     if (s.rejected)
         printf("   " C_RED "%llu rejected" C_RESET, (unsigned long long)s.rejected);
     printf("   " C_DIM "up" C_RESET " %-12s", formatDuration(s.uptimeSeconds).c_str());
     printf("      %s│" C_RESET "\n", B);
-    printf("%s└──────────────────────────────────────────────────────────┘" C_RESET "\n", B);
+    lines++;
 
-    printf("\033[6A");  // back to the top of the panel for the next redraw
+    printf("%s└──────────────────────────────────────────────────────────┘" C_RESET "\n", B);
+    lines++;
+
+    printf("\033[%dA", lines);  // back to the top of the frame
     fflush(stdout);
 }
 
