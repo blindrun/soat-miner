@@ -65,6 +65,9 @@ struct Buffer {
     void *mapped = nullptr;
 };
 
+/** Workgroup size. Fed to the shader as a specialization constant. */
+static const uint32_t kLocalSize = 256;
+
 class Autolykos2VK : public Algorithm {
    public:
     const char *name() const override { return "autolykos2"; }
@@ -221,11 +224,25 @@ class Autolykos2VK : public Algorithm {
         plci.pPushConstantRanges = &pcr;
         VKCHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &pipeLayout_));
 
+        // Specialization constant 0 = local_size_x, so host and shader can
+        // never disagree about the workgroup size.
+        VkSpecializationMapEntry specEntry{};
+        specEntry.constantID = 0;
+        specEntry.offset = 0;
+        specEntry.size = sizeof(uint32_t);
+        const uint32_t localSize = kLocalSize;
+        VkSpecializationInfo spec{};
+        spec.mapEntryCount = 1;
+        spec.pMapEntries = &specEntry;
+        spec.dataSize = sizeof(uint32_t);
+        spec.pData = &localSize;
+
         VkPipelineShaderStageCreateInfo stage{};
         stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         stage.module = shader_;
         stage.pName = "main";
+        stage.pSpecializationInfo = &spec;
 
         VkComputePipelineCreateInfo cpci{};
         cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -327,7 +344,7 @@ class Autolykos2VK : public Algorithm {
             p.buildChunk = c;
             p.buildFirst = c * chunkElems_;
             p.buildCount = (c == chunks_ - 1) ? (N - p.buildFirst) : chunkElems_;
-            if (!dispatch(p, (p.buildCount + 255) / 256)) return false;
+            if (!dispatch(p, (p.buildCount + kLocalSize - 1) / kLocalSize)) return false;
         }
         height_ = (uint32_t)job.epoch;
         return true;
@@ -343,7 +360,7 @@ class Autolykos2VK : public Algorithm {
         p.mode = 1;
         p.baseNonce = nonceBase;
         p.maxOut = kMaxSolutions;
-        if (!dispatch(p, (uint32_t)(count / 256))) return false;
+        if (!dispatch(p, (uint32_t)(count / kLocalSize))) return false;
 
         uint32_t found = *(uint32_t *)cnt_.mapped;
         if (found == 0) return true;

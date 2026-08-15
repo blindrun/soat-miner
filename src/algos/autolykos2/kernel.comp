@@ -13,7 +13,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 256) in;
+// Workgroup size is a specialization constant so the host is the single
+// source of truth. Hardcoding it in both places let them drift once already:
+// the shader said 256 while the host dispatched for 512, which silently built
+// only half the dataset and still credited a full batch to the hashrate
+// counter - a wrong result reported as a 72% speedup.
+layout(local_size_x_id = 0) in;
 
 // The dataset is split across four buffers. Vulkan only guarantees
 // maxStorageBufferRange per binding (4 GB - 1 even on a 24 GB RTX 4090)
@@ -399,6 +404,10 @@ void computeHit(uint64_t nonce, out uint64_t hit[4]) {
     for (int i = 0; i < 32; i++) ext[i] = d[i];
     ext[32] = d[0]; ext[33] = d[1]; ext[34] = d[2];
 
+    // Straightforward accumulation. An 8-wide batched-load variant was tried
+    // to expose memory-level parallelism and measured SLOWER on RDNA2 (71.4 vs
+    // 82.5 MH/s) - the extra live registers cost more occupancy than the
+    // overlapping loads win back. Kept simple deliberately.
     uint64_t acc[4];
     acc[0] = 0UL; acc[1] = 0UL; acc[2] = 0UL; acc[3] = 0UL;
     for (uint j = 0u; j < AL_K; j++) {
