@@ -82,11 +82,24 @@ $(BIN_VK): $(VK_OBJS)
 # --- correctness gates -----------------------------------------------------
 # test_hit is the one that matters: it rebuilds the real dataset and
 # reproduces a real mainnet block's hit from that block's winning nonce.
+#
+# Pinned vector, mainnet block f9e0e887ec38c2b95631bfef81becf20025c4cd8d700666
+# ecf6cdf80810b260f. Height 500,012 is deliberate: it is Autolykos v2 but below
+# the N-increase start, so the dataset is 2.15 GB and this runs on any card
+# that can run the miner. Regenerate with:
+#   python3 tests/reference.py --vector <blockId>
+HIT_MSG    = 21098a45fe5ec2e9b1087e8b248e810a770fe0200a1f8a211ace97faa9813e7b
+HIT_HEIGHT = 500012
+HIT_NONCE  = 1232002a7deb44c0
+HIT_EXPECT = 0000000000001fa822c756eef06389799c10c7c1d06868eb29c75214e0a7aab1
+
 test: tests/test_element tests/test_hit
 	@echo "--- python reference vs real mainnet blocks ---"
 	@python3 tests/reference.py
 	@echo "--- device dataset elements vs python reference ---"
 	@./tests/test_element 1851437
+	@echo "--- device end-to-end: real block's hit from its winning nonce ---"
+	@./tests/test_hit $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
 
 tests/test_element: tests/test_element.cu src/algos/autolykos2/autolykos.cuh src/core/blake2b.cuh
 	$(NVCC) $(NVFLAGS) $< -o $@

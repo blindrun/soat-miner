@@ -365,12 +365,19 @@ inline void printBanner(const MinerStats &s, bool tty) {
         fflush(stdout);
         return;
     }
+    // Each letter is one glyph wide with a space between, so nothing runs into
+    // its neighbour - the old art had the A collapsed against its neighbours
+    // and it did not read as an A at all. Widest line is 57 columns; the
+    // tagline sits on its own line so an 80-column terminal never wraps it.
     printf("\n");
-    printf(C_ORANGE "   ___  ___  _ _____   __  __ _" C_RESET "\n");
-    printf(C_ORANGE "  / __|/ _ \\/ \\_   _| |  \\/  (_)_ _  ___ _ _" C_RESET "\n");
-    printf(C_ORANGE "  \\__ \\ (_) | |_| |   | |\\/| | | ' \\/ -_) '_|" C_RESET "\n");
-    printf(C_ORANGE "  |___/\\___/|_(_)_|   |_|  |_|_|_||_\\___|_|" C_RESET
-           "   " C_DIM "open source, no dev fee" C_RESET "\n\n");
+    printf(C_ORANGE "   ___    ___      _     _____     __  __ _" C_RESET "\n");
+    printf(C_ORANGE "  / __|  / _ \\    /_\\   |_   _|   |  \\/  (_)_ _  ___ _ _"
+           C_RESET "\n");
+    printf(C_ORANGE "  \\__ \\ | (_) |  / _ \\    | |     | |\\/| | | ' \\/ -_) '_|"
+           C_RESET "\n");
+    printf(C_ORANGE "  |___/  \\___/  /_/ \\_\\   |_|     |_|  |_|_|_||_\\___|_|"
+           C_RESET "\n");
+    printf("  " C_DIM "open source, no dev fee" C_RESET "\n\n");
     printf("  " C_DIM "GPU     " C_RESET "%s " C_DIM "(%s, %.1f GB)" C_RESET "\n",
            s.gpuName.c_str(), s.arch.c_str(), s.gpuMemGB);
     printf("  " C_DIM "Algo    " C_RESET "%s " C_DIM "via" C_RESET " %s\n",

@@ -1,7 +1,13 @@
 // End-to-end check: build the real dataset for a real block's height, then
 // confirm the GPU reproduces that block's hit for its known winning nonce.
 //
-// usage: test_hit <msg_hex64> <height> <nonce_hex16> [target_hex64]
+// usage: test_hit <msg_hex64> <height> <nonce_hex16> [expected_hit_hex64]
+//
+// With an expected hit this EXITS NON-ZERO on any mismatch, which is the only
+// thing that makes it a gate. Without one it just prints, which is fine for
+// poking at a block by hand and useless as a test - `make test` always passes
+// the expected hit.
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,9 +95,29 @@ int main(int argc, char **argv) {
     uint64_t hit[4];
     cudaMemcpy(hit, d_out, 32, cudaMemcpyDeviceToHost);
 
-    printf("nonce=%016llx\nhit  =", (unsigned long long)nonce);
-    for (int l = 3; l >= 0; l--) printf("%016llx", (unsigned long long)hit[l]);
-    printf("\n");
+    char hitHex[65];
+    for (int l = 3; l >= 0; l--)
+        snprintf(hitHex + (3 - l) * 16, 17, "%016llx", (unsigned long long)hit[l]);
+    printf("nonce=%016llx\nhit  =%s\n", (unsigned long long)nonce, hitHex);
+
+    // The whole point of the test. A hit that does not match the reference
+    // means this GPU disagrees with consensus, so it would mine forever and
+    // find nothing - which reports as no error at all if nobody checks here.
+    int failed = 0;
+    if (argc >= 5) {
+        char want[65];
+        for (int i = 0; i < 64 && argv[4][i]; i++)
+            want[i] = (char)tolower((unsigned char)argv[4][i]);
+        want[64] = '\0';
+        if (strncmp(hitHex, want, 64) != 0) {
+            printf("FAIL: expected hit\n     =%s\n", want);
+            failed = 1;
+        } else {
+            printf("PASS: hit matches the reference for block %u\n", height);
+        }
+    } else {
+        printf("(no expected hit given - nothing was checked)\n");
+    }
 
     // --- throughput -------------------------------------------------------
     uint64_t target[4] = {0, 0, 0, 0};  // impossible target: pure benchmark
@@ -120,5 +146,5 @@ int main(int argc, char **argv) {
            (unsigned long long)total, ms / 1000.0, total / (ms * 1000.0));
 
     cudaFree(d_ds);
-    return 0;
+    return failed;
 }

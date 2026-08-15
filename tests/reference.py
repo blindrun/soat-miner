@@ -120,9 +120,37 @@ def verify_block(h: dict) -> dict:
     }
 
 
+def get(u):
+    return json.loads(urllib.request.urlopen(u, timeout=60).read())
+
+
+def emit_vector(block_id: str) -> int:
+    """Prints the four arguments test_hit needs, for pinning in the Makefile.
+
+    The pinned vector in the Makefile is not a magic constant: regenerate it
+    with `python3 tests/reference.py --vector <blockId>` against any block.
+    Prefer one below height 614,400, where N is still 2^26 and the dataset is
+    2.15 GB rather than 7.3 - the gate should run on any card that can run the
+    miner, not only on the big ones.
+    """
+    h = get(f"https://api.ergoplatform.com/api/v1/blocks/{block_id}")["block"]["header"]
+    r = verify_block(h)
+    if not r["valid"]:
+        print(f"refusing to pin block {block_id}: it does not verify")
+        return 1
+    print(f"HIT_MSG    = {r['msg']}")
+    print(f"HIT_HEIGHT = {r['height']}")
+    print(f"HIT_NONCE  = {h['powSolutions']['n']}")
+    print(f"HIT_EXPECT = {r['hit']:064x}")
+    print(f"# N={r['N']:,} ({r['N'] * 32 / 1e9:.2f} GB dataset)")
+    return 0
+
+
 if __name__ == "__main__":
-    def get(u):
-        return json.loads(urllib.request.urlopen(u, timeout=60).read())
+    import sys
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--vector":
+        sys.exit(emit_vector(sys.argv[2]))
 
     blocks = get("https://api.ergoplatform.com/api/v1/blocks?limit=6")["items"]
     ok = 0
@@ -135,3 +163,6 @@ if __name__ == "__main__":
         print(f"h={r['height']} {mark} hit/b={ratio:.6f}  N={r['N']:,}")
         ok += r["valid"]
     print(f"\n{ok}/{len(blocks)} real mainnet blocks verified")
+    # Exit non-zero when a block fails, or this prints "0/6 verified" and
+    # `make test` still reports success.
+    sys.exit(0 if ok == len(blocks) and ok > 0 else 1)
