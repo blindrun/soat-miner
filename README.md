@@ -114,8 +114,15 @@ Measured at the current dataset size, 7.27GB.
 | RX 7900 XT | Vulkan | 151.9 |
 | RX 6700 XT | Vulkan | 82.9 |
 
-lolMiner does about 265 MH/s on a 4090 and takes 0.75% to 1%. This is close to
-that with none, and you can read the source.
+The only like for like comparison here is SRBMiner 3.5.5 on the same 4090 at
+the same 7.27GB. It does 237.7 gross and takes 1%, so it delivers 235.4 against
+our 217.5. That is 92%, with no fee and source you can read.
+
+lolMiner takes 1.5% on Autolykos V2. Their own algorithm table says so.
+
+Do not trust the 265 MH/s figure the calculator sites list for a 4090. It is
+not sourced to a run at this dataset size, and every old number is inflated for
+the reason in the next paragraph.
 
 Your number will drop over time and that is not a bug. Hashrate falls as the
 dataset outgrows your cache. The same 6700 XT did 235 MH/s in 2021 at 2.25GB
@@ -310,8 +317,8 @@ gets slower and memory goes up as the card gets more expensive. A 6700 XT
 would save 8.2 seconds a block and has 12GB, so two tables never fit. The 4090
 has the room and the least to gain.
 
-None of this carried over to Vulkan. It was built there too, with two queues,
-two descriptor sets and an async fence, and it lost on both cards.
+None of this carried over to Vulkan on NVIDIA. It was built there too, with two
+queues, two descriptor sets and an async fence, and it lost on both cards.
 
 | GPU | off | on |
 |---|---|---|
@@ -319,13 +326,20 @@ two descriptor sets and an async fence, and it lost on both cards.
 | RTX 4090 | 160.1 | 158.5 |
 
 CUDA lets you say which stream matters. Vulkan only lets you hint it, with a
-float at queue creation, and the driver is free to ignore it. It does.
+float at queue creation, and the driver is free to ignore it. NVIDIA's does.
 
 You can see it in the readouts. With build-ahead off there is one clean dip per
 block and then flat. With it on the dip is shallower but it smears across the
 next several intervals, and the smear adds up to more than the dip it replaced.
 
-That code is not in the tree. It is a lot of Vulkan for a negative number.
+Read that as Vulkan on NVIDIA, not as Vulkan. AMD was never tested and there is
+good reason to think it goes the other way. AMD has real async compute engines,
+its drivers honour queue priority, and lolMiner ships this same feature as an
+AMD default called --ergo-prebuild. The card to try is a 7900 XT, since 20GB is
+the smallest AMD card here that fits two 7.27GB tables at all.
+
+The code is on the vulkan-build-ahead branch rather than deleted, for exactly
+that test.
 
 ## Adding an algorithm
 
