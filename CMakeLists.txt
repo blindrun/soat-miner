@@ -20,14 +20,24 @@
 
 cmake_minimum_required(VERSION 3.18)
 
-# Has to be tested BEFORE project(): enabling the CUDA language defines
-# CMAKE_CUDA_ARCHITECTURES itself (to 52), so afterwards there is no way left
-# to tell "the user asked for an architecture" from "CMake filled in a default".
-# Checking after project() silently built everything for sm_52.
-if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(SOAT_ARCH_FROM_USER TRUE)
-else()
-  set(SOAT_ARCH_FROM_USER FALSE)
+# "Did the user pick an architecture?" - and it takes two tricks to answer.
+#
+# It has to be tested BEFORE project(), because enabling the CUDA language
+# defines CMAKE_CUDA_ARCHITECTURES itself (to 52); after that there is no way
+# left to tell a user's choice from CMake's default.
+#
+# And the answer has to be cached on the FIRST configure only. `cmake --build`
+# re-runs configure, and by then CMake's default IS in the cache, so
+# recomputing makes the second pass believe the user asked for 52.
+#
+# Both were found the same way: the build printed the right architectures and
+# produced an sm_52 binary anyway.
+if(NOT DEFINED SOAT_ARCH_FROM_USER)
+  if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(SOAT_ARCH_FROM_USER TRUE CACHE INTERNAL "CUDA arch came from the user")
+  else()
+    set(SOAT_ARCH_FROM_USER FALSE CACHE INTERNAL "CUDA arch came from the user")
+  endif()
 endif()
 
 project(soat-miner LANGUAGES CXX CUDA)
@@ -78,6 +88,11 @@ if(NOT SOAT_ARCH_FROM_USER)
   if(SOAT_NEWEST_VIRTUAL)
     list(APPEND CMAKE_CUDA_ARCHITECTURES "${SOAT_NEWEST_VIRTUAL}-virtual")
   endif()
+
+  # FORCE into the cache: a plain set() does not survive the re-configure that
+  # `cmake --build` performs, and CMake's own default (52) wins instead.
+  set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+      CACHE STRING "CUDA architectures to build" FORCE)
 
   if(NOT CMAKE_CUDA_ARCHITECTURES)
     message(FATAL_ERROR
