@@ -62,8 +62,9 @@ class Failure(Exception):
 
 class LithosMock:
     def __init__(self, port, shares_before_rotate=3, total_shares=6,
-                 send_zero_target=False):
+                 send_zero_target=False, bind="127.0.0.1"):
         self.port = port
+        self.bind = bind
         self.shares_before_rotate = shares_before_rotate
         self.total_shares = total_shares
         self.send_zero_target = send_zero_target
@@ -162,7 +163,7 @@ class LithosMock:
     def serve(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", self.port))
+        self.sock.bind((self.bind, self.port))
         self.sock.listen(1)
         self.sock.settimeout(120)
 
@@ -286,13 +287,15 @@ class LithosMock:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=4444)
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="0.0.0.0 to accept a miner on another host")
     ap.add_argument("--shares", type=int, default=6)
     ap.add_argument("--rotate-after", type=int, default=3)
     ap.add_argument("--zero-target", action="store_true")
     args = ap.parse_args()
 
     mock = LithosMock(args.port, args.rotate_after, args.shares,
-                      args.zero_target)
+                      args.zero_target, bind=args.bind)
     mock.serve()
 
     for e in mock.errors:
