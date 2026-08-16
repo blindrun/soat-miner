@@ -216,6 +216,24 @@ It made no difference. 217.3 against 217.5, and 12 more watts. Twice the warps
 in flight bought nothing, so the card is not short of warps. It is waiting on
 DRAM and more threads just wait alongside it.
 
+Locality is the other thing people try. There is a real ceiling up there, but
+you cannot reach it. Confining the lookups to a window and measuring a 4090:
+
+| Window | MH/s |
+|---|---|
+| 64 MiB | 538.2 |
+| 256 MiB | 231.3 |
+| 1 GiB | 214.2 |
+| 7.27 GiB, the real one | 217.5 |
+
+So it is a cliff, not a curve. You only get it while the working set fits in
+L2, which is 72 MB on this card.
+
+Sorting the lookups into L2 sized bins would need 113 bins, and a bin only pays
+if more lookups land in it than it holds elements. That means batching about
+30 million nonces, and the index buffers for that come to 7.7GB on top of the
+7.27GB dataset. It does not fit in 16GB at all. Not worth it.
+
 ## Adding an algorithm
 
 Drop it in src/algos/yourname/.
