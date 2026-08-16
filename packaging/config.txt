@@ -32,6 +32,14 @@ BATCH=4194304
 # Seconds between readouts.
 INTERVAL=5
 
+# Memory clock offset, in MHz of transfer rate.
+# CUDA and Vulkan both force performance state P2, which runs your memory
+# slower than it is rated for (10251 vs 10501 on a 4090). Autolykos is memory
+# bound so that is straight hashrate. 500 puts a 4090 back to stock and is
+# worth about 2.5%. This is NOT an overclock at 500.
+# Needs root on Linux. 0 leaves the card alone.
+MCLK_OFFSET=0
+
 # Build the next block's lookup table ahead of time: auto | on | off
 # A new block needs a new 7.27GB table, and building it stops mining for 1.5s
 # on a 4090 and 8.2s on a 6700 XT. Building it early removes that.

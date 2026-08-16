@@ -73,6 +73,45 @@ Force it with BACKEND=cuda or BACKEND=vulkan if you want.
 
 See what it found with command ./soat-miner-vk --list-devices
 
+## Get your memory clock back
+
+Your card is probably running its memory slower than it is rated for, and it is
+not your fault.
+
+CUDA and Vulkan both put the GPU in performance state P2. P2 runs GDDR6X under
+its rated speed. On a 4090 that is 10251 MHz against a rated 10501.
+
+Autolykos is memory bound, so that is straight hashrate.
+
+`nvidia-smi --lock-memory-clocks` does not fix it. It reports success and the
+clock does not move.
+
+Put it back with command ./soat-miner --mclk-offset 500
+
+Measured on a 4090:
+
+| | MH/s |
+|---|---|
+| CUDA, P2 | 218.1 |
+| CUDA, clock restored | **223.8** |
+| Vulkan, P2 | 162.7 |
+| Vulkan, clock restored | **166.7** |
+
+So about 2.5% on both backends.
+
+This is not an overclock. 500 is the offset that gets a 4090 back to the speed
+written on the box. The number is in MHz of transfer rate, so half of it lands
+on the clock.
+
+Needs root on Linux. Run it with sudo or it prints why it could not.
+
+The miner sets the offset back to 0 when it stops.
+
+You can push past stock if you want to, and that is a real overclock with real
+risk. Bad memory produces bad hashes. This miner re-checks every solution on
+the GPU before sending it, so you will see them rejected rather than sent, but
+do not go hunting for numbers you cannot verify.
+
 ## Building the next block ahead
 
 The lookup table depends on the block height. Every new block means a new table.

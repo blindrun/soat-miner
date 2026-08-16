@@ -66,6 +66,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
+        else if (a == "--mclk-offset") opt.memOffsetMhz = atoi(next().c_str());
         // No --cache-dag here. Building ahead was measured on this backend and
         // it loses: see the README. Accepting the flag and ignoring it would be
         // worse than not having it.
@@ -93,6 +94,11 @@ int main(int argc, char **argv) {
                 "  --bench-epoch-secs N  benchmark: change height every N s\n"
                 "  --plain           one-line JSON output, for logs/systemd\n"
                 "  --ascii           plain ASCII frame (no box-drawing glyphs)\n"
+                "  --mclk-offset N   memory clock offset in MHz of transfer\n"
+                "                    rate. CUDA and Vulkan both force state P2,\n"
+                "                    which runs memory under its rated speed;\n"
+                "                    500 restores a 4090 to stock for +2.3%%.\n"
+                "                    Needs root on Linux. 0 leaves it alone\n"
                 "  --bench           benchmark, no node required\n"
                 "  --bench-height H  height to benchmark at\n");
             return 0;

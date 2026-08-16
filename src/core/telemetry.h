@@ -122,11 +122,37 @@ class Nvml {
         getTemp_ = (TempFn)sym("nvmlDeviceGetTemperature");
         getFan_ = (UintFn)sym("nvmlDeviceGetFanSpeed");
         getClock_ = (ClockFn)sym("nvmlDeviceGetClockInfo");
+        setMemOffset_ = (OffsetSetFn)sym("nvmlDeviceSetMemClkVfOffset");
+        getMemOffset_ = (OffsetGetFn)sym("nvmlDeviceGetMemClkVfOffset");
         if (!init_ || !getHandle_ || init_() != 0) return false;
         if (getHandle_(deviceIndex, &dev_) != 0) return false;
         ok_ = true;
         return true;
     }
+
+    /**
+     * Memory clock offset, in MHz of transfer rate (so half of it lands on the
+     * clock itself).
+     *
+     * This exists because CUDA and Vulkan both force performance state P2,
+     * which runs the memory below its own rated speed - 10251 against 10501 on
+     * a 4090. Autolykos is memory bound, so that is straight hashrate, and
+     * `nvidia-smi --lock-memory-clocks` does not override it. Offsetting back
+     * up to the rated clock is not an overclock, it is undoing the downclock.
+     *
+     * Needs root on Linux and a driver new enough to export the call.
+     */
+    bool setMemOffsetMhz(int mhz) {
+        if (!ok_ || !setMemOffset_) return false;
+        return setMemOffset_(dev_, mhz) == 0;
+    }
+
+    bool memOffsetMhz(int *out) const {
+        if (!ok_ || !getMemOffset_) return false;
+        return getMemOffset_(dev_, out) == 0;
+    }
+
+    bool canSetMemOffset() const { return ok_ && setMemOffset_ != nullptr; }
 
     GpuTelemetry sample() const {
         GpuTelemetry t;
@@ -159,6 +185,10 @@ class Nvml {
     using UintFn = int (*)(void *, unsigned *);
     using TempFn = int (*)(void *, int, unsigned *);
     using ClockFn = int (*)(void *, int, unsigned *);
+    using OffsetSetFn = int (*)(void *, int);
+    using OffsetGetFn = int (*)(void *, int *);
+    OffsetSetFn setMemOffset_ = nullptr;
+    OffsetGetFn getMemOffset_ = nullptr;
     void *lib_ = nullptr, *dev_ = nullptr;
     bool ok_ = false;
     IntFn init_ = nullptr, shutdown_ = nullptr;
@@ -282,6 +312,20 @@ class GpuMonitor {
         else if (which_ == Amd) amd_.close();
     }
     bool available() const { return which_ != None; }
+
+    /**
+     * Undo the P2 memory downclock. NVIDIA only; AMD does not do this to
+     * itself. Returns the resulting offset, or a negative value if it could
+     * not be applied.
+     */
+    int applyMemOffsetMhz(int mhz) {
+        if (which_ != Nv || !nvml_.canSetMemOffset()) return -1;
+        if (!nvml_.setMemOffsetMhz(mhz)) return -1;
+        int got = 0;
+        if (!nvml_.memOffsetMhz(&got)) return mhz;
+        return got;
+    }
+    bool canSetMemOffset() const { return which_ == Nv && nvml_.canSetMemOffset(); }
 
    private:
     enum Which { None, Nv, Amd };

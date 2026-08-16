@@ -60,6 +60,7 @@ esac
 [[ -x "$BIN" ]] || { echo "$BIN not found or not executable"; exit 1; }
 
 ARGS=(--batch "${BATCH:-4194304}" --interval "${INTERVAL:-5}")
+ARGS+=(--mclk-offset "${MCLK_OFFSET:-0}")
 
 # Building the next block's table ahead is CUDA only so far.
 if [[ "$BIN" == "./soat-miner" ]]; then

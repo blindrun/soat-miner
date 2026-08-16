@@ -13,6 +13,16 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     GpuMonitor gpu;
     gpu.open();
 
+    // Undo the P2 memory downclock before anything is measured. Autolykos is
+    // memory bound, so on a 4090 this is worth about 2.3%.
+    if (opt.memOffsetMhz != 0) {
+        const int got = gpu.applyMemOffsetMhz(opt.memOffsetMhz);
+        if (got < 0)
+            fprintf(stderr,
+                    "could not set the memory clock offset. Needs an NVIDIA "
+                    "card, a recent driver, and root on Linux.\n");
+    }
+
     const bool tty = stdoutIsTty() && !opt.plain;
 
     MinerStats stats;
@@ -281,6 +291,8 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
 
     if (tty) printf("\n");
     logLine(tty, "info", "stopping");
+    // Put the card back the way it was found.
+    if (opt.memOffsetMhz != 0) gpu.applyMemOffsetMhz(0);
     algo->release();
     gpu.close();
     return 0;

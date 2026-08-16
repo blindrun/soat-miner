@@ -103,6 +103,11 @@ struct RunOptions {
     // Build the next height's dataset in the background: -1 auto, 0 off, 1 on.
     int prefetch = -1;
 
+    // Memory clock offset in MHz of transfer rate. CUDA and Vulkan both force
+    // performance state P2, which runs memory below its rated speed, and this
+    // is what puts it back. 0 leaves the card alone.
+    int memOffsetMhz = 0;
+
     // Benchmark only: pretend a new block arrives this often, so the cost of
     // an epoch change is included in the average. 0 means the height is fixed.
     int benchEpochSeconds = 0;

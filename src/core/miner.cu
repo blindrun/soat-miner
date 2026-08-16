@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
+        else if (a == "--mclk-offset") opt.memOffsetMhz = atoi(next().c_str());
         else if (a == "--cache-dag") {
             const std::string v = next();
             opt.prefetch = (v == "on" || v == "1") ? 1
@@ -108,6 +109,11 @@ int main(int argc, char **argv) {
                 "                    time: auto (default), on, off. Needs a\n"
                 "                    second dataset resident, so auto skips it\n"
                 "                    on cards without the spare VRAM\n"
+                "  --mclk-offset N   memory clock offset in MHz of transfer\n"
+                "                    rate. CUDA and Vulkan both force state P2,\n"
+                "                    which runs memory under its rated speed;\n"
+                "                    500 restores a 4090 to stock for +2.3%%.\n"
+                "                    Needs root on Linux. 0 leaves it alone\n"
                 "  --bench           benchmark, no node required\n"
                 "  --bench-height H  height to benchmark at\n"
                 "  --bench-epoch-secs N  benchmark: change height every N s,\n"
