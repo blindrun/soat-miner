@@ -1,0 +1,123 @@
+// Pearl NoisyGEMM, Vulkan cooperative matrix.
+//
+// One subgroup owns one 16x16 output tile, which is the int8 cooperative
+// matrix shape on both vendors. The XOR reduction runs on the accumulator
+// while it is still a coopmat, so the product never reaches memory during
+// mining.
+//
+// K is a SPECIALISATION CONSTANT, not a literal, because the supported shape
+// differs by vendor and baking it in would silently produce a shader that
+// cannot run on half the fleet. Enumerated with a probe calling
+// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR:
+//
+//   RTX 4090          M16 N16 K32   sint8 x sint8 -> sint32
+//   RX 6700 XT (RADV) M16 N16 K16   sint8 x sint8 -> sint32
+//   llvmpipe          M8  N8  K8
+//
+// RDNA2 has no hardware WMMA; RADV lowers coopmat onto v_dot4_i32_i8, so one
+// path covers both vendors and no hand-written int8 MAC fallback is needed.
+//
+// Subgroup size is also a spec constant, set from the device at pipeline
+// creation, so one workgroup is exactly one subgroup on wave32 and wave64
+// alike. Hardcoding it is how the host and shader drift apart.
+
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(constant_id = 0) const int SUBGROUP_SIZE = 32;
+layout(constant_id = 1) const int K_DIM = 16;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufA { int8_t A[]; };
+layout(std430, binding = 1) readonly buffer BufB { int8_t B[]; };
+layout(std430, binding = 2) writeonly buffer BufC { int32_t C[]; };
+layout(std430, binding = 3) buffer BufT { uint transcripts[]; };
+
+layout(push_constant) uniform Push {
+    int m;
+    int n;
+    int k;
+    int rank;
+    int writeC;
+} pc;
+
+const int HASH_TILE = 16;
+const int TRANSCRIPT_U32 = 16;
+const int ROTATION = 13;
+
+uint rotl32(uint x, int r) {
+    return (x << r) | (x >> (32 - r));
+}
+
+void main() {
+    const int tilesX = pc.n / HASH_TILE;
+    const int tilesY = pc.m / HASH_TILE;
+    const int tile = int(gl_WorkGroupID.x);
+    if (tile >= tilesX * tilesY) return;
+
+    const int tileRow = tile / tilesX;
+    const int tileCol = tile % tilesX;
+    const int row = tileRow * HASH_TILE;
+    const int col = tileCol * HASH_TILE;
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    // One slot per invocation rather than an array indexed by reduction % 16.
+    // A runtime-variable index into a per-invocation array is what forces it
+    // out of registers into scratch; every invocation holds the same value
+    // after the subgroup reduction, so invocation L can own slot L.
+    uint slot = 0u;
+    int reduction = 0;
+    const uint lane = gl_SubgroupInvocationID;
+
+    for (int p = 0; p < pc.k; p += pc.rank) {
+        if (pc.k - p < pc.rank) break;
+
+        for (int kk = p; kk < p + pc.rank; kk += K_DIM) {
+            coopmat<int8_t, gl_ScopeSubgroup, 16, K_DIM, gl_MatrixUseA> ma;
+            coopmat<int8_t, gl_ScopeSubgroup, K_DIM, 16, gl_MatrixUseB> mb;
+            // Element offsets, not byte offsets, and the stride is in elements.
+            coopMatLoad(ma, A, row * pc.k + kk, pc.k, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb, B, kk * pc.n + col, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+            acc = coopMatMulAdd(ma, mb, acc);
+        }
+
+        // Fold the accumulator without materialising it. XOR is commutative
+        // and associative, so which element of the tile each invocation holds
+        // does not matter and never has to be known.
+        uint v = 0u;
+        for (int i = 0; i < acc.length(); ++i) {
+            v ^= uint(acc[i]);
+        }
+        v = subgroupXor(v);
+
+        if (int(lane) == reduction % TRANSCRIPT_U32) {
+            slot = rotl32(slot, ROTATION) ^ v;
+        }
+        ++reduction;
+    }
+
+    if (pc.writeC != 0) {
+        coopMatStore(acc, C, row * pc.n + col, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    if (lane < uint(TRANSCRIPT_U32)) {
+        const int blocksPerRow = pc.n / pc.rank;
+        const int iIdx = row / pc.rank;
+        const int jIdx = col / pc.rank;
+        const int hi = (row % pc.rank) / HASH_TILE;
+        const int wi = (col % pc.rank) / HASH_TILE;
+        const int tilesPerSide = pc.rank / HASH_TILE;
+        const int flatIdx =
+            ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+        transcripts[flatIdx * TRANSCRIPT_U32 + int(lane)] = slot;
+    }
+}
