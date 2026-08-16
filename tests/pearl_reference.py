@@ -447,6 +447,11 @@ def emit_vectors(path: str, m=256, n=256, k=256, rank=128) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--emit-vectors":
-        emit_vectors(sys.argv[2])
+        # Optional rank override. The live chain runs noise_rank 64 as well as
+        # the 128 default - a testnet fork rejection at height 36761 said so
+        # explicitly ("Rank must be >= 128 || r=64") - so the kernels have to be
+        # exercised at both, not just the one the reference happens to default to.
+        rank = int(sys.argv[3]) if len(sys.argv) > 3 else 128
+        emit_vectors(sys.argv[2], rank=rank)
         sys.exit(0)
     sys.exit(main())
