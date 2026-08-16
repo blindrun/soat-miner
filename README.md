@@ -1,385 +1,233 @@
 # SOAT Miner
 
-An open-source GPU miner built to be read rather than trusted. **No dev fee.**
+Mines Ergo on your GPU. Autolykos v2, CUDA and Vulkan, Linux and Windows.
 
-**Currently supporting Autolykos2 (Ergo)**, with the structure in place to add
-more algorithms — the core owns the nonce counter, job lifecycle and reporting,
-and an algorithm only answers "test these nonces, tell me which won".
+No dev fee. Nothing is skimmed off your hashrate. MIT licensed.
 
-- **AMD runs on Vulkan compute** — and as far as we can find, this is the
-  first Vulkan implementation of Autolykos anywhere. The existing open AMD
-  miners are all OpenCL, and the NVIDIA ones are CUDA.
-- **NVIDIA runs on CUDA.**
-- **Linux and Windows.**
+You will need an Ergo wallet address before you can mine to a pool.
+Get one from Nautilus or the Ergo desktop wallet.
 
-Every mainstream Autolykos miner is a closed-source binary. That is a poor fit
-for a machine that also holds SSH keys, API tokens and real work — so this one
-is source-available end to end and ships with the test that proves it computes
-the right thing.
+You will also need a GPU with 8GB or more.
+The dataset is 7.27GB right now and it grows every few days.
 
-```
-  SOAT Miner  autolykos2
-  ────────────────────────────────────────────────────────────
-  GPU        AMD Radeon RX 6700 XT (RADV NAVI22) (Vulkan 1.4, 12.9 GB)
-  Source     ergo.herominers.com:1180 (pool)
-  ────────────────────────────────────────────────────────────
-  Hashrate      82.90 MH/s    ▂▄▅▆▇█▇▆
-  Epoch       1851444         dataset 7.27 GB
-  Solutions  2 accepted
-  ────────────────────────────────────────────────────────────
-```
+## Get it
 
-## Status
+Download the release for your os.
 
-| | |
-|---|---|
-| Algorithms | Autolykos v2 (Ergo) — more planned |
-| Hashrate | **267.6** RTX 5080 · **217** RTX 4090 (CUDA) · **162.5** RTX 4090 · **151.9** RX 7900 XT · **82.9** RX 6700 XT (Vulkan) MH/s |
-| Dev fee | **none** |
-| Correctness | verified against real mainnet blocks — see below |
-| Backends | **CUDA** (NVIDIA) · **Vulkan** (AMD, Intel, NVIDIA) |
-| Work source | **pools (stratum)** and solo via your own node |
-| Platforms | Linux (tested), Windows (builds; untested on hardware) |
+https://github.com/blindrun/soat-miner/releases
 
-For reference, lolMiner does ~265 MH/s on a 4090 and takes a 0.75–1% dev fee.
-This is ~82% of that with none, and you can read it.
+Unpack it on Linux with command tar xzf soat-miner_v0.1.2_Lin64.tar.gz
 
-### Hashrate depends on the chain height, a lot
+On Windows just unzip it.
 
-Autolykos v2's dataset grows over time, and this workload is memory bound, so
-hashrate falls as the dataset outgrows cache. Measured on one RX 6700 XT, same
-binary, only `--bench-height` changed:
+## Mine to a pool
 
-| Epoch | Dataset | Hashrate |
+This is the part most people want.
+
+Open mine_ergo_herominers.sh in a text editor.
+Change WALLET to your own address.
+Save it.
+Run it with command ./mine_ergo_herominers.sh
+
+On Windows open mine_ergo_herominers.bat instead, change WALLET, then double
+click it.
+
+That is it. You are mining.
+
+There is a woolypooly script in there too if you prefer that pool.
+
+First start takes about 15 seconds. It builds the 7.27GB dataset before it
+hashes anything. That is normal and it is not frozen.
+
+## Check it is working
+
+Look at the accepted count in the readout. It should climb every few minutes.
+
+Then look yourself up on the pool.
+
+https://ergo.herominers.com
+
+Paste your wallet address in. Your worker should be listed with a hashrate.
+
+BE WARNED: a miner that prints a hashrate is not proof you are getting paid.
+Always confirm on the pool site. Shares can be rejected for reasons the miner
+cannot see.
+
+## Benchmark without mining
+
+Run it with command ./soat-miner-vk --bench
+
+No pool, no wallet, no shares, no payouts. It only measures speed.
+
+## Which backend
+
+Leave BACKEND=auto in config.txt and it picks for you.
+
+It goes by GPU, not by brand.
+
+- AMD and Intel get Vulkan.
+- NVIDIA 50-series gets Vulkan. It is 22% faster than CUDA on Blackwell.
+- Every older NVIDIA gets CUDA. It is 34% faster than Vulkan on Ada.
+
+Force it with BACKEND=cuda or BACKEND=vulkan if you want.
+
+See what it found with command ./soat-miner-vk --list-devices
+
+## Speeds
+
+Measured at the current dataset size, 7.27GB.
+
+| GPU | Backend | MH/s |
 |---|---|---|
-| 2021 (h=614,400) | 2.25 GB | **235.2 MH/s** |
-| 2023 (h=1,200,000) | 3.86 GB | **154.2 MH/s** |
-| today (h=1,851,444) | **7.27 GB** | **82.9 MH/s** |
+| RTX 5080 | Vulkan | 267.6 |
+| RTX 4090 | CUDA | 217.5 |
+| RX 7900 XT | Vulkan | 151.9 |
+| RX 6700 XT | Vulkan | 82.9 |
 
-Most published Autolykos figures date from 2022, when the dataset was ~2.9 GB.
-Compare like with like before concluding a miner is slow — including this one.
+lolMiner does about 265 MH/s on a 4090 and takes 0.75% to 1%. This is close to
+that with none, and you can read the source.
 
-### The dataset must be a dedicated allocation
+Your number will drop over time and that is not a bug. Hashrate falls as the
+dataset outgrows your cache. The same 6700 XT did 235 MH/s in 2021 at 2.25GB
+and does 82.9 now at 7.27GB. Old numbers you find online are about double what
+any miner gets today. Compare like with like.
 
-Vulkan buffers are not automatically backed by large pages. Without
-`VkMemoryDedicatedAllocateInfo` on the dataset, NVIDIA's driver maps it in a
-way that makes 33 random gathers per nonce miss the TLB almost every time, and
-the miner collapses as the dataset grows — on a 4090, 119 MH/s at 2.15 GB but
-2.9 MH/s at 7.27 GB, while CUDA stayed flat near 218. Two obvious explanations
-were both wrong: it was not the branch that selects a chunk buffer (removing it
-changed nothing) and not register spilling (a 5080 with essentially none was
-just as slow). Confining the gathers to the first 2.15 GB of a full 7.27 GB
-allocation restored the fast number exactly, which leaves only how far the
-gathers span. One flag fixed it:
+## Money
 
-| GPU | before | after |
-|---|---|---|
-| RTX 5080 | 5.7 | **267.6** |
-| RTX 4090 | 2.9 | **162.5** |
-| RX 6700 XT | 82.9 | 82.9 (unaffected) |
+Be honest with yourself about this.
 
-Memory utilisation went from 4% to 99% on the 5080 — the kernel had been
-TLB-stalled, not bandwidth-bound. AMD is unchanged, so this is an NVIDIA
-mapping behaviour, not an algorithm problem. CUDA never showed it because
-`cudaMalloc` gets large pages already.
+A tuned 4090 nets a few dollars a month at $0.11/kWh. It drops about 25% a
+quarter as the block reward steps down. This is not free money.
 
-### It is bandwidth-bound, and the numbers show it
+Power limit it to the efficiency knee. On a 4090 set 183W and you still get
+217 MH/s while the card actually pulls 167W. That is 24% less power for 0.3
+MH/s.
 
-Measured across three cards at the same chain height:
+Set it with command sudo nvidia-smi -pl 183
 
-| GPU | Backend | MH/s | Peak BW | Useful BW | % of peak |
-|---|---|---|---|---|---|
-| RTX 5080 | Vulkan | 267.6 | 960 GB/s | 282 GB/s | 29.4% |
-| RTX 4090 | CUDA | 217.0 | 1008 GB/s | 229 GB/s | 22.7% |
-| RTX 4090 | Vulkan | 162.5 | 1008 GB/s | 171 GB/s | 17.0% |
-| RX 7900 XT | Vulkan | 151.9 | 800 GB/s | 160 GB/s | 20.0% |
-| RX 6700 XT | Vulkan | 82.9 | 384 GB/s | 88 GB/s | 22.8% |
+## Solo mining
 
-Three different GPUs, two vendors, two APIs — and all three land within a
-couple of points of the same fraction of their own memory bandwidth. That is
-the signature of a kernel limited by its 33 random gathers per nonce and
-nothing else.
+Solo needs your own Ergo node. Pool does not.
 
-The 7900 XT has 2.08x the 6700 XT's bandwidth and delivers 1.83x the
-hashrate: 88% of the bandwidth-predicted scaling.
+Your payout address is configured on the NODE, not in the miner. Put it in
+ergo.conf.
 
-Practical consequence: **for this algorithm, memory bandwidth is the spec that
-matters.** Shader count and clocks barely move it.
-
-### Both paths are at hardware limits
-
-The dataset build is ALU-saturated on both vendors, and the difference between
-the cards is exactly the difference in their ALUs:
-
-| GPU | Build | Throughput | % of ALU peak |
-|---|---|---|---|
-| RX 6700 XT | 9.86 s | 5.03 T ops/s | 81.3% |
-| RTX 4090 | 1.47 s | 33.76 T ops/s | 81.8% |
-
-Build-time ratio 6.71×, ALU capacity ratio 6.66×. The search path is memory
-bound: removing its 33 random gathers takes it from 82.9 to 780 MH/s.
-
-Optimisations tried and **rejected as measurably useless or harmful**, so
-nobody repeats them: LDS-cached `M` table (cost 11 MH/s to occupancy),
-`N` as a specialization constant (no change, and it baked `N` into the
-pipeline so it would break at the next epoch), wave32 vs wave64 (no change),
-8-wide batched loads for memory-level parallelism (71.4 vs 82.9), unrolling
-the message-array fills (no change — the compiler already did it).
-
-## Correctness
-
-A miner that hashes slightly wrong finds nothing and tells you nothing is
-wrong. So correctness is pinned to real chain data at three levels:
-
-1. **`tests/reference.py`** — Autolykos v2 in plain Python, ported from the
-   Ergo node's `AutolykosPowScheme.scala`. It fetches recent mainnet blocks,
-   recomputes each header digest and hit from scratch, and asserts each block's
-   own nonce satisfies its own target. Currently **6/6 blocks verified**.
-2. **`tests/test_element.cu`** — the CUDA dataset elements must match the
-   Python reference exactly, including index 0, the 1023/1024 block boundary,
-   and the final element.
-3. **`tests/test_hit.cu`** — builds the real 7.27 GB dataset for a real block's
-   height and reproduces that block's hit from its winning nonce, byte for
-   byte.
-
-```bash
-make test
 ```
-
-Run these after any change. If they pass, the miner agrees with consensus.
-
-## Build
-
-**Linux**
-
-```bash
-make                    # builds BOTH backends
-make cuda               # NVIDIA only
-make opencl             # AMD / Intel / NVIDIA - no vendor toolchain needed
-make package            # release tarball
-
-make ARCH=sm_89         # defaults to sm_89 (Ada / RTX 40xx)
-make ARCH=sm_86         # Ampere / RTX 30xx
-make ARCH=sm_75         # Turing / RTX 20xx, 16xx
-```
-
-**Windows** (CUDA Toolkit + Visual Studio Build Tools)
-
-```powershell
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build --config Release
-```
-
-CMake works on Linux too if you prefer it.
-
-## Run
-
-```bash
-./soat-miner --bench                 # benchmark, no node needed
-./soat-miner --node 127.0.0.1        # solo mine against your node
-./soat-miner --plain                 # one-line JSON per interval, for logs
-./soat-miner --help
-```
-
-The readout auto-detects a terminal. Under systemd it emits one JSON object
-per interval instead of redrawing a panel into your log file:
-
-```json
-{"ts":18,"algo":"autolykos2","mhs":216.83,"watts":183.0,"temp_c":49,
- "eff_mh_w":1.185,"epoch":1851444,"accepted":0,"rejected":0}
-```
-
-### Pool mining
-
-Edit `config.txt`, then run the launcher:
-
-```bash
-./soat-miner.sh            # Linux
-soat-miner.bat             # Windows
-```
-
-Or use a ready-made script — edit `WALLET` at the top and run it:
-
-| Script | What it does |
-|---|---|
-| `mine_ergo_herominers.sh` / `.bat` | pool mine to HeroMiners |
-| `mine_ergo_woolypooly.sh` / `.bat` | pool mine to WoolyPooly |
-| `mine_ergo_solo.sh` / `.bat` | solo against your own node |
-| `benchmark.sh` / `.bat` | benchmark, no pool or node needed |
-
-Command-line flags override `config.txt`, so these work without editing it.
-
-```ini
-WALLET=9yourErgoAddress...
-POOL=ergo.herominers.com:1180
-WORKER=rig1
-BACKEND=auto               # auto | cuda | vulkan
-```
-
-Or directly:
-
-```bash
-./soat-miner --pool ergo.herominers.com:1180 --wallet 9yourAddr --worker rig1
-```
-
-The stratum protocol was captured from live pools rather than taken from
-documentation, because Ergo stratum is a de-facto standard with no spec. Two
-details that are easy to get wrong and are handled here: `mining.notify`
-param 6 is the target in **decimal**, not a difficulty and not hex; and the
-subscribe reply's extranonce is a **prefix** of the 8-byte nonce, so nonces
-must be generated inside that subspace or every share is rejected.
-
-### Solo mining
-
-Leave `POOL` empty in `config.txt` and point it at your own node.
-
-```bash
-# on the node, ergo.conf:
 ergo {
-  node {
-    mining = true
-    useExternalMiner = true
-  }
+  node.mining = true
+  wallet.secretStorage.secretDir = ...
 }
 ```
 
-The **reward address is configured on the node, not here.** The miner asks the
-node for work and hands back solutions; the node decides who gets paid.
+Then run it with command ./mine_ergo_solo.sh
 
-Solo is the default on purpose. At 217 MH/s against a ~510 GH/s network you
-expect a block roughly every **3 days** — high variance but not absurd — and
-solo mining is the one thing that improves Ergo's mining centralisation rather
-than worsening it. As of 2026-08-15 a single miner held **53–61% of network
-hashrate for 40+ days straight**, so where you point hashrate matters.
+At 217 MH/s against a network around 510 GH/s you will find a block roughly
+once every three years. Solo is in here because it is the one thing that
+actually improves mining decentralisation, not because it pays.
 
-## Guard: mining around real GPU work
+## Build from source
 
-`scripts/soat-miner-guard.py` starts and stops the miner so it never competes
-with actual work. It stops mining when:
+**Linux.** Install the CUDA toolkit and glslang, then run make.
 
-- **Ollama has a model loaded** (`/api/ps`) — i.e. Qwen was asked something
-- **ComfyUI has anything running or queued** (`/queue`)
-- **any other process appears on the GPU** — by name (`llama-server`, `ollama`)
-  immediately, or by VRAM threshold for anything unrecognised
-- it is **outside the allowed hours** (summer default avoids the heat of the day)
-- the **GPU is too hot**
+Build both backends with command make
 
-Stopping is immediate; starting waits for a short settle period, because
-rebuilding the dataset costs ~4 s and thrashing between two prompts is worse
-than losing a few seconds of mining.
+Build one with command make cuda or command make vulkan
 
-**Why name-based detection matters.** On a 24 GB card, `qwen3:8k` needs
-21.9 GB and the Autolykos dataset is 7.3 GB — 29.2 GB total, 4.6 GB over
-capacity. They cannot coexist. Waiting for a VRAM threshold to trip means
-reacting *after* the allocation has already failed, so known LLM processes are
-treated as busy the moment they appear, at any size.
+**Windows.** You need the CUDA Toolkit and Visual Studio Build Tools with the
+C++ workload. Then use cmake.
 
-Install:
-
-```bash
-sudo install -Dm755 soat-miner            /opt/soat-miner/soat-miner
-sudo install -Dm755 scripts/soat-miner-guard.py /opt/soat-miner/soat-miner-guard.py
-sudo install -Dm644 scripts/guard.conf.example  /etc/soat-miner/guard.conf
-sudo install -Dm644 scripts/soat-miner.service       /etc/systemd/system/
-sudo install -Dm644 scripts/soat-miner-guard.service /etc/systemd/system/
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin soatminer
-sudo mkdir -p /var/log/soat-miner && sudo chown soatminer /var/log/soat-miner
-sudo systemctl enable --now soat-miner-guard
+```
+cmake -B build
+cmake --build build --config Release
 ```
 
-Only the guard is enabled. It starts the miner when appropriate; you never
-start `soat-miner.service` directly.
+The binary lands in build\Release\soat-miner.exe
 
-Set `DRY_RUN=true` in `guard.conf` first and watch `/var/log/soat-miner/guard.log`
-to confirm its decisions before letting it touch anything.
+BE WARNED: RTX 50-series needs CUDA Toolkit 12.8 or newer to get native code.
+Older toolkits still work. They fall back to PTX and the driver compiles it at
+startup.
 
-## Tuning
+CUDA cannot be cross compiled from Linux. nvcc needs MSVC on a Windows host.
+That is why the Windows download ships the Vulkan build only.
 
-Measured on an RTX 4090:
+## Correctness
 
-| Power limit | Hashrate | Actual draw | Efficiency |
-|---|---|---|---|
-| 450 W | 217.5 MH/s | 221 W | 0.98 MH/W |
-| **183 W** | **217.2 MH/s** | **167 W** | **1.30 MH/W** |
-| 150 W | 170.0 MH/s | 134 W | 1.27 MH/W |
+A miner that hashes slightly wrong finds nothing and reports no error. So this
+is checked against the real chain, not against itself.
 
-183 W costs **0.3 MH/s for 24% less power**. The guard applies this
-automatically and restores the full limit the moment it stops.
+Run the tests with command make test
+
+It does three things. It recomputes real mainnet blocks in Python from the Ergo
+node's own reference. It compares the GPU dataset against that Python byte for
+byte. Then it rebuilds the dataset on your card and reproduces a real block's
+hit from that block's winning nonce.
+
+Both backends are held to the same block and must agree exactly.
+
+## Mining around other GPU work
+
+There is a guard script if you use the same card for Ollama or ComfyUI.
+
+It stops mining when real work wants the GPU and starts it again after.
+
+It watches process names, not VRAM. A 21.9GB model and a 7.3GB dataset cannot
+share a 24GB card. By the time VRAM spikes it is already too late.
+
+Copy guard.conf.example to /etc/soat-miner/guard.conf and edit it.
+Install the two service files.
+Start it with command systemctl enable --now soat-miner-guard
 
 ## How it works
 
-Per nonce, after the dataset exists:
+Autolykos v2 is memory bound. Every nonce does 33 random lookups into that
+7.27GB table. The hashing is not the slow part, the lookups are.
 
-```
-prei8 = H(msg || nonce)[24..32]      1 compression
-i     = prei8 mod N
-f     = element(i)                   1 random read
-seed  = f || msg || nonce            (31 + 32 + 8 = 71 bytes)
-idx   = 32 indices from H(seed)      1 compression
-sum   = SUM element(idx[j])          32 random reads
-hit   = H(sum as 32-byte BE)         1 compression
-```
+Proof: replace the lookups with arithmetic and a 6700 XT goes from 82.9 to 780
+MH/s.
 
-Three Blake2b compressions and **33 random reads** into a 7.27 GB table. At
-217 MH/s that is ~230 GB/s of random access against ~1008 GB/s of peak
-bandwidth — this is a **memory-latency bound** workload, not a compute bound
-one, which drives every optimisation decision here.
+So hashrate tracks memory bandwidth and nothing else. Across three cards, two
+brands and two APIs, every one of them lands at 20% to 23% of its own peak
+bandwidth. The 7900 XT has 2.08x the bandwidth of a 6700 XT and gets 1.83x the
+hashrate.
 
-Two that mattered, and one that did not:
+That also means most tuning does nothing.
 
-- **`M` is never stored.** The 8 KB constant is 1024 big-endian int64s, so
-  message word *w* is just `bswap64(w)` — one instruction instead of 8 KB of
-  traffic, 227 million times per dataset build.
-- **Register pressure is the ceiling.** The obvious Blake2b stages its message
-  through a `uint8_t buf[128]`, and those 128 bytes live in registers. Removing
-  it, plus `__launch_bounds__(256, 2)`, took the kernel from 250 registers
-  (~16% occupancy) to 128 with zero spills: **180 → 218 MH/s**.
-- **Replacing the 33 integer modulos with a precomputed reciprocal did
-  nothing** (218.2 → 216.7 MH/s). A useful negative result: it confirms the
-  kernel is waiting on memory, not arithmetic. The code was reverted.
+All of these were measured. All of them got reverted.
+
+- Caching the constant table in LDS.
+- Baking the table size into the pipeline.
+- wave32 against wave64.
+- Batching the loads 8 wide.
+- Unrolling the message fills.
+
+Do not spend a weekend on them.
 
 ## Adding an algorithm
 
-The core owns the nonce counter, job lifecycle, stop signals and reporting.
-An algorithm only answers "test these nonces, tell me which won".
+Drop it in src/algos/yourname/.
+Add the object to ALGO_OBJS in the Makefile.
+Add two lines to src/core/registry.cu.
 
-1. Create `src/algos/<name>/` and implement `om::Algorithm` (`src/core/algo.h`):
-   `name`, `memoryBytes`, `prepare`, `search`, `verify`, `release`.
-2. Add a factory line to `src/core/registry.cu`.
-3. Add the object to `ALGO_OBJS` in the `Makefile` and to `CMakeLists.txt`.
+An algorithm only has to answer four things. Prepare for this epoch. Test these
+nonces. Say which won. Verify one.
 
-`prepare()` is called whenever the job's epoch changes, which covers
-DAG/dataset-per-epoch designs as well as algorithms needing no memory at all.
-`Job` carries a 32-byte message plus a 256-bit target; anything chain-specific
-rides in `Job::extra` and stays opaque to the core.
-
-To add a pool instead of an algorithm, implement `JobSource` in
-`src/core/miner.cu` — that is the only thing stratum support requires.
-
-## Two backends
-
-`soat-miner` is the CUDA build; `soat-miner-cl` is the OpenCL build. They are
-verified to produce byte-identical hits, and on an RTX 4090 they benchmark the
-same (217 MH/s), so OpenCL is not a slow fallback - it is a genuine portable
-build that happens to also be the only one AMD can run.
-
-OpenCL compiles its kernels at runtime, which is why an AMD build needs no AMD
-machine and no ROCm/HIP toolchain to produce.
-
-One OpenCL-specific constraint: `CL_DEVICE_MAX_MEM_ALLOC_SIZE` is commonly a
-quarter of VRAM (6.3 GB on a 24 GB card) while the dataset is 7.27 GB, so the
-dataset is split across up to four buffers and addressed across them.
+The mining loop, the pool code and the readout are shared and you do not touch
+them.
 
 ## Not done yet
-- **Windows is built but only lightly exercised.** The platform shim covers
-  Winsock, `_isatty`, and MSVC's lack of `__int128`. The Vulkan `.exe` has been
-  run; the CUDA build on Windows has not.
-- Multi-GPU. Single device today.
+
+- Multi GPU. One card at a time right now.
+- More algorithms. Only Autolykos v2 so far.
+- The Windows CUDA build is tested on a 5080 and nothing else.
+
+## Resources
+
+https://github.com/blindrun/soat-miner
+
+https://ergo.herominers.com
+
+https://sonofatech.com
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-Mining is not free money — read the economics before you run this. On the
-hardware above it nets a few dollars a month at $0.115/kWh, declining ~25% per
-quarter as Ergo's block reward steps down.
+MIT. Do what you want with it.
