@@ -96,7 +96,31 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                                      opt.worker, opt.password);
         std::string err;
         if (!st->start(&err)) {
-            fprintf(stderr, "pool connect failed: %s\n", err.c_str());
+            if (opt.lithos) {
+                // The overwhelmingly common Lithos failure: no local Lithos
+                // client is running yet. Lithos has no central pool - you run
+                // your own node + client and payouts go to YOUR wallet - so a
+                // refused connection here almost always means "not set up yet",
+                // not a network problem. Say exactly what to do.
+                logLine(tty, "error",
+                        "no Lithos client is answering on " + opt.poolHost +
+                        ":" + std::to_string(opt.poolPort) + ".");
+                logLine(tty, "info",
+                        "Lithos has no central pool. You run a local Ergo node "
+                        "+ Lithos client, and your mining payouts go to your "
+                        "own wallet on that node.");
+                logLine(tty, "info",
+                        "One command sets all of it up (node, client, wallet) - "
+                        "the script ships next to this miner:");
+                logLine(tty, "info",
+                        "    sudo ./lithos-quickstart.sh --network testnet");
+                logLine(tty, "info",
+                        "Then wait for it to sync (watch: ./lithos-status), "
+                        "start the client, and re-run this miner. Payouts land "
+                        "in the wallet the setup created.");
+            } else {
+                fprintf(stderr, "pool connect failed: %s\n", err.c_str());
+            }
             delete st;
             return 1;
         }

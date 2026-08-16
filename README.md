@@ -211,20 +211,52 @@ database, the Lithos client compresses your work into Non-Interactive Share
 Proofs and settles them on-chain against collateral, so there is no operator to
 trust and no operator to censor you.
 
-You need three things running before the miner is any use:
+Because there is no operator, there is no pool server to point at. Each miner
+runs their own Ergo node and Lithos client, and payouts go to that miner's own
+wallet. That is more to set up than a normal pool, so this download ships a
+script that does all of it for you.
 
-1. a fully synced Ergo node
-2. Java 11
-3. the [Lithos client](https://github.com/Lithos-Protocol/Lithos-Client),
-   configured in `conf/application.conf` to point at your node
+### Mine Lithos and get paid, from scratch
 
-The client runs a stratum server on `127.0.0.1:4444`. Mine into it:
+**1. Set up the node, client and wallet** (Debian/Ubuntu, one command):
 
 ```
-./mine_ergo_lithos.sh
+sudo ./lithos-quickstart.sh --network testnet
 ```
 
-or directly:
+This installs Java 11, an Ergo node and the Lithos client, creates the wallet
+your payouts will go to, and starts everything. It handles the traps that
+otherwise cost an afternoon (the testnet difficulty override, the node version
+that is stable, creating the wallet the client needs before it will start).
+
+**2. Wait for the node to sync**, and watch it plainly:
+
+```
+./lithos-status --watch
+```
+
+The node syncs the chain (this takes a while). When `lithos-status` shows
+`SYNCED`, start the client:
+
+```
+systemctl start lithos-client
+```
+
+**3. Mine:**
+
+```
+./mine_ergo_lithos.sh          # or: ./soat-miner.sh --lithos
+```
+
+**4. Check you are actually earning.** `lithos-status` reads the client and
+tells you your super-shares per hour against the payout bar (you need about
+0.83/hour). If you are below it, lower the `diff` in the client config.
+
+Payouts settle on-chain to the wallet the setup created. Back up its mnemonic
+(the setup prints where it saved it).
+
+If you already run your own node and client, skip the script — the client's
+stratum server is on `127.0.0.1:4444` and you just mine into it:
 
 ```
 ./soat-miner.sh --lithos

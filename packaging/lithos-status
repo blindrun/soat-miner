@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# lithos-status - is my Lithos mining actually working, and am I earning?
+#
+# Lithos gives you no dashboard. Your node syncs silently, the client produces
+# "super shares" you never see, and the stratum address is a label so a normal
+# pool page tells you nothing. This turns the two local APIs into one answer:
+# are you synced, is the client producing super shares, and are you on track to
+# get paid.
+#
+#   node   http://127.0.0.1:9052/info    (testnet; mainnet is 9053)
+#   client http://127.0.0.1:9053/mining  (StratumInfo: diff, tau, superSharesPerHour)
+#
+# The one number that matters is superSharesPerHour. Payout needs at least
+# 10 super shares in the 12-hour window before a block, i.e. ~0.83/hour. This
+# tells you whether your current diff/hashrate clears that bar, because nothing
+# else will.
+#
+# Usage:
+#   lithos-status                one snapshot
+#   lithos-status --watch        refresh every 10s
+#   lithos-status --json         one JSON object (for scripts/systemd)
+#
+# Config (env or /etc/lithos-quickstart.conf, all optional):
+#   NETWORK=testnet|mainnet          default testnet
+#   NODE_HOST=127.0.0.1  NODE_PORT=  default 9052 testnet / 9053 mainnet
+#   CLIENT_HOST=127.0.0.1  CLIENT_PORT=9053
+#   NODE_API_KEY=hello               only needed if your node locks /info
+
+set -u
+
+# ---- config -----------------------------------------------------------------
+[ -f /etc/lithos-quickstart.conf ] && . /etc/lithos-quickstart.conf
+NETWORK="${NETWORK:-testnet}"
+NODE_HOST="${NODE_HOST:-127.0.0.1}"
+if [ "$NETWORK" = "mainnet" ]; then NODE_PORT="${NODE_PORT:-9053}"; else NODE_PORT="${NODE_PORT:-9052}"; fi
+CLIENT_HOST="${CLIENT_HOST:-127.0.0.1}"
+CLIENT_PORT="${CLIENT_PORT:-9053}"
+NODE_API_KEY="${NODE_API_KEY:-hello}"
+
+# Payout bar: 10 super shares per 12h window = 0.8333/hour.
+TARGET_SSPH="0.83"
+
+MODE="once"
+for a in "$@"; do
+  case "$a" in
+    --watch) MODE="watch" ;;
+    --json)  MODE="json" ;;
+    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown arg: $a (try --help)"; exit 2 ;;
+  esac
+done
+
+command -v curl >/dev/null || { echo "need curl"; exit 1; }
+HAVE_JQ=1; command -v jq >/dev/null || HAVE_JQ=0
+
+# ---- helpers ----------------------------------------------------------------
+# get_json URL [apikey] -> body on stdout, exit 0 if reachable
+fetch() {
+  local url="$1" key="${2:-}"
+  if [ -n "$key" ]; then
+    curl -s -m 6 -H "api_key: $key" "$url" 2>/dev/null
+  else
+    curl -s -m 6 "$url" 2>/dev/null
+  fi
+}
+# jget BODY .path default
+jget() {
+  local body="$1" path="$2" def="${3:-}"
+  if [ "$HAVE_JQ" = 1 ]; then
+    local v; v=$(printf '%s' "$body" | jq -r "$path // empty" 2>/dev/null)
+    [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$def"
+  else
+    # crude fallback: pull "key":value for a leaf path like .foo
+    local k="${path#.}"; local v
+    v=$(printf '%s' "$body" | grep -o "\"$k\"[[:space:]]*:[[:space:]]*[^,}]*" | head -1 | sed 's/.*:[[:space:]]*//; s/"//g')
+    [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$def"
+  fi
+}
+
+# bar PCT WIDTH -> [#####-----]
+bar() {
+  local pct="$1" w="${2:-24}"; [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+  [ "$pct" -lt 0 ] 2>/dev/null && pct=0
+  local fill=$(( pct * w / 100 )) i s=""
+  for ((i=0;i<w;i++)); do [ "$i" -lt "$fill" ] && s+="#" || s+="-"; done
+  printf '%s' "$s"
+}
+
+# ---- collect ----------------------------------------------------------------
+collect() {
+  NODE_BODY=$(fetch "http://$NODE_HOST:$NODE_PORT/info" "$NODE_API_KEY")
+  NODE_UP=0; [ -n "$NODE_BODY" ] && case "$NODE_BODY" in *headersHeight*) NODE_UP=1;; esac
+
+  HEADERS=$(jget "$NODE_BODY" .headersHeight 0)
+  FULL=$(jget "$NODE_BODY" .fullHeight 0)
+  MAXPEER=$(jget "$NODE_BODY" .maxPeerHeight 0)
+  PEERS=$(jget "$NODE_BODY" .peersCount 0)
+  NET=$(jget "$NODE_BODY" .network "$NETWORK")
+  [ "$FULL" = "null" ] && FULL=0
+  [ "$MAXPEER" = "null" ] && MAXPEER=0
+
+  # Ergo syncs in two phases: headers to the tip first, THEN full blocks.
+  # Report the phase actually in progress, so header download does not read as
+  # a frozen 0%.
+  local tip="$MAXPEER"; [ "$HEADERS" -gt "$tip" ] 2>/dev/null && tip="$HEADERS"
+  HDR_PCT=0; FULL_PCT=0
+  [ "$tip" -gt 0 ] 2>/dev/null && HDR_PCT=$(( HEADERS * 100 / tip ))
+  [ "$tip" -gt 0 ] 2>/dev/null && [ "$FULL" -gt 0 ] 2>/dev/null && FULL_PCT=$(( FULL * 100 / tip ))
+  # phase: block sync has started once fullHeight moves; else still on headers
+  PHASE="headers"; [ "$FULL" -gt 0 ] 2>/dev/null && PHASE="blocks"
+  SYNC_PCT="$FULL_PCT"; [ "$PHASE" = "headers" ] && SYNC_PCT="$HDR_PCT"
+  SYNCED=0; { [ "$FULL" -gt 0 ] 2>/dev/null && [ $(( tip - FULL )) -le 3 ] 2>/dev/null; } && SYNCED=1
+
+  CLIENT_BODY=$(fetch "http://$CLIENT_HOST:$CLIENT_PORT/mining")
+  CLIENT_UP=0; [ -n "$CLIENT_BODY" ] && case "$CLIENT_BODY" in *superSharesPerHour*) CLIENT_UP=1;; esac
+  DIFF=$(jget "$CLIENT_BODY" .diff "-")
+  TAU=$(jget "$CLIENT_BODY" .tau 0)
+  SSPH=$(jget "$CLIENT_BODY" .superSharesPerHour 0)
+  REDUCED=$(jget "$CLIENT_BODY" .reducedMessaging false)
+}
+
+# on_track: compare SSPH to TARGET_SSPH using awk (floats)
+on_track() { awk -v a="$1" -v b="$TARGET_SSPH" 'BEGIN{exit !(a+0 >= b+0)}'; }
+
+# ---- render -----------------------------------------------------------------
+render() {
+  collect
+  printf '\n  LITHOS STATUS  (%s)\n' "$NET"
+  printf '  ---------------------------------------------\n'
+
+  # node
+  if [ "$NODE_UP" = 1 ]; then
+    if [ "$SYNCED" = 1 ]; then
+      printf '  node     UP    SYNCED   full=%s peers=%s\n' "$FULL" "$PEERS"
+    elif [ "$PHASE" = "headers" ]; then
+      printf '  node     UP    headers  [%s] %s%%  %s/%s peers=%s\n' \
+        "$(bar "$SYNC_PCT")" "$SYNC_PCT" "$HEADERS" "$MAXPEER" "$PEERS"
+    else
+      printf '  node     UP    blocks   [%s] %s%%  full=%s/%s peers=%s\n' \
+        "$(bar "$SYNC_PCT")" "$SYNC_PCT" "$FULL" "$MAXPEER" "$PEERS"
+    fi
+  else
+    printf '  node     DOWN  (no answer on %s:%s) - start the Ergo node first\n' "$NODE_HOST" "$NODE_PORT"
+  fi
+
+  # client
+  if [ "$CLIENT_UP" = 1 ]; then
+    printf '  client   UP    diff=%s tau=%s reducedMsg=%s\n' "$DIFF" "$TAU" "$REDUCED"
+  elif [ "$SYNCED" = 1 ]; then
+    printf '  client   DOWN  (no answer on %s:%s) - start the Lithos client\n' "$CLIENT_HOST" "$CLIENT_PORT"
+  else
+    printf '  client   --    (waiting on node sync; it will not serve jobs until synced)\n'
+  fi
+
+  # the verdict: super shares
+  printf '  ---------------------------------------------\n'
+  if [ "$CLIENT_UP" = 1 ]; then
+    if on_track "$SSPH"; then
+      printf '  EARNING  super shares/hr: %s   (>= %s target)  ON TRACK\n' "$SSPH" "$TARGET_SSPH"
+    else
+      printf '  BELOW    super shares/hr: %s   (< %s target)   LOWER YOUR diff\n' "$SSPH" "$TARGET_SSPH"
+      printf '           payout needs 10 super shares per 12h window (~%s/hr).\n' "$TARGET_SSPH"
+      printf '           a lower diff in the client config makes more super shares.\n'
+    fi
+  else
+    printf '  EARNING  unknown - the client is not reporting yet\n'
+  fi
+  printf '\n'
+}
+
+render_json() {
+  collect
+  printf '{"network":"%s","node_up":%s,"synced":%s,"phase":"%s","sync_pct":%s,"headers":%s,"full_height":%s,"max_peer":%s,"peers":%s,"client_up":%s,"diff":"%s","tau":%s,"super_shares_per_hour":%s,"target_ssph":%s,"on_track":%s}\n' \
+    "$NET" "$NODE_UP" "$SYNCED" "$PHASE" "$SYNC_PCT" "$HEADERS" "$FULL" "$MAXPEER" "$PEERS" \
+    "$CLIENT_UP" "$DIFF" "$TAU" "$SSPH" "$TARGET_SSPH" \
+    "$(on_track "$SSPH" && echo true || echo false)"
+}
+
+case "$MODE" in
+  json)  render_json ;;
+  watch) while true; do clear 2>/dev/null; render; sleep 10; done ;;
+  *)     render ;;
+esac
