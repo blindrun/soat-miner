@@ -366,7 +366,7 @@ def Transcript_slot_used(i: int) -> bool:
 
 
 # ------------------------------------------------------------- vectors
-VECTOR_MAGIC = b"PRLV0001"
+VECTOR_MAGIC = b"PRLV0002"   # 0002 adds pow_key and the expected digests
 
 
 def emit_vectors(path: str, m=256, n=256, k=256, rank=128) -> None:
@@ -420,6 +420,10 @@ def emit_vectors(path: str, m=256, n=256, k=256, rank=128) -> None:
                 for wi in range(tw):
                     transcripts.append(ts[hi][wi].data)
 
+    # blake3 of each transcript under the pow key. This is the whole PoW
+    # check, and it is what the device has to reproduce exactly.
+    digests = [blake3(t.tobytes(), key=key_A).digest() for t in transcripts]
+
     with open(path, "wb") as fh:
         fh.write(VECTOR_MAGIC)
         fh.write(np.array([m, n, k, rank, ng.hash_tile_h, len(transcripts)],
@@ -435,8 +439,10 @@ def emit_vectors(path: str, m=256, n=256, k=256, rank=128) -> None:
         fh.write(C_noised.tobytes())
         fh.write(C.tobytes())
         fh.write(np.ascontiguousarray(np.array(transcripts, dtype=np.uint32)).tobytes())
+        fh.write(key_A)
+        fh.write(b"".join(digests))
     print(f"wrote {path}: {m}x{k} @ {k}x{n}, rank {rank}, "
-          f"{len(transcripts)} transcripts")
+          f"{len(transcripts)} transcripts, {len(digests)} digests")
 
 
 if __name__ == "__main__":

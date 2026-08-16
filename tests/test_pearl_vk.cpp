@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
         if (fread(vec.data(), 1, sz, f) != (size_t)sz) { fclose(f); return 2; }
         fclose(f);
     }
-    if (vec.size() < 32 || memcmp(vec.data(), "PRLV0001", 8) != 0) {
+    if (vec.size() < 32 || memcmp(vec.data(), "PRLV0002", 8) != 0) {
         fprintf(stderr, "bad vector magic\n"); return 2;
     }
     Reader rd{vec.data() + 8, vec.data() + vec.size()};

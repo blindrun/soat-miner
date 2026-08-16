@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
     }
     fclose(f);
 
-    if (size < 32 || memcmp(buf.data(), "PRLV0001", 8) != 0) {
+    if (size < 32 || memcmp(buf.data(), "PRLV0002", 8) != 0) {
         fprintf(stderr, "bad magic - regenerate the vectors\n");
         return 2;
     }
@@ -97,6 +97,8 @@ int main(int argc, char **argv) {
     const int32_t *cExpect = r.take<int32_t>((size_t)m * n);
     r.take<int32_t>((size_t)m * n);                      // C denoised
     const uint32_t *tExpect = r.take<uint32_t>((size_t)numTranscripts * 16);
+    const uint32_t *powKey = r.take<uint32_t>(8);
+    const uint32_t *dExpect = r.take<uint32_t>((size_t)numTranscripts * 8);
     if (!r.ok) {
         fprintf(stderr, "vector file truncated\n");
         return 2;
@@ -199,6 +201,54 @@ int main(int argc, char **argv) {
 
     int badC = naiveOk && mmaOk && stagedOk ? 0 : 1;
     int badT = 0;
+
+    // blake3 PoW check. The transcripts are only useful if the device can turn
+    // them into the same digests the reference does.
+    {
+        uint32_t *dKey, *dDig, *dTarget;
+        CHECK(cudaMalloc(&dKey, 8 * sizeof(uint32_t)));
+        CHECK(cudaMalloc(&dTarget, 8 * sizeof(uint32_t)));
+        CHECK(cudaMalloc(&dDig, (size_t)numTranscripts * 8 * sizeof(uint32_t)));
+        CHECK(cudaMemcpy(dKey, powKey, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        std::vector<uint32_t> maxT(8, 0xffffffffu);
+        CHECK(cudaMemcpy(dTarget, maxT.data(), 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        // Hash the REFERENCE transcripts, so this isolates blake3 from the
+        // gemm. A gemm bug would otherwise show up here as a hash failure.
+        uint32_t *dRefT;
+        CHECK(cudaMalloc(&dRefT, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
+        CHECK(cudaMemcpy(dRefT, tExpect, (size_t)numTranscripts * 16 * sizeof(uint32_t),
+                         cudaMemcpyHostToDevice));
+
+        uint32_t *dHits;
+        CHECK(cudaMalloc(&dHits, (size_t)numTranscripts * sizeof(uint32_t)));
+        om::pearl::powCheck<<<(numTranscripts + 255) / 256, 256>>>(
+            dRefT, numTranscripts, dKey, dTarget, dDig, dHits);
+        CHECK(cudaGetLastError());
+        CHECK(cudaDeviceSynchronize());
+
+        std::vector<uint32_t> dig((size_t)numTranscripts * 8), hits(numTranscripts);
+        CHECK(cudaMemcpy(dig.data(), dDig, dig.size() * sizeof(uint32_t),
+                         cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(hits.data(), dHits, hits.size() * sizeof(uint32_t),
+                         cudaMemcpyDeviceToHost));
+
+        int badD = 0;
+        for (size_t i = 0; i < dig.size(); ++i)
+            if (dig[i] != dExpect[i]) {
+                if (badD < 3)
+                    fprintf(stderr, "  digest[%zu/%zu] device %08x != reference %08x\n", i / 8,
+                            i % 8, dig[i], dExpect[i]);
+                ++badD;
+            }
+        int nHit = 0;
+        for (int i = 0; i < numTranscripts; ++i) nHit += hits[i] ? 1 : 0;
+        printf("  blake3:        digests %s (%d/%zu)\n", badD ? "FAIL" : "ok", badD, dig.size());
+        printf("  target check:  %d/%d hit at max target (expect all)\n", nHit, numTranscripts);
+        if (badD || nHit != numTranscripts) badC = 1;
+
+        cudaFree(dKey); cudaFree(dTarget); cudaFree(dDig); cudaFree(dRefT); cudaFree(dHits);
+    }
 
     // Restore the naive result so the negative control below tests what it
     // says it tests.

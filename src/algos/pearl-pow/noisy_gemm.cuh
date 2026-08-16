@@ -41,6 +41,117 @@ __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
+// ------------------------------------------------------------------ blake3
+//
+// Only the case Pearl needs: a keyed hash of exactly one 64-byte block. The
+// transcript is 64 bytes, which is one block of one chunk, so the whole PoW
+// check is a SINGLE compression - not a general blake3 implementation, and
+// that is why it is cheap enough to sit in the mining loop.
+//
+// Ported from a pure-Python version checked against the reference blake3
+// library on 200 random keyed inputs plus the short-input edge cases, so the
+// flag and block-length handling is known good before it reached the device.
+
+__device__ __forceinline__ uint32_t rotr32(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+__device__ __forceinline__ void b3g(uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d,
+                                    uint32_t mx, uint32_t my) {
+    a += b + mx;  d = rotr32(d ^ a, 16);
+    c += d;       b = rotr32(b ^ c, 12);
+    a += b + my;  d = rotr32(d ^ a, 8);
+    c += d;       b = rotr32(b ^ c, 7);
+}
+
+/**
+ * Keyed blake3 of one block. `key` and `out` are 8 words, `block` is 16.
+ * `blockLen` is the real byte count (64 for a full transcript).
+ */
+__device__ inline void blake3KeyedBlock(const uint32_t key[8], const uint32_t blockIn[16],
+                                        uint32_t blockLen, uint32_t out[8]) {
+    const uint32_t IV0 = 0x6A09E667u, IV1 = 0xBB67AE85u, IV2 = 0x3C6EF372u, IV3 = 0xA54FF53Au;
+    // KEYED_HASH | CHUNK_START | CHUNK_END | ROOT
+    const uint32_t flags = 16u | 1u | 2u | 8u;
+
+    uint32_t s[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = key[i];
+    s[8] = IV0; s[9] = IV1; s[10] = IV2; s[11] = IV3;
+    s[12] = 0u;            // counter low
+    s[13] = 0u;            // counter high
+    s[14] = blockLen;
+    s[15] = flags;
+
+    uint32_t m[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) m[i] = blockIn[i];
+
+    // The permutation is applied with literal indices on an unrolled loop so
+    // the message words stay in registers. A table lookup here would be a
+    // runtime index into a register array, which spills.
+#pragma unroll
+    for (int r = 0; r < 7; ++r) {
+        b3g(s[0], s[4], s[8],  s[12], m[0],  m[1]);
+        b3g(s[1], s[5], s[9],  s[13], m[2],  m[3]);
+        b3g(s[2], s[6], s[10], s[14], m[4],  m[5]);
+        b3g(s[3], s[7], s[11], s[15], m[6],  m[7]);
+        b3g(s[0], s[5], s[10], s[15], m[8],  m[9]);
+        b3g(s[1], s[6], s[11], s[12], m[10], m[11]);
+        b3g(s[2], s[7], s[8],  s[13], m[12], m[13]);
+        b3g(s[3], s[4], s[9],  s[14], m[14], m[15]);
+        if (r < 6) {
+            const uint32_t t0 = m[2],  t1 = m[6],  t2 = m[3],  t3 = m[10];
+            const uint32_t t4 = m[7],  t5 = m[0],  t6 = m[4],  t7 = m[13];
+            const uint32_t t8 = m[1],  t9 = m[11], t10 = m[12], t11 = m[5];
+            const uint32_t t12 = m[9], t13 = m[14], t14 = m[15], t15 = m[8];
+            m[0] = t0;   m[1] = t1;   m[2] = t2;   m[3] = t3;
+            m[4] = t4;   m[5] = t5;   m[6] = t6;   m[7] = t7;
+            m[8] = t8;   m[9] = t9;   m[10] = t10; m[11] = t11;
+            m[12] = t12; m[13] = t13; m[14] = t14; m[15] = t15;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = s[i] ^ s[i + 8];
+}
+
+/**
+ * Hash each transcript and flag the ones at or below the target.
+ *
+ * Comparison is little-endian over the 32-byte digest, matching the
+ * reference's int.from_bytes(digest, "little") <= pow_target, so the most
+ * significant word is the LAST one.
+ */
+__global__ void powCheck(const uint32_t *__restrict__ transcripts, int count,
+                         const uint32_t *__restrict__ key,
+                         const uint32_t *__restrict__ target,
+                         uint32_t *__restrict__ digests, uint32_t *__restrict__ hits) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+
+    uint32_t k[8], blk[16], out[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) k[j] = key[j];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) blk[j] = transcripts[i * kTranscriptU32 + j];
+
+    blake3KeyedBlock(k, blk, 64u, out);
+
+    if (digests) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) digests[i * 8 + j] = out[j];
+    }
+    if (hits) {
+        // Walk from the most significant limb down; first difference decides.
+        int win = 1;
+        for (int j = 7; j >= 0; --j) {
+            if (out[j] < target[j]) break;
+            if (out[j] > target[j]) { win = 0; break; }
+        }
+        hits[i] = win ? 1u : 0u;
+    }
+}
+
 /**
  * One block computes one 16x16 output tile of A_noised @ B_noised, folding a
  * transcript as it goes.
