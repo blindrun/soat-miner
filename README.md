@@ -203,6 +203,12 @@ actually improves mining decentralisation, not because it pays.
 
 ## Lithos
 
+> **Experimental.** The Lithos stratum support here is verified against a mock
+> server built from the Lithos client's own source, and on real hardware, but it
+> has not yet been run against a live Lithos client end to end (the public
+> testnet needs a node build the Lithos team has not published). Treat it as beta
+> until that lands. The rest of the miner is not affected.
+
 [Lithos](https://docs.ergoplatform.com/eco/lithos/) is a decentralised pool
 protocol for Ergo. It is not a coin and not an algorithm: the proof of work is
 the same Autolykos v2, the same dataset and the same kernels. What changes is
