@@ -199,8 +199,22 @@ All of these were measured. All of them got reverted.
 - wave32 against wave64.
 - Batching the loads 8 wide.
 - Unrolling the message fills.
+- Replacing the 32 index divisions with a mask. 219.2 against 219.4.
+- Splitting the hashing and the gathers into separate kernels.
 
 Do not spend a weekend on them.
+
+The last one is worth explaining. The kernel uses 128 registers, and that caps
+it at 33% occupancy. The registers are all Blake2b. The gather loop that
+actually stalls needs almost none, so it is stuck paying for hashing it is not
+doing.
+
+Splitting it in three fixed exactly that. The gather kernel came out at 64
+registers with no spills, which is 67% occupancy, double what it had.
+
+It made no difference. 217.3 against 217.5, and 12 more watts. Twice the warps
+in flight bought nothing, so the card is not short of warps. It is waiting on
+DRAM and more threads just wait alongside it.
 
 ## Adding an algorithm
 
