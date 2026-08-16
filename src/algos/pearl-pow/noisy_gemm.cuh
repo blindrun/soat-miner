@@ -23,6 +23,13 @@
 
 #include <stdint.h>
 
+// At file scope on purpose. Including this inside the namespace pulls every
+// declaration in it - the warp intrinsics included - into om::pearl and makes
+// calls like __shfl_xor_sync ambiguous against the global ones.
+#if defined(__CUDACC__)
+#include <mma.h>
+#endif
+
 namespace om {
 namespace pearl {
 
@@ -111,6 +118,106 @@ __global__ void noisyGemmTile(const int8_t *__restrict__ A,
         transcripts[flat * kTranscriptU32 + threadIdx.x] = sTranscript[threadIdx.x];
     }
 }
+
+// ---------------------------------------------------------------- MMA path
+//
+// One WARP owns one 16x16 output tile, which is exactly the int8 WMMA shape.
+// A block of 256 threads therefore covers 8 tiles.
+//
+// The win is that the XOR reduction runs on the accumulator fragment while it
+// is still in registers. C never reaches shared or global memory during
+// mining, which is the whole reason this algorithm suits tensor cores.
+//
+// A pleasant consequence of the reduction being XOR: it is commutative and
+// associative, so the mapping of fragment elements to matrix positions does
+// not matter and never has to be known. Every thread folds whatever elements
+// it happens to hold, the warp folds those together, and the result is the XOR
+// over the full tile regardless of layout. A sum would have needed the layout.
+
+#if defined(__CUDACC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 720)
+
+namespace wmma = nvcuda::wmma;
+
+constexpr int kMmaK = 16;   // int8 WMMA is m16n16k16
+
+/**
+ * As noisyGemmTile, but tensor-core accumulated.
+ *
+ * Launch with 256 threads (8 warps, 8 tiles) and grid
+ * ((n/16 * m/16 + 7) / 8). Requires k and rank to be multiples of 16.
+ */
+__global__ void noisyGemmMma(const int8_t *__restrict__ A,
+                             const int8_t *__restrict__ B,
+                             int32_t *__restrict__ cNoised,
+                             uint32_t *__restrict__ transcripts,
+                             int m, int n, int k, int rank, bool writeC) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int tilesX = n / kHashTile;
+    const int tile = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (tile >= tilesX * (m / kHashTile)) return;
+
+    const int tileRow = tile / tilesX;
+    const int tileCol = tile % tilesX;
+    const int row = tileRow * kHashTile;
+    const int col = tileCol * kHashTile;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> aFrag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::row_major> bFrag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> cFrag;
+    wmma::fill_fragment(cFrag, 0);
+
+    // One transcript SLOT per lane rather than a 16-entry array per thread.
+    //
+    // The obvious form is `uint32_t transcript[16]` indexed by
+    // `reduction % 16`, but that index is runtime-variable, which forces the
+    // array out of registers into local memory - the same dynamic-indexing
+    // trap that cost 75x on the Vulkan side of this repo. Every lane holds an
+    // identical value after the butterfly reduction, so lane L can simply own
+    // slot L and fold only on the steps that land on it. One register, no
+    // array, no indexing.
+    uint32_t slot = 0;
+
+    int reduction = 0;
+    for (int p = 0; p < k; p += rank) {
+        if (k - p < rank) break;                 // partial tiles do not fold
+        for (int kk = p; kk < p + rank; kk += kMmaK) {
+            wmma::load_matrix_sync(aFrag, A + row * k + kk, k);
+            wmma::load_matrix_sync(bFrag, B + kk * n + col, n);
+            wmma::mma_sync(cFrag, aFrag, bFrag, cFrag);
+        }
+
+        // Fold straight off the accumulator registers.
+        uint32_t v = 0;
+#pragma unroll
+        for (int i = 0; i < cFrag.num_elements; ++i)
+            v ^= static_cast<uint32_t>(cFrag.x[i]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v ^= __shfl_xor_sync(0xffffffffu, v, off);
+
+        if (lane == reduction % kTranscriptU32) slot = rotl32(slot, kRotation) ^ v;
+        ++reduction;
+    }
+
+    if (writeC) {
+        // Only for the correctness test; mining never needs C in memory.
+        wmma::store_matrix_sync(cNoised + row * n + col, cFrag, n, wmma::mem_row_major);
+    }
+
+    if (lane < kTranscriptU32) {
+        const int blocksPerRow = n / rank;
+        const int iIdx = row / rank;
+        const int jIdx = col / rank;
+        const int hi = (row % rank) / kHashTile;
+        const int wi = (col % rank) / kHashTile;
+        const int tilesPerSide = rank / kHashTile;
+        const int flat = ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+        transcripts[flat * kTranscriptU32 + lane] = slot;
+    }
+}
+
+#endif  // tensor cores available
 
 }  // namespace pearl
 }  // namespace om

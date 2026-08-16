@@ -123,26 +123,60 @@ int main(int argc, char **argv) {
     CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(tGot.data(), dT, tGot.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    int badC = 0;
-    for (size_t i = 0; i < cGot.size(); ++i) {
-        if (cGot[i] != cExpect[i]) {
-            if (badC < 3)
-                fprintf(stderr, "  C[%zu] device %d != reference %d\n", i, cGot[i], cExpect[i]);
-            ++badC;
+    auto compare = [&](const char *what) {
+        int badC = 0, badT = 0;
+        for (size_t i = 0; i < cGot.size(); ++i) {
+            if (cGot[i] != cExpect[i]) {
+                if (badC < 3)
+                    fprintf(stderr, "  C[%zu] device %d != reference %d\n", i, cGot[i],
+                            cExpect[i]);
+                ++badC;
+            }
         }
-    }
-    int badT = 0;
-    for (size_t i = 0; i < tGot.size(); ++i) {
-        if (tGot[i] != tExpect[i]) {
-            if (badT < 3)
-                fprintf(stderr, "  transcript[%zu/%zu] device %08x != reference %08x\n", i / 16,
-                        i % 16, tGot[i], tExpect[i]);
-            ++badT;
+        for (size_t i = 0; i < tGot.size(); ++i) {
+            if (tGot[i] != tExpect[i]) {
+                if (badT < 3)
+                    fprintf(stderr, "  transcript[%zu/%zu] device %08x != reference %08x\n",
+                            i / 16, i % 16, tGot[i], tExpect[i]);
+                ++badT;
+            }
         }
-    }
+        printf("  %-14s product %s (%d/%zu)   transcripts %s (%d/%zu)\n", what,
+               badC ? "FAIL" : "ok", badC, cGot.size(), badT ? "FAIL" : "ok", badT, tGot.size());
+        return badC == 0 && badT == 0;
+    };
+    bool naiveOk = compare("naive:");
 
-    printf("  noised product : %s (%d/%zu mismatched)\n", badC ? "FAIL" : "ok", badC, cGot.size());
-    printf("  transcripts    : %s (%d/%zu mismatched)\n", badT ? "FAIL" : "ok", badT, tGot.size());
+    // Same vectors through the tensor-core path. It must agree exactly, not
+    // approximately: this is integer arithmetic, so "close" would mean broken.
+    bool mmaOk = true;
+    {
+        const int totalTiles = (m / om::pearl::kHashTile) * (n / om::pearl::kHashTile);
+        const int warpsPerBlock = 256 / 32;
+        const int blocks = (totalTiles + warpsPerBlock - 1) / warpsPerBlock;
+        CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));
+        CHECK(cudaMemset(dT, 0, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
+        om::pearl::noisyGemmMma<<<blocks, 256>>>(dA, dB, dC, dT, m, n, k, rank, true);
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            printf("  mma:           SKIPPED (%s)\n", cudaGetErrorString(e));
+        } else {
+            CHECK(cudaDeviceSynchronize());
+            CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t),
+                             cudaMemcpyDeviceToHost));
+            CHECK(cudaMemcpy(tGot.data(), dT, tGot.size() * sizeof(uint32_t),
+                             cudaMemcpyDeviceToHost));
+            mmaOk = compare("mma:");
+        }
+    }
+    int badC = naiveOk && mmaOk ? 0 : 1;
+    int badT = 0;
+
+    // Restore the naive result so the negative control below tests what it
+    // says it tests.
+    CHECK(cudaMemset(dT, 0, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
+    om::pearl::noisyGemmTile<<<grid, 256>>>(dA, dB, dC, dT, m, n, k, rank);
+    CHECK(cudaDeviceSynchronize());
 
     // Negative control: the suite must be able to fail. Corrupt one input byte
     // and confirm the comparison notices, otherwise a pass proves nothing.
