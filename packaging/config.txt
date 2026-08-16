@@ -32,6 +32,14 @@ BATCH=4194304
 # Seconds between readouts.
 INTERVAL=5
 
+# Build the next block's lookup table ahead of time: auto | on | off
+# A new block needs a new 7.27GB table, and building it stops mining for 1.5s
+# on a 4090 and 8.2s on a 6700 XT. Building it early removes that.
+# It needs two tables in memory, which is 14.5GB, so it does not fit on most
+# cards. Auto checks first and turns itself off if it will not fit.
+# Worth 0.73% on a 4090. CUDA only for now.
+CACHE_DAG=auto
+
 # Backend: auto | cuda | vulkan
 #   auto   - use CUDA if an NVIDIA GPU is present, else Vulkan
 #   cuda   - NVIDIA only, currently much faster (217 vs 2.9 MH/s on a 4090)

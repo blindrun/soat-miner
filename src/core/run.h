@@ -100,6 +100,13 @@ struct RunOptions {
     int reportSeconds = 5;
     std::string backendLabel;
 
+    // Build the next height's dataset in the background: -1 auto, 0 off, 1 on.
+    int prefetch = -1;
+
+    // Benchmark only: pretend a new block arrives this often, so the cost of
+    // an epoch change is included in the average. 0 means the height is fixed.
+    int benchEpochSeconds = 0;
+
     // Pool mode. When poolHost is set, a StratumSource is used instead of the
     // node source.
     std::string poolHost;

@@ -73,6 +73,29 @@ Force it with BACKEND=cuda or BACKEND=vulkan if you want.
 
 See what it found with command ./soat-miner-vk --list-devices
 
+## Building the next block ahead
+
+The lookup table depends on the block height. Every new block means a new table.
+
+That is consensus, not a bug. So every miner rebuilds 7.27GB every block.
+
+On a 4090 that costs 1.5 seconds of every block. On a 6700 XT it costs 8.2.
+
+Build it ahead of time instead with command ./soat-miner --cache-dag on
+
+You know the next height already, so the next table can be built while you are
+still mining the current one. A new block then starts instantly.
+
+This needs two tables in memory at once, which is 14.5GB.
+
+Leave it on auto and it checks your card first. It turns itself off if the
+second table will not fit, and tells you why. It will never push your card into
+an out of memory that it was not already in.
+
+Auto is the default. Turn it off with command ./soat-miner --cache-dag off
+
+Do not expect much. It is worth 0.73% on a 4090.
+
 ## Speeds
 
 Measured at the current dataset size, 7.27GB.
@@ -157,12 +180,22 @@ is checked against the real chain, not against itself.
 
 Run the tests with command make test
 
-It does three things. It recomputes real mainnet blocks in Python from the Ergo
-node's own reference. It compares the GPU dataset against that Python byte for
-byte. Then it rebuilds the dataset on your card and reproduces a real block's
-hit from that block's winning nonce.
+It recomputes real mainnet blocks in Python from the Ergo node's own reference.
+It compares the GPU dataset against that Python byte for byte. Then it rebuilds
+the dataset on your card and reproduces a real block's hit from that block's
+winning nonce.
 
 Both backends are held to the same block and must agree exactly.
+
+It also drives the miner's own search and verify against that block, instead of
+just the kernels underneath them. A kernel can be right and the miner still
+find nothing, if the solution count is read back before the kernel wrote it or
+if building ahead hands mining the wrong table. Neither of those shows up as an
+error anywhere.
+
+That last one is checked by looking for the old block's nonce after the swap.
+It has to be gone. If it is still there you are mining the previous height's
+table and every share you send will be rejected.
 
 ## Mining around other GPU work
 
@@ -233,6 +266,42 @@ Sorting the lookups into L2 sized bins would need 113 bins, and a bin only pays
 if more lookups land in it than it holds elements. That means batching about
 30 million nonces, and the index buffers for that come to 7.7GB on top of the
 7.27GB dataset. It does not fit in 16GB at all. Not worth it.
+
+Building the next block ahead is the same kind of trap, and it took a
+measurement to see it.
+
+Doing it the obvious way buys exactly zero. 202.6 against 202.6.
+
+The reason is that the table costs the same amount of GPU work whether you
+build it during the block or before it. Moving work around in time does not
+create a card that can do more work. The stall you removed comes straight back
+as a slower kernel.
+
+What makes it pay is that the two kernels want different things. Mining waits
+on DRAM. Building the table is Blake2b and barely touches memory. So they
+should share the card better than they do.
+
+They do not, because the build kernel launches 887,000 blocks and takes every
+warp slot on every SM. Mining then cannot keep enough loads in flight.
+
+Give the mining stream a high priority and the build stream a low one and that
+stops happening. 215.1 against 216.6 at Ergo's real 2 minute blocks.
+
+So 0.73%, and only because of the priorities. Without them it is nothing.
+
+Two things to know if you build on this.
+
+The deprioritized build takes about 21 seconds instead of 1.5. That is fine
+against 2 minute blocks and it is not fine against 20 second ones. Test it at
+the real block time. A short one flatters it.
+
+Holding the second table costs nothing while it sits there. 218.1 against
+218.1.
+
+The cards that would gain most cannot run it. Build time goes up as the card
+gets slower and memory goes up as the card gets more expensive. A 6700 XT
+would save 8.2 seconds a block and has 12GB, so two tables never fit. Same for
+a 5080 at 16GB. The 4090 has the room and the least to gain.
 
 ## Adding an algorithm
 

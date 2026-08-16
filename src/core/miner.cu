@@ -57,6 +57,13 @@ int main(int argc, char **argv) {
         else if (a == "--batch") opt.batch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
+        else if (a == "--cache-dag") {
+            const std::string v = next();
+            opt.prefetch = (v == "on" || v == "1") ? 1
+                         : (v == "off" || v == "0") ? 0
+                         : -1;
+        }
         else if (a == "--plain") opt.plain = true;
         else if (a == "--ascii") om::g_asciiOnly = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
@@ -97,8 +104,14 @@ int main(int argc, char **argv) {
                 "  --interval N      seconds between readouts (default 5)\n"
                 "  --plain           one-line JSON output, for logs/systemd\n"
                 "  --ascii           plain ASCII frame (no box-drawing glyphs)\n"
+                "  --cache-dag MODE  build the next block's dataset ahead of\n"
+                "                    time: auto (default), on, off. Needs a\n"
+                "                    second dataset resident, so auto skips it\n"
+                "                    on cards without the spare VRAM\n"
                 "  --bench           benchmark, no node required\n"
-                "  --bench-height H  height to benchmark at\n");
+                "  --bench-height H  height to benchmark at\n"
+                "  --bench-epoch-secs N  benchmark: change height every N s,\n"
+                "                    so the cost of a new block is measured\n");
             return 0;
         }
     }

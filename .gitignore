@@ -6,3 +6,4 @@ tests/__pycache__/
 *.o
 *.log
 tests/test_vulkan
+tests/test_algo

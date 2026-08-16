@@ -61,6 +61,11 @@ esac
 
 ARGS=(--batch "${BATCH:-4194304}" --interval "${INTERVAL:-5}")
 
+# Building the next block's table ahead is CUDA only so far.
+if [[ "$BIN" == "./soat-miner" ]]; then
+  ARGS+=(--cache-dag "${CACHE_DAG:-auto}")
+fi
+
 if [[ "$EXPLICIT_SOURCE" == "1" ]]; then
   echo "SOAT Miner [$BACKEND] - using command-line settings"
 elif [[ -n "${POOL:-}" ]]; then

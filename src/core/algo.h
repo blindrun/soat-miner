@@ -71,6 +71,28 @@ class Algorithm {
      */
     virtual bool verify(const Job &job, const Solution &sol) const = 0;
 
+    /**
+     * Opt in to precomputing the *next* epoch's state in the background, so a
+     * new job does not stall mining while it is built.
+     *
+     * Mode: -1 decide automatically (build ahead only when the memory is
+     * free), 0 never, 1 always. Default is a no-op, so a backend that has not
+     * implemented it is unaffected.
+     */
+    virtual void setPrefetch(int mode) { (void)mode; }
+
+    /** True when the last prepare() was served from a prefetched buffer. */
+    virtual bool servedFromPrefetch() const { return false; }
+
+    /**
+     * True when prepare(job) will be instant because the state is already
+     * built. Only used to decide whether to warn the user about a wait.
+     */
+    virtual bool prefetchReadyFor(const Job &job) const { (void)job; return false; }
+
+    /** One line on what prefetch is doing, or empty if it is not running. */
+    virtual std::string prefetchNote() const { return std::string(); }
+
     /** Release device memory. */
     virtual void release() = 0;
 };

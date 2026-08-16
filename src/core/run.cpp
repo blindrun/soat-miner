@@ -41,6 +41,8 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 "or pass --pool HOST:PORT --wallet <address>");
     }
 
+    algo->setPrefetch(opt.prefetch);
+
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
     int nonceBits = 64;
@@ -128,7 +130,18 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         job.valid = true;
     }
 
+    auto tEpoch = tStart;
+    std::string prefetchNote;
+
     while (!*stop) {
+        if (opt.bench && opt.benchEpochSeconds > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - tEpoch).count() >=
+                (double)opt.benchEpochSeconds) {
+                job.epoch++;
+                tEpoch = now;
+            }
+        }
         if (!opt.bench) {
             Job fresh;
             if (!source->fetch(&fresh)) {
@@ -155,7 +168,10 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         if (!job.valid) { sleepSeconds(1); continue; }
 
         if (job.epoch != preparedEpoch) {
-            {
+            // Only warn about a wait when there is going to be one. Building
+            // ahead makes this instant, and "please wait" followed immediately
+            // by "ready in 0.00s" is just noise.
+            if (!algo->prefetchReadyFor(job)) {
                 char pre[160];
                 snprintf(pre, sizeof(pre),
                          "epoch %llu - building %.2f GB dataset, please wait...",
@@ -170,11 +186,18 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     .count();
             stats.datasetGB = algo->memoryBytes(job) / 1e9;
             char buf[160];
-            snprintf(buf, sizeof(buf),
-                     "dataset ready in %.2fs - mining", secs);
+            snprintf(buf, sizeof(buf), "dataset ready in %.2fs%s - mining", secs,
+                     algo->servedFromPrefetch() ? " (built ahead)" : "");
             logLine(tty, "ok", buf);
             preparedEpoch = job.epoch;
             stats.epochs++;
+
+            // Say once what build-ahead decided, and why if it declined.
+            const std::string note = algo->prefetchNote();
+            if (note != prefetchNote) {
+                prefetchNote = note;
+                if (!note.empty()) logLine(tty, "info", note);
+            }
         }
 
         sols.clear();

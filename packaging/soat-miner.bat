@@ -58,19 +58,24 @@ if not exist "%BIN%" (
   )
 )
 
+REM Building the next block's table ahead is CUDA only so far.
+if "%CACHE_DAG%"=="" set CACHE_DAG=auto
+set CACHEARG=
+if "%BIN%"=="soat-miner.exe" set CACHEARG=--cache-dag %CACHE_DAG%
+
 REM Command-line args override config.txt, so the mine_ergo_*.bat wrappers
 REM can pass their own --pool/--wallet.
 echo %* | findstr /C:"--pool" /C:"--node" /C:"--bench" /C:"--list-devices" /C:"--list-algos" /C:"--help" >nul
 if %errorlevel%==0 (
   echo SOAT Miner [%BACKEND%] - using command-line settings
-  %BIN% --batch %BATCH% --interval %INTERVAL% %*
+  %BIN% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
   goto :eof
 )
 
 if not "%POOL%"=="" (
   echo SOAT Miner -^> pool %POOL% as %WORKER% [%BACKEND%]
-  %BIN% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %*
+  %BIN% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
 ) else (
   echo SOAT Miner -^> solo via node %NODE%:%NODE_PORT% [%BACKEND%]
-  %BIN% --node %NODE% --port %NODE_PORT% --batch %BATCH% --interval %INTERVAL% %*
+  %BIN% --node %NODE% --port %NODE_PORT% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
 )

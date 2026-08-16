@@ -124,13 +124,15 @@ HIT_HEIGHT = 500012
 HIT_NONCE  = 1232002a7deb44c0
 HIT_EXPECT = 0000000000001fa822c756eef06389799c10c7c1d06868eb29c75214e0a7aab1
 
-test: tests/test_element tests/test_hit tests/test_vulkan
+test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan
 	@echo "--- python reference vs real mainnet blocks ---"
 	@python3 tests/reference.py
 	@echo "--- device dataset elements vs python reference ---"
 	@./tests/test_element 1851437
 	@echo "--- device end-to-end: real block's hit from its winning nonce ---"
 	@./tests/test_hit $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
+	@echo "--- the Algorithm object: search, verify and the build-ahead swap ---"
+	@./tests/test_algo $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
 	@echo "--- vulkan backend against the same pinned vector ---"
 	@./tests/test_vulkan $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
 
@@ -147,6 +149,11 @@ tests/test_element: tests/test_element.cu src/algos/autolykos2/autolykos.cuh src
 tests/test_hit: tests/test_hit.cu src/algos/autolykos2/mine.cuh src/core/blake2b.cuh
 	$(NVCC) $(NVFLAGS) $< -o $@
 
+tests/test_algo: tests/test_algo.cu src/algos/autolykos2/algo.cu \
+                 src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
+                 src/core/algo.h src/core/blake2b.cuh
+	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/autolykos2/algo.cu -o $@
+
 bench: $(BIN)
 	./$(BIN) --bench
 
@@ -154,7 +161,8 @@ install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)/usr/local/bin/$(BIN)
 
 clean:
-	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit tests/test_vulkan
+	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit \
+	       tests/test_algo tests/test_vulkan
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
 VERSION ?= 0.1.2
