@@ -365,5 +365,82 @@ def Transcript_slot_used(i: int) -> bool:
     return bool(t.data[i] != 0)
 
 
+# ------------------------------------------------------------- vectors
+VECTOR_MAGIC = b"PRLV0001"
+
+
+def emit_vectors(path: str, m=256, n=256, k=256, rank=128) -> None:
+    """Write one test case for the device tests to check themselves against.
+
+    Cross-language comparison needs a fixed artifact, not a re-run: if the
+    device test regenerated its own inputs it could agree with itself while
+    both sides drifted from the reference together.
+
+    Layout is deliberately dumb - magic, six int32 dims, then raw little-endian
+    arrays - so the C++ side needs no parser.
+    """
+    gen = NoiseGenerator(noise_rank=rank)
+    key_A = bytes(range(32))
+    key_B = bytes(range(32, 64))
+    E_AL, E_AR, E_BL, E_BR = gen.generate(key_A, key_B, m, k, n)
+
+    rng = np.random.default_rng(20260816)
+    span = 256 - 128
+    lo = -span // 2
+    A = rng.integers(lo, lo + span, size=(m, k), dtype=np.int64).astype(np.int8)
+    B = rng.integers(lo, lo + span, size=(k, n), dtype=np.int64).astype(np.int8)
+
+    ng = NoisyGemm(noise_rank=rank)
+    A_noised, _ = ng.noise_A(A, E_AL, E_AR, E_BL)
+    B_noised, _ = ng.noise_B(B, E_AR, E_BL, E_BR)
+    C, _ = ng.noisy_gemm(A, B, E_AL, E_AR, E_BL, E_BR, key_A, pow_target=0)
+
+    # The noised product is what a kernel actually computes, so hand the device
+    # both that and the transcripts rather than only the denoised result.
+    C_noised = np.zeros((m, n), dtype=np.int32)
+    transcripts = []
+    for i in range(0, m, rank):
+        for j in range(0, n, rank):
+            blk = np.zeros((rank, rank), dtype=np.int32)
+            th = rank // ng.hash_tile_h
+            tw = rank // ng.hash_tile_w
+            ts = [[Transcript() for _ in range(tw)] for _ in range(th)]
+            red = 0
+            for p in range(0, k, rank):
+                blk = blk + (A_noised[i:i + rank, p:p + rank].astype(np.int32)
+                             @ B_noised[p:p + rank, j:j + rank].astype(np.int32))
+                for hi in range(th):
+                    for wi in range(tw):
+                        tile = blk[hi * 16:(hi + 1) * 16, wi * 16:(wi + 1) * 16]
+                        ts[hi][wi].rotl_xor_into(
+                            red, xor_reduce_tile(np.ascontiguousarray(tile)))
+                red += 1
+            C_noised[i:i + rank, j:j + rank] = blk
+            for hi in range(th):
+                for wi in range(tw):
+                    transcripts.append(ts[hi][wi].data)
+
+    with open(path, "wb") as fh:
+        fh.write(VECTOR_MAGIC)
+        fh.write(np.array([m, n, k, rank, ng.hash_tile_h, len(transcripts)],
+                          dtype=np.int32).tobytes())
+        fh.write(A.tobytes())
+        fh.write(B.tobytes())
+        fh.write(E_AL.tobytes())
+        fh.write(np.ascontiguousarray(E_AR).tobytes())
+        fh.write(np.ascontiguousarray(E_BL).tobytes())
+        fh.write(np.ascontiguousarray(E_BR).tobytes())
+        fh.write(A_noised.tobytes())
+        fh.write(B_noised.tobytes())
+        fh.write(C_noised.tobytes())
+        fh.write(C.tobytes())
+        fh.write(np.ascontiguousarray(np.array(transcripts, dtype=np.uint32)).tobytes())
+    print(f"wrote {path}: {m}x{k} @ {k}x{n}, rank {rank}, "
+          f"{len(transcripts)} transcripts")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--emit-vectors":
+        emit_vectors(sys.argv[2])
+        sys.exit(0)
     sys.exit(main())
