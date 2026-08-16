@@ -96,6 +96,13 @@ Auto is the default. Turn it off with command ./soat-miner --cache-dag off
 
 Do not expect much. It is worth 0.73% on a 4090.
 
+CUDA only. It was built for Vulkan too and it lost on both cards, so it is not
+in that build. Numbers are further down.
+
+It also has a shelf life. The table grows 5% every 51,200 blocks, so two of
+them stop fitting a 16GB card around block 2,000,000 and a 24GB card around
+block 2,364,000.
+
 ## Speeds
 
 Measured at the current dataset size, 7.27GB.
@@ -300,8 +307,25 @@ Holding the second table costs nothing while it sits there. 218.1 against
 
 The cards that would gain most cannot run it. Build time goes up as the card
 gets slower and memory goes up as the card gets more expensive. A 6700 XT
-would save 8.2 seconds a block and has 12GB, so two tables never fit. Same for
-a 5080 at 16GB. The 4090 has the room and the least to gain.
+would save 8.2 seconds a block and has 12GB, so two tables never fit. The 4090
+has the room and the least to gain.
+
+None of this carried over to Vulkan. It was built there too, with two queues,
+two descriptor sets and an async fence, and it lost on both cards.
+
+| GPU | off | on |
+|---|---|---|
+| RTX 5080 | 247.2 | 246.9 |
+| RTX 4090 | 160.1 | 158.5 |
+
+CUDA lets you say which stream matters. Vulkan only lets you hint it, with a
+float at queue creation, and the driver is free to ignore it. It does.
+
+You can see it in the readouts. With build-ahead off there is one clean dip per
+block and then flat. With it on the dip is shallower but it smears across the
+next several intervals, and the smear adds up to more than the dip it replaced.
+
+That code is not in the tree. It is a lot of Vulkan for a negative number.
 
 ## Adding an algorithm
 

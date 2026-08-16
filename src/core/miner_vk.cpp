@@ -65,6 +65,10 @@ int main(int argc, char **argv) {
         else if (a == "--batch") opt.batch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
+        // No --cache-dag here. Building ahead was measured on this backend and
+        // it loses: see the README. Accepting the flag and ignoring it would be
+        // worse than not having it.
         else if (a == "--plain") opt.plain = true;
         else if (a == "--ascii") om::g_asciiOnly = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
@@ -86,6 +90,7 @@ int main(int argc, char **argv) {
                 "  --api-key KEY     node API key\n"
                 "  --batch N         nonces per launch (default 4194304)\n"
                 "  --interval N      seconds between readouts (default 5)\n"
+                "  --bench-epoch-secs N  benchmark: change height every N s\n"
                 "  --plain           one-line JSON output, for logs/systemd\n"
                 "  --ascii           plain ASCII frame (no box-drawing glyphs)\n"
                 "  --bench           benchmark, no node required\n"
