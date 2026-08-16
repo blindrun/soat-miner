@@ -85,6 +85,13 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 return 1;
             }
         }
+        // Name the payout address on every startup. On a conventional pool this
+        // is who gets paid, and shipping it unseen is how someone ends up mining
+        // to a default they never noticed (github issue #1). Lithos is exempt:
+        // there the address is a label, not a payout identifier.
+        if (!opt.lithos) {
+            logLine(tty, "info", "payout address: " + opt.wallet);
+        }
         logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
                                  std::to_string(opt.poolPort) + " ...");
         // Lithos only logs the worker name, so an empty address is fine there -

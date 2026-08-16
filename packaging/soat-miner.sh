@@ -83,7 +83,7 @@ elif [[ -n "${POOL:-}" ]]; then
   fi
   ARGS+=(--pool "$POOL" --wallet "$WALLET"
          --worker "${WORKER:-rig1}" --pass "${PASSWORD:-x}")
-  echo "SOAT Miner [$BACKEND] -> pool $POOL as ${WORKER:-rig1}"
+  echo "SOAT Miner [$BACKEND] -> pool $POOL as ${WORKER:-rig1} paying $WALLET"
 else
   ARGS+=(--node "${NODE:-127.0.0.1}" --port "${NODE_PORT:-9053}")
   echo "SOAT Miner [$BACKEND] -> solo via node ${NODE:-127.0.0.1}:${NODE_PORT:-9053}"

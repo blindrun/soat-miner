@@ -89,7 +89,20 @@ if /I "%LITHOS%"=="yes" (
 )
 
 if not "%POOL%"=="" (
-  echo SOAT Miner -^> pool %POOL% as %WORKER% [%BACKEND%]
+  REM Refuse the unedited placeholder so nobody mines to it by accident. The
+  REM C++ guard catches it too, but check here so the message is clear on Windows.
+  if "%WALLET%"=="9YOUR_ERGO_ADDRESS_HERE" (
+    echo Set WALLET in config.txt to YOUR Ergo address before pool mining.
+    echo   ^(or edit WALLET in one of the mine_ergo_*.bat scripts^)
+    pause
+    goto :eof
+  )
+  if "%WALLET%"=="" (
+    echo Set WALLET in config.txt to your Ergo address before pool mining.
+    pause
+    goto :eof
+  )
+  echo SOAT Miner -^> pool %POOL% as %WORKER% paying %WALLET% [%BACKEND%]
   %BIN% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
 ) else (
   echo SOAT Miner -^> solo via node %NODE%:%NODE_PORT% [%BACKEND%]
