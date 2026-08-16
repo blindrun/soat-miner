@@ -217,6 +217,88 @@ __global__ void noisyGemmMma(const int8_t *__restrict__ A,
     }
 }
 
+/**
+ * As noisyGemmMma, but A is staged through shared memory.
+ *
+ * Every warp in a block works the same tile ROW, so they all want the identical
+ * A fragment and were each fetching it separately. The unstaged kernel moves
+ * about 1 GB per 2048^3 iteration, which at its measured runtime is ~3.2 TB/s -
+ * far past this card's DRAM bandwidth, so it was being served by L2. Loading A
+ * once per block and sharing it across the 8 warps cuts A traffic 8x.
+ *
+ * Launch with 256 threads and grid (tilesX / warpsPerBlock, tilesY).
+ */
+__global__ void noisyGemmMmaStaged(const int8_t *__restrict__ A,
+                                   const int8_t *__restrict__ B,
+                                   int32_t *__restrict__ cNoised,
+                                   uint32_t *__restrict__ transcripts,
+                                   int m, int n, int k, int rank, bool writeC) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+
+    const int tileRow = blockIdx.y;
+    const int tileCol = blockIdx.x * warps + warp;
+    if (tileCol >= n / kHashTile || tileRow >= m / kHashTile) return;
+
+    const int row = tileRow * kHashTile;
+    const int col = tileCol * kHashTile;
+
+    __shared__ int8_t sA[kHashTile * kMmaK];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> aFrag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::row_major> bFrag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> cFrag;
+    wmma::fill_fragment(cFrag, 0);
+
+    uint32_t slot = 0;
+    int reduction = 0;
+
+    for (int p = 0; p < k; p += rank) {
+        if (k - p < rank) break;
+        for (int kk = p; kk < p + rank; kk += kMmaK) {
+            // 256 threads, 256 bytes: one each, and each row of 16 is
+            // contiguous so a group of 16 lanes makes one 16-byte transaction.
+            __syncthreads();
+            if (threadIdx.x < kHashTile * kMmaK) {
+                const int i = threadIdx.x / kMmaK;
+                const int j = threadIdx.x % kMmaK;
+                sA[threadIdx.x] = A[(row + i) * k + kk + j];
+            }
+            __syncthreads();
+
+            wmma::load_matrix_sync(aFrag, sA, kMmaK);
+            wmma::load_matrix_sync(bFrag, B + kk * n + col, n);
+            wmma::mma_sync(cFrag, aFrag, bFrag, cFrag);
+        }
+
+        uint32_t v = 0;
+#pragma unroll
+        for (int i = 0; i < cFrag.num_elements; ++i)
+            v ^= static_cast<uint32_t>(cFrag.x[i]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v ^= __shfl_xor_sync(0xffffffffu, v, off);
+
+        if (lane == reduction % kTranscriptU32) slot = rotl32(slot, kRotation) ^ v;
+        ++reduction;
+    }
+
+    if (writeC)
+        wmma::store_matrix_sync(cNoised + row * n + col, cFrag, n, wmma::mem_row_major);
+
+    if (lane < kTranscriptU32) {
+        const int blocksPerRow = n / rank;
+        const int iIdx = row / rank;
+        const int jIdx = col / rank;
+        const int hi = (row % rank) / kHashTile;
+        const int wi = (col % rank) / kHashTile;
+        const int tilesPerSide = rank / kHashTile;
+        const int flat = ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+        transcripts[flat * kTranscriptU32 + lane] = slot;
+    }
+}
+
 #endif  // tensor cores available
 
 }  // namespace pearl

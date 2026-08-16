@@ -169,7 +169,35 @@ int main(int argc, char **argv) {
             mmaOk = compare("mma:");
         }
     }
-    int badC = naiveOk && mmaOk ? 0 : 1;
+    // Shared-memory staged variant. A faster kernel that is wrong is worse
+    // than a slow one, so it is held to the identical reference.
+    bool stagedOk = true;
+    {
+        const int tilesX = n / om::pearl::kHashTile;
+        const int tilesY = m / om::pearl::kHashTile;
+        const int warpsPerBlock = 256 / 32;
+        if (tilesX % warpsPerBlock) {
+            printf("  staged:        SKIPPED (needs n/16 divisible by %d)\n", warpsPerBlock);
+        } else {
+            dim3 gridS(tilesX / warpsPerBlock, tilesY);
+            CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));
+            CHECK(cudaMemset(dT, 0, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
+            om::pearl::noisyGemmMmaStaged<<<gridS, 256>>>(dA, dB, dC, dT, m, n, k, rank, true);
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                printf("  staged:        SKIPPED (%s)\n", cudaGetErrorString(e));
+            } else {
+                CHECK(cudaDeviceSynchronize());
+                CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost));
+                CHECK(cudaMemcpy(tGot.data(), dT, tGot.size() * sizeof(uint32_t),
+                                 cudaMemcpyDeviceToHost));
+                stagedOk = compare("staged:");
+            }
+        }
+    }
+
+    int badC = naiveOk && mmaOk && stagedOk ? 0 : 1;
     int badT = 0;
 
     // Restore the naive result so the negative control below tests what it
