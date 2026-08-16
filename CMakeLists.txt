@@ -47,11 +47,46 @@ endif()
 # driver JITs onto anything newer. Shipping the PTX is what lets a build from
 # CUDA 12.4 (whose newest target is sm_90) run on a Blackwell card at all.
 if(NOT SOAT_ARCH_FROM_USER)
-  set(CMAKE_CUDA_ARCHITECTURES 75-real 86-real 89-real)
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 120-real 120-virtual)
-  else()
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 90-virtual)
+  # Ask the toolkit what it can actually target rather than assuming. Every
+  # CUDA major release drops old architectures - 12.x dropped Kepler, 13.x
+  # dropped Maxwell/Pascal/Volta - so a hardcoded list eventually turns into a
+  # hard build failure on a newer toolkit, for a wanted architecture nobody
+  # noticed had gone.
+  execute_process(
+    COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-arch
+    OUTPUT_VARIABLE SOAT_NVCC_ARCHES
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  set(CMAKE_CUDA_ARCHITECTURES "")
+  foreach(cc 75 86 89 120)
+    if(SOAT_NVCC_ARCHES MATCHES "compute_${cc}(\n|$)")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES "${cc}-real")
+    endif()
+  endforeach()
+
+  # PTX for the newest architecture this toolkit knows, so the driver can JIT
+  # forward onto cards released after it. Without this the binary runs only on
+  # the exact architectures above - which is how the v0.1.1 release shipped
+  # Ada-only and refused to start on everything else.
+  set(SOAT_NEWEST_VIRTUAL "")
+  foreach(cc 90 100 110 120 130)
+    if(SOAT_NVCC_ARCHES MATCHES "compute_${cc}(\n|$)")
+      set(SOAT_NEWEST_VIRTUAL "${cc}")
+    endif()
+  endforeach()
+  if(SOAT_NEWEST_VIRTUAL)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES "${SOAT_NEWEST_VIRTUAL}-virtual")
+  endif()
+
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    message(FATAL_ERROR
+      "could not determine any usable CUDA architecture from "
+      "`${CMAKE_CUDA_COMPILER} --list-gpu-arch`. Pass one explicitly, e.g. "
+      "-DCMAKE_CUDA_ARCHITECTURES=89")
+  endif()
+
+  if(NOT SOAT_NVCC_ARCHES MATCHES "compute_120")
     message(STATUS
       "CUDA ${CMAKE_CUDA_COMPILER_VERSION} cannot emit Blackwell (sm_120) SASS; "
       "RTX 50-series will run via PTX JIT. Install CUDA 12.8+ for native code.")
