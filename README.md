@@ -213,7 +213,7 @@ Command-line flags override `config.txt`, so these work without editing it.
 WALLET=9yourErgoAddress...
 POOL=ergo.herominers.com:1180
 WORKER=rig1
-BACKEND=auto               # auto | cuda | opencl
+BACKEND=auto               # auto | cuda | vulkan
 ```
 
 Or directly:

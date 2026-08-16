@@ -9,10 +9,37 @@ for /f "usebackq tokens=1,* delims==" %%A in ("config.txt") do (
   if not "!line:~0,1!"=="#" if not "%%A"=="" set "%%A=%%B"
 )
 
+REM Backend choice is per GPU architecture, not per vendor. Measured at 7.27 GB
+REM on Windows: RTX 5080 Vulkan 259.0 vs natively compiled sm_120 CUDA 219.6,
+REM so Blackwell wants Vulkan; RTX 4090 is the other way round (CUDA 217.5 vs
+REM Vulkan 162.5). Compute capability 12.0 and up means Blackwell.
+REM Done with labels rather than a parenthesised block: nvidia-smi's
+REM --format=csv,noheader has to run outside a for /f, because the comma there
+REM gets parsed as an argument separator and nvidia-smi fails with
+REM "Option noheader is not recognized" - which then silently falls through to
+REM whatever the default was.
 if "%BACKEND%"=="" set BACKEND=auto
-if /i "%BACKEND%"=="auto" (
-  where nvidia-smi >nul 2>&1 && ( set BACKEND=cuda ) || ( set BACKEND=vulkan )
+if /i not "%BACKEND%"=="auto" goto :backend_done
+
+set BACKEND=vulkan
+where nvidia-smi >nul 2>&1 || goto :backend_done
+
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader > "%TEMP%\soat_cap.txt" 2>nul
+set "CAPMAJOR="
+for /f "tokens=1 delims=." %%C in ('type "%TEMP%\soat_cap.txt" 2^>nul') do (
+  if not defined CAPMAJOR set "CAPMAJOR=%%C"
 )
+del "%TEMP%\soat_cap.txt" >nul 2>&1
+
+REM No capability reported means an older driver; CUDA is right for every
+REM NVIDIA generation before Blackwell.
+if not defined CAPMAJOR set BACKEND=cuda & goto :backend_done
+if %CAPMAJOR% GEQ 12 (
+  echo auto: compute capability %CAPMAJOR%.x ^(Blackwell^) - Vulkan, ~22%% faster than CUDA here
+) else (
+  set BACKEND=cuda
+)
+:backend_done
 if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-vk.exe )
 
 REM The Windows archive ships the Vulkan build only - CUDA cannot be
@@ -21,8 +48,9 @@ REM with a confusing "not found" on an NVIDIA machine.
 if not exist "%BIN%" (
   if exist "soat-miner-vk.exe" (
     echo [!] %BIN% not present, using soat-miner-vk.exe ^(Vulkan^)
-    echo [!] NOTE: Vulkan is very slow on NVIDIA. Build the CUDA target from
-    echo [!]       source with CMake for full speed on NVIDIA cards.
+    echo [!] On Blackwell ^(RTX 50-series^) that is the faster backend anyway.
+    echo [!] On Ada and older, CUDA is about 34%% faster - build it from source
+    echo [!] with CMake if you want it.
     set BIN=soat-miner-vk.exe
   ) else (
     echo No miner binary found in this folder.

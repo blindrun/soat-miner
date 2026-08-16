@@ -63,11 +63,29 @@ int main(int argc, char **argv) {
         else if (a == "--list-algos") {
             for (const auto &n : availableAlgorithms()) printf("%s\n", n.c_str());
             return 0;
+        } else if (a == "--list-devices") {
+            // The Vulkan build has always had this; the CUDA build did not,
+            // and silently ignored it - so `soat-miner.sh --list-devices` on
+            // an NVIDIA machine started mining instead of listing anything.
+            int n = 0;
+            if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
+                printf("no CUDA device found\n");
+                return 1;
+            }
+            for (int d = 0; d < n; d++) {
+                cudaDeviceProp p{};
+                if (cudaGetDeviceProperties(&p, d) != cudaSuccess) continue;
+                printf("  [%d] %-38s %5.1f GB  sm_%d%d  %d SMs\n", d, p.name,
+                       p.totalGlobalMem / 1e9, p.major, p.minor,
+                       p.multiProcessorCount);
+            }
+            return 0;
         } else if (a == "--help" || a == "-h") {
             printf(
                 "SOAT Miner (CUDA) - open-source GPU miner\n\n"
                 "  --algo NAME       algorithm (default autolykos2)\n"
                 "  --list-algos      list compiled-in algorithms\n"
+                "  --list-devices    list CUDA GPUs and exit\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"

@@ -21,10 +21,32 @@ for a in "$@"; do
   esac
 done
 
+# Backend choice is per GPU architecture, not per vendor. Measured at 7.27 GB:
+#
+#   RTX 5080 (Blackwell, cc 12.0)   Vulkan 267.6   CUDA 219.6   -> Vulkan +22%
+#   RTX 4090 (Ada, cc 8.9)          Vulkan 162.5   CUDA 217.5   -> CUDA   +34%
+#   RX 6700 XT                      Vulkan  82.9   (no CUDA)
+#
+# and it holds on both operating systems - on Windows the 5080 is Vulkan 259.0
+# against a natively compiled sm_120 CUDA 219.6, so this is not a JIT artifact.
+# Blackwell therefore wants Vulkan even though it is an NVIDIA card.
 BACKEND="${BACKEND:-auto}"
 if [[ "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    BACKEND=cuda
+    # Largest VRAM wins, which is the same rule the binaries use to pick a
+    # device - so the launcher and the miner agree which GPU this is about.
+    cap=$(nvidia-smi --query-gpu=memory.total,compute_cap \
+            --format=csv,noheader,nounits 2>/dev/null |
+          sort -t, -k1 -n | tail -1 | cut -d, -f2 | tr -d '[:space:]')
+    major="${cap%%.*}"
+    if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )); then
+      BACKEND=vulkan
+      echo "auto: compute capability $cap (Blackwell) - Vulkan, ~22% faster than CUDA here"
+    else
+      # Unknown capability falls through to CUDA, which is right for every
+      # NVIDIA generation before Blackwell.
+      BACKEND=cuda
+    fi
   else
     BACKEND=vulkan
   fi

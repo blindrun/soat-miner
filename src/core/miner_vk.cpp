@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
             printf(
                 "SOAT Miner (Vulkan) - open-source GPU miner\n\n"
                 "  --device N        GPU index (default: largest VRAM)\n"
-                "  --list-devices    list OpenCL GPUs and exit\n"
+                "  --list-devices    list Vulkan GPUs and exit\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
