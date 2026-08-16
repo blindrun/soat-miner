@@ -6,16 +6,31 @@
 // mining.
 //
 // K is a SPECIALISATION CONSTANT, not a literal, because the supported shape
-// differs by vendor and baking it in would silently produce a shader that
-// cannot run on half the fleet. Enumerated with a probe calling
-// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR:
+// differs by device and baking it in would silently produce a shader that
+// cannot run on half the fleet:
 //
-//   RTX 4090          M16 N16 K32   sint8 x sint8 -> sint32
-//   RX 6700 XT (RADV) M16 N16 K16   sint8 x sint8 -> sint32
-//   llvmpipe          M8  N8  K8
+//   RTX 4090          M16 N16 K32   sint8 x sint8 -> sint32   usable
+//   llvmpipe          M8  N8  K8                              usable
+//   RX 6700 XT (RADV) NOT SUPPORTED - see below
 //
-// RDNA2 has no hardware WMMA; RADV lowers coopmat onto v_dot4_i32_i8, so one
-// path covers both vendors and no hand-written int8 MAC fallback is needed.
+// HOW TO CHECK A DEVICE, because the obvious way is wrong:
+// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR returns 14 configurations
+// on the RX 6700 XT, including int8 ones. That device does not support
+// cooperative matrix at all. VK_KHR_cooperative_matrix is ABSENT from its
+// device extension list and the feature bit reads FALSE; the loader resolves
+// the enumeration entry point because another device on the same box has the
+// extension, and calling it against a device that does not simply returns
+// results anyway.
+//
+// So: check the DEVICE EXTENSION LIST first, then the feature bit, and only
+// then trust the config list. Trusting the config list alone says RDNA2 works,
+// and it does not - vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT.
+//
+// RDNA2 has no hardware WMMA and RADV does not lower coopmat onto its
+// v_dot4_i32_i8 dot instructions. Covering Navi 22 therefore needs a separate
+// hand-written int8 MAC shader, which is a real and still-outstanding piece of
+// work rather than something the driver hands us. RDNA3 may differ; RADV added
+// cooperative matrix for GFX11, and the 7900 XT is untested here.
 //
 // Subgroup size is also a spec constant, set from the device at pipeline
 // creation, so one workgroup is exactly one subgroup on wave32 and wave64
