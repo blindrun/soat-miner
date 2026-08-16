@@ -134,6 +134,19 @@ int main(int argc, char **argv) {
         opt.poolPort = 4444;
     }
 
+    // `--pool` with an empty value swallows whatever follows it, so a launcher
+    // that expands a variable to nothing quietly mines to a host called
+    // "--worker". Refuse it rather than spend a connection finding out.
+    if (!opt.poolHost.empty() &&
+        (opt.poolHost[0] == '-' || opt.poolPort <= 0 ||
+         opt.poolPort > 65535)) {
+        fprintf(stderr,
+                "--pool needs HOST:PORT, got '%s:%d'. An empty value in a "
+                "launcher script is the usual cause.\n",
+                opt.poolHost.c_str(), opt.poolPort);
+        return 1;
+    }
+
     if (!platformInit()) {
         fprintf(stderr, "network init failed\n");
         return 1;

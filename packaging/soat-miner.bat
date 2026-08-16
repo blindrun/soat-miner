@@ -72,10 +72,17 @@ if %errorlevel%==0 (
   goto :eof
 )
 
+REM Default set OUTSIDE the block below on purpose. cmd.exe expands %VAR% when
+REM it parses a parenthesised block, before any line in it runs, so a `set`
+REM inside the block is invisible to the lines that follow it there - and
+REM enabledelayedexpansion does not change that, it only adds !VAR!. Setting it
+REM here is what makes an upgraded config.txt with no LITHOS_ADDR line work
+REM instead of passing an empty --pool.
+if "%LITHOS_ADDR%"=="" set LITHOS_ADDR=127.0.0.1:4444
+
 if /I "%LITHOS%"=="yes" (
   REM No WALLET check: on Lithos the stratum address is a label, and payment
   REM follows the node the Lithos client is attached to.
-  if "%LITHOS_ADDR%"=="" set LITHOS_ADDR=127.0.0.1:4444
   echo SOAT Miner -^> Lithos client at %LITHOS_ADDR% [%BACKEND%]
   %BIN% --lithos --pool %LITHOS_ADDR% --worker %WORKER% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
   goto :eof

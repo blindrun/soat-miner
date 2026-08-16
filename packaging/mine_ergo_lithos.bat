@@ -12,8 +12,11 @@ REM pointed at that node.
 REM
 REM The payout identity comes from the NODE, not from an address set here,
 REM which is why no WALLET is needed below.
+REM Named LITHOS_TARGET, not LITHOS: environment variables set here are
+REM inherited by soat-miner.bat, which uses LITHOS as a yes/no switch and
+REM LITHOS_ADDR as an address. Reusing either name here would collide.
 cd /d "%~dp0"
-set LITHOS=127.0.0.1:4444
+set LITHOS_TARGET=127.0.0.1:4444
 set WORKER=%COMPUTERNAME%
-soat-miner.bat --lithos --pool %LITHOS% --worker %WORKER% %*
+soat-miner.bat --lithos --pool %LITHOS_TARGET% --worker %WORKER% %*
 pause
