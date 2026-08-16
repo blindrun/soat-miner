@@ -119,6 +119,18 @@ struct RunOptions {
     std::string wallet;
     std::string worker = "soat";
     std::string password = "x";
+
+    // Lithos mode. Lithos is not a coin or an algorithm: it is a decentralised
+    // pool protocol whose reference client runs a local stratum server (default
+    // 127.0.0.1:4444) speaking ordinary Ergo/Autolykos v2 stratum. The PoW,
+    // the dataset and the kernels are unchanged.
+    //
+    // What does change is that rewards are settled on-chain from Non-Interactive
+    // Share Proofs against the node the Lithos client is attached to, so the
+    // stratum address is NOT a payout identifier the way it is on a
+    // conventional pool. Demanding a valid Ergo address here would reject a
+    // perfectly good Lithos setup.
+    bool lithos = false;
 };
 
 /** Drives an already-constructed algorithm until *stop becomes non-zero. */

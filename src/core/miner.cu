@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
         }
         else if (a == "--wallet" || a == "--user") opt.wallet = next();
         else if (a == "--worker") opt.worker = next();
+        else if (a == "--lithos") opt.lithos = true;
         else if (a == "--pass") opt.password = next();
         else if (a == "--node") opt.target.host = next();
         else if (a == "--port") opt.target.port = atoi(next().c_str());
@@ -97,6 +98,10 @@ int main(int argc, char **argv) {
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
+                "  --lithos          mine to a Lithos client (decentralised\n"
+                "                    pool protocol; same Autolykos v2 PoW).\n"
+                "                    Defaults --pool to 127.0.0.1:4444 and\n"
+                "                    does not require an Ergo address\n"
                 "  --pass P          pool password (default x)\n"
                 "  --node HOST       Ergo node host (default 127.0.0.1)\n"
                 "  --port N          node API port (default 9053)\n"
@@ -120,6 +125,13 @@ int main(int argc, char **argv) {
                 "                    so the cost of a new block is measured\n");
             return 0;
         }
+    }
+
+    // The Lithos reference client listens on 127.0.0.1:4444 by default.
+    // Applied after parsing so an explicit --pool wins regardless of flag order.
+    if (opt.lithos && opt.poolHost.empty()) {
+        opt.poolHost = "127.0.0.1";
+        opt.poolPort = 4444;
     }
 
     if (!platformInit()) {

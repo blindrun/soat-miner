@@ -65,10 +65,19 @@ if "%BIN%"=="soat-miner.exe" set CACHEARG=--cache-dag %CACHE_DAG%
 
 REM Command-line args override config.txt, so the mine_ergo_*.bat wrappers
 REM can pass their own --pool/--wallet.
-echo %* | findstr /C:"--pool" /C:"--node" /C:"--bench" /C:"--list-devices" /C:"--list-algos" /C:"--help" >nul
+echo %* | findstr /C:"--pool" /C:"--node" /C:"--bench" /C:"--lithos" /C:"--list-devices" /C:"--list-algos" /C:"--help" >nul
 if %errorlevel%==0 (
   echo SOAT Miner [%BACKEND%] - using command-line settings
   %BIN% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
+  goto :eof
+)
+
+if /I "%LITHOS%"=="yes" (
+  REM No WALLET check: on Lithos the stratum address is a label, and payment
+  REM follows the node the Lithos client is attached to.
+  if "%LITHOS_ADDR%"=="" set LITHOS_ADDR=127.0.0.1:4444
+  echo SOAT Miner -^> Lithos client at %LITHOS_ADDR% [%BACKEND%]
+  %BIN% --lithos --pool %LITHOS_ADDR% --worker %WORKER% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
   goto :eof
 )
 

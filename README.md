@@ -201,6 +201,59 @@ At 217 MH/s against a network around 510 GH/s you will find a block roughly
 once every three years. Solo is in here because it is the one thing that
 actually improves mining decentralisation, not because it pays.
 
+## Lithos
+
+[Lithos](https://docs.ergoplatform.com/eco/lithos/) is a decentralised pool
+protocol for Ergo. It is not a coin and not an algorithm: the proof of work is
+the same Autolykos v2, the same dataset and the same kernels. What changes is
+who settles the rewards. Instead of a pool operator crediting shares in a
+database, the Lithos client compresses your work into Non-Interactive Share
+Proofs and settles them on-chain against collateral, so there is no operator to
+trust and no operator to censor you.
+
+You need three things running before the miner is any use:
+
+1. a fully synced Ergo node
+2. Java 11
+3. the [Lithos client](https://github.com/Lithos-Protocol/Lithos-Client),
+   configured in `conf/application.conf` to point at your node
+
+The client runs a stratum server on `127.0.0.1:4444`. Mine into it:
+
+```
+./mine_ergo_lithos.sh
+```
+
+or directly:
+
+```
+./soat-miner.sh --lithos
+```
+
+`--lithos` defaults `--pool` to `127.0.0.1:4444` and stops requiring an Ergo
+address. That second part is the bit worth knowing: on a conventional pool the
+stratum address is who gets paid, so the miner refuses to start without a valid
+one. On Lithos it is a label. Payment follows the node the Lithos client is
+attached to, so demanding an address here would only reject working setups.
+
+Two things the miner handles for Lithos specifically, both of which fail
+silently if you get them wrong:
+
+- **The extranonce moves.** When two rigs collide on the same prefix the client
+  answers with `mining.set_extranonce` and hands one of them a new one. A miner
+  that only reads the extranonce at connect time keeps hashing in a subspace it
+  no longer owns.
+- **The share target can be zero.** Lithos publishes `tau`, the share target, in
+  `mining.notify` param 6, and it is legitimately `0` before the client has one.
+  A zero target can never be beaten, so the miner would hash forever, submit
+  nothing, and report no error at all. It refuses the job and says so instead.
+
+`make test` runs both against a mock Lithos server transcribed from the client's
+own Scala source, including the check that matters most: Lithos validates
+`extraNonce1 ++ extraNonce2`, not the nonce field you send it, so if the miner
+slices `extraNonce2` wrongly the server proof-checks a different nonce than the
+one your GPU solved and every share dies as "low difficulty".
+
 ## Build from source
 
 **Linux.** Install the CUDA toolkit and glslang, then run make.
@@ -249,6 +302,15 @@ error anywhere.
 That last one is checked by looking for the old block's nonce after the swap.
 It has to be gone. If it is still there you are mining the previous height's
 table and every share you send will be rejected.
+
+The same reasoning covers the wire, because a correct hit still earns nothing if
+the submit is malformed. The Lithos case runs the real binary against a mock
+server transcribed from the Lithos client's own source, and checks the three
+things that fail without any error: the submit carries the five params it
+destructures, the nonce it reconstructs is the nonce the GPU actually solved,
+and a reassigned extranonce is picked up rather than ignored. An earlier release
+shipped a three-param submit to conventional pools and no share ever reached
+one, while the panel reported every one of them as accepted.
 
 ## Mining around other GPU work
 

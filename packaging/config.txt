@@ -19,6 +19,23 @@ WORKER=rig1
 # Pool password. Almost always "x".
 PASSWORD=x
 
+# --------------------------------------------------------------- LITHOS MODE
+# Lithos is a decentralised pool protocol, not a coin or an algorithm - the
+# proof of work is the same Autolykos v2. Its reference client runs a stratum
+# server on your own machine and settles rewards on-chain, so there is no pool
+# operator involved.
+#
+# Needs a synced Ergo node, Java 11, and the Lithos client running:
+#   github.com/Lithos-Protocol/Lithos-Client
+#
+# Set this to yes to mine into it. POOL below is then ignored, and WALLET is
+# not required - payment follows the NODE the Lithos client is attached to, not
+# an address set here.
+LITHOS=no
+
+# Where the Lithos client's stratum server is listening.
+LITHOS_ADDR=127.0.0.1:4444
+
 # ---------------------------------------------------------------- SOLO MODE
 # Leave POOL empty above and set these to mine solo against your own node.
 # The payout address is configured on the NODE in solo mode, not here.

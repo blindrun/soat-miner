@@ -17,7 +17,7 @@ set -a; source ./config.txt; set +a
 EXPLICIT_SOURCE=0
 for a in "$@"; do
   case "$a" in
-    --pool|--node|--bench|--list-devices|--list-algos|--help|-h) EXPLICIT_SOURCE=1 ;;
+    --pool|--node|--bench|--lithos|--list-devices|--list-algos|--help|-h) EXPLICIT_SOURCE=1 ;;
   esac
 done
 
@@ -69,6 +69,12 @@ fi
 
 if [[ "$EXPLICIT_SOURCE" == "1" ]]; then
   echo "SOAT Miner [$BACKEND] - using command-line settings"
+elif [[ "${LITHOS:-no}" == "yes" ]]; then
+  # No WALLET check here: on Lithos the stratum address is a label, and payment
+  # follows the node the Lithos client is attached to.
+  ARGS+=(--lithos --pool "${LITHOS_ADDR:-127.0.0.1:4444}"
+         --worker "${WORKER:-rig1}")
+  echo "SOAT Miner [$BACKEND] -> Lithos client at ${LITHOS_ADDR:-127.0.0.1:4444}"
 elif [[ -n "${POOL:-}" ]]; then
   if [[ -z "${WALLET:-}" || "$WALLET" == 9YOUR_ERGO_ADDRESS_HERE ]]; then
     echo "Set WALLET in config.txt to your Ergo address before pool mining."

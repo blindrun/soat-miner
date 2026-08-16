@@ -59,24 +59,40 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     if (opt.bench) {
         stats.source = "benchmark (no pool/node)";
     } else if (!opt.poolHost.empty()) {
-        // Catch the obvious cases before spending a connection on them.
+        // Catch the obvious cases before spending a connection on them. Skipped
+        // for Lithos, where the address is a label rather than a payout
+        // identifier - see RunOptions::lithos.
         const std::string &w = opt.wallet;
-        const bool looksLikeErgo =
-            w.size() >= 40 && w.size() <= 60 && w[0] == '9' &&
-            w.find_first_of(" \t") == std::string::npos;
-        if (w.empty() || w.rfind("9YOUR", 0) == 0 || !looksLikeErgo) {
-            logLine(tty, "error",
-                    w.empty() ? "no --wallet given; pool mining needs your Ergo "
-                                "payout address"
-                              : "'" + w + "' is not a valid Ergo address");
-            logLine(tty, "error",
-                    "edit WALLET in the mine_ergo_* script (or config.txt) to a "
-                    "real address - they start with 9 and are about 51 chars");
-            return 1;
+        if (opt.lithos) {
+            logLine(tty, "info",
+                    "Lithos mode: rewards are settled on-chain by the Lithos "
+                    "client from your node, not by this address.");
+        } else {
+            const bool looksLikeErgo =
+                w.size() >= 40 && w.size() <= 60 && w[0] == '9' &&
+                w.find_first_of(" \t") == std::string::npos;
+            if (w.empty() || w.rfind("9YOUR", 0) == 0 || !looksLikeErgo) {
+                logLine(tty, "error",
+                        w.empty() ? "no --wallet given; pool mining needs your "
+                                    "Ergo payout address"
+                                  : "'" + w + "' is not a valid Ergo address");
+                logLine(tty, "error",
+                        "edit WALLET in the mine_ergo_* script (or config.txt) "
+                        "to a real address - they start with 9 and are about 51 "
+                        "chars");
+                logLine(tty, "error",
+                        "mining to a Lithos client instead? pass --lithos");
+                return 1;
+            }
         }
         logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
                                  std::to_string(opt.poolPort) + " ...");
-        auto *st = new StratumSource(opt.poolHost, opt.poolPort, opt.wallet,
+        // Lithos only logs the worker name, so an empty address is fine there -
+        // but send something rather than a bare ".worker".
+        const std::string walletArg =
+            (opt.lithos && opt.wallet.empty()) ? std::string("lithos")
+                                               : opt.wallet;
+        auto *st = new StratumSource(opt.poolHost, opt.poolPort, walletArg,
                                      opt.worker, opt.password);
         std::string err;
         if (!st->start(&err)) {
@@ -108,9 +124,13 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             logLine(tty, "error",
                     "pool REJECTED the login: " + st->loginError());
             logLine(tty, "error",
-                    "check --wallet is a real Ergo address (starts with 9, "
-                    "~51 chars). The placeholder in the example scripts will "
-                    "not work.");
+                    opt.lithos
+                        ? "the Lithos client refused the login - check its log; "
+                          "it rejects miners before its node has finished "
+                          "syncing."
+                        : "check --wallet is a real Ergo address (starts with "
+                          "9, ~51 chars). The placeholder in the example "
+                          "scripts will not work.");
             return 1;
         }
         noncePrefix = st->noncePrefix();
@@ -122,10 +142,16 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
 
     Job job;
     uint64_t preparedEpoch = ~0ULL;
-    const uint64_t nonceMask =
+    uint64_t nonceMask =
         (nonceBits >= 64) ? ~0ULL : ((1ULL << nonceBits) - 1ULL);
     uint64_t nonceCounter = ((uint64_t)time(nullptr) << 16) & nonceMask;
     uint64_t nonce = noncePrefix | nonceCounter;
+
+    // Non-null only in pool mode; used to pick up a mid-session extranonce
+    // reassignment, which Lithos issues when two miners collide on a prefix.
+    auto *stratumSrc = dynamic_cast<StratumSource *>(source.get());
+    uint64_t extranonceGen =
+        stratumSrc ? stratumSrc->extranonceGeneration() : 0;
     uint64_t intervalHashes = 0;
     uint64_t hostRejected = 0;  // failures this side of the wire, kept separate
                                 // from what the pool rejected
@@ -160,8 +186,11 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     logLine(tty, "error",
                             "pool REJECTED the login: " + st->loginError());
                     logLine(tty, "error",
-                            "check --wallet is a real Ergo address (starts "
-                            "with 9, ~51 chars).");
+                            opt.lithos
+                                ? "the Lithos client refused the login - check "
+                                  "its log."
+                                : "check --wallet is a real Ergo address "
+                                  "(starts with 9, ~51 chars).");
                     return 1;
                 }
                 logLine(tty, "warn", std::string("cannot reach ") +
@@ -250,6 +279,27 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             }
         }
 
+        // Adopt a new extranonce the moment the pool issues one. Keeping the
+        // old prefix would mean mining in a subspace the pool has just handed
+        // to somebody else.
+        if (stratumSrc) {
+            const uint64_t gen = stratumSrc->extranonceGeneration();
+            if (gen != extranonceGen) {
+                extranonceGen = gen;
+                noncePrefix = stratumSrc->noncePrefix();
+                nonceBits = stratumSrc->nonceBitsOwned();
+                nonceMask =
+                    (nonceBits >= 64) ? ~0ULL : ((1ULL << nonceBits) - 1ULL);
+                nonceCounter &= nonceMask;
+                char xb[96];
+                snprintf(xb, sizeof(xb),
+                         "pool reassigned the extranonce: prefix=%016llx, %d "
+                         "nonce bits ours",
+                         (unsigned long long)noncePrefix, nonceBits);
+                logLine(tty, "info", xb);
+            }
+        }
+
         nonceCounter = (nonceCounter + opt.batch) & nonceMask;
         nonce = noncePrefix | nonceCounter;
         intervalHashes += opt.batch;
@@ -264,6 +314,8 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 const std::string v = st->takeSubmitVerdict();
                 if (!v.empty())
                     logLine(tty, "error", "pool REJECTED the share: " + v);
+                const std::string jw = st->takeJobWarning();
+                if (!jw.empty()) logLine(tty, "warn", jw);
                 uint64_t a = 0, r = 0, p = 0;
                 std::string le;
                 st->poolCounters(&a, &r, &p, &le);

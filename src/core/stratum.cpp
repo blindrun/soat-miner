@@ -222,12 +222,41 @@ void StratumSource::handleLine(const std::string &line) {
             if (!hexToBytes(msgHex, j.msg, 32)) return;
             j.epoch = strtoull(unquote(p[1]).c_str(), nullptr, 10);
             decimalToLimbs(unquote(p[6]), j.target);
+
+            // A zero target can never be beaten, so the miner would hash
+            // forever, submit nothing and report no error - the worst failure
+            // mode there is. Lithos reaches this legitimately: its
+            // BlockTemplate has a constructor that leaves tau at 0, and tau is
+            // what it publishes in params[6]. Refuse the job and say so.
+            if ((j.target[0] | j.target[1] | j.target[2] | j.target[3]) == 0) {
+                std::lock_guard<std::mutex> lk(mu_);
+                jobWarning_ =
+                    "pool sent job " + unquote(p[0]) +
+                    " with a zero target - nothing can ever satisfy it. "
+                    "On Lithos this means the client has no share target (tau) "
+                    "set yet; wait for it to finish syncing.";
+                return;
+            }
             j.valid = true;
 
             std::lock_guard<std::mutex> lk(mu_);
             current_ = j;
             jobId_ = unquote(p[0]);
             haveJob_ = true;
+            return;
+        }
+
+        // Lithos rotates the extranonce mid-session when two miners collide on
+        // the same prefix (its StratumConnection answers a duplicate share by
+        // issuing a fresh extraNonce1). Ignoring this leaves us mining in the
+        // subspace it just took away from us.
+        //   params: ["<extraNonce1 hex>", <extraNonce2Size>]
+        if (method == "mining.set_extranonce") {
+            std::string params;
+            if (!rawValue(line, "params", &params)) return;
+            const auto p = splitArray(params);
+            if (p.size() < 2) return;
+            applyExtranonce(unquote(p[0]), atoi(unquote(p[1]).c_str()));
             return;
         }
 
@@ -296,28 +325,44 @@ void StratumSource::handleLine(const std::string &line) {
         std::string result;
         if (!rawValue(line, "result", &result)) return;
         const auto r = splitArray(result);
+        // Read the last two elements positionally rather than assuming what
+        // sits in front of them. A conventional Ergo pool answers
+        // [<subscriptions>, extraNonce1, extraNonce2Size]; Lithos answers
+        // [null, extraNonce1, extraNonce2Size] - same layout, but element 0 is
+        // a bare null rather than an array.
         if (r.size() >= 2) {
-            const std::string xn = unquote(r[r.size() - 2]);
-            int nonceBytes = atoi(unquote(r[r.size() - 1]).c_str());
-            if (nonceBytes <= 0 || nonceBytes > 8) nonceBytes = 8;
-
-            uint64_t prefix = 0;
-            int prefixNibbles = 0;
-            for (char c : xn) {
-                if (!isxdigit((unsigned char)c)) continue;
-                const int v = (c <= '9') ? (c - '0')
-                                         : ((c | 0x20) - 'a' + 10);
-                prefix = (prefix << 4) | (uint64_t)v;
-                prefixNibbles++;
-            }
-            const int ownedBits = nonceBytes * 8;
-            std::lock_guard<std::mutex> lk(mu_);
-            nonceBitsOwned_ = ownedBits > 64 ? 64 : ownedBits;
-            noncePrefix_ = (prefixNibbles > 0)
-                               ? (prefix << nonceBitsOwned_)
-                               : 0ULL;
+            applyExtranonce(unquote(r[r.size() - 2]),
+                            atoi(unquote(r[r.size() - 1]).c_str()));
         }
     }
+}
+
+// Adopt an extranonce assignment, from either the subscribe reply or a later
+// mining.set_extranonce. `en2Size` is the number of nonce bytes left to us;
+// the prefix occupies the bits above them.
+void StratumSource::applyExtranonce(const std::string &xnHex, int en2Size) {
+    if (en2Size <= 0 || en2Size > 8) en2Size = 8;
+
+    uint64_t prefix = 0;
+    int prefixNibbles = 0;
+    for (char c : xnHex) {
+        if (!isxdigit((unsigned char)c)) continue;
+        const int v = (c <= '9') ? (c - '0') : ((c | 0x20) - 'a' + 10);
+        prefix = (prefix << 4) | (uint64_t)v;
+        prefixNibbles++;
+    }
+    const int ownedBits = en2Size * 8;
+    std::lock_guard<std::mutex> lk(mu_);
+    nonceBitsOwned_ = ownedBits > 64 ? 64 : ownedBits;
+    noncePrefix_ = (prefixNibbles > 0) ? (prefix << nonceBitsOwned_) : 0ULL;
+    extranonceGen_++;
+}
+
+std::string StratumSource::takeJobWarning() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string s;
+    s.swap(jobWarning_);
+    return s;
 }
 
 bool StratumSource::submit(const Job &job, const Solution &sol, std::string *err) {

@@ -133,6 +133,8 @@ test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan
 	@./tests/test_hit $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
 	@echo "--- the Algorithm object: search, verify and the build-ahead swap ---"
 	@./tests/test_algo $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
+	@echo "--- Lithos stratum protocol, against a mock built from its source ---"
+	@python3 tests/test_lithos.py
 	@echo "--- vulkan backend against the same pinned vector ---"
 	@./tests/test_vulkan $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
 

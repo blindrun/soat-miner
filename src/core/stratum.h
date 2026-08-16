@@ -88,9 +88,26 @@ class StratumSource : public JobSource {
         return loginError_;
     }
 
-    /** Nonce prefix imposed by the pool's extranonce, and how many bits we own. */
-    uint64_t noncePrefix() const { return noncePrefix_; }
-    int nonceBitsOwned() const { return nonceBitsOwned_; }
+    /**
+     * Nonce prefix imposed by the pool's extranonce, and how many bits we own.
+     *
+     * These are read every iteration of the mining loop, not once at startup:
+     * Lithos reassigns the extranonce mid-session via mining.set_extranonce,
+     * and a prefix cached at connect time would silently go stale.
+     */
+    uint64_t noncePrefix() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return noncePrefix_;
+    }
+    int nonceBitsOwned() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return nonceBitsOwned_;
+    }
+    /** Bumped on every extranonce assignment, so a change is cheap to spot. */
+    uint64_t extranonceGeneration() const { return extranonceGen_.load(); }
+
+    /** Pops a one-off warning about an unusable job, so it is logged once. */
+    std::string takeJobWarning();
 
     /** What the POOL said about our shares, not what we hoped it said. */
     bool poolCounters(uint64_t *accepted, uint64_t *rejected, uint64_t *pending,
@@ -103,6 +120,7 @@ class StratumSource : public JobSource {
     void readerLoop();
     bool sendLine(const std::string &s);
     void handleLine(const std::string &line);
+    void applyExtranonce(const std::string &xnHex, int en2Size);
 
     std::string host_, wallet_, worker_, password_, desc_, login_;
     int port_ = 0;
@@ -119,6 +137,8 @@ class StratumSource : public JobSource {
 
     uint64_t noncePrefix_ = 0;
     int nonceBitsOwned_ = 64;
+    std::atomic<uint64_t> extranonceGen_{0};
+    std::string jobWarning_;
 
     /** Submit request ids start here, so a reply is identifiable by id alone. */
     static const int kFirstSubmitId = 10;
