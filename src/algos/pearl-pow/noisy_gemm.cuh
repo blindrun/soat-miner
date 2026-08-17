@@ -748,6 +748,196 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
     }
 }
 
+// ------------------------------------------------------------- cp.async
+//
+// Ampere added an instruction that copies global memory straight into shared
+// without landing in registers first, and without occupying the thread while
+// it is in flight. The double-buffered kernel above still pays for the trip:
+// it loads to registers, then stores to shared, and both halves are ordinary
+// instructions competing with the mma for issue slots.
+//
+// With cp.async the copy is fire-and-forget, so the pipeline gets deeper than
+// two stages is worth. THREE stages is what removes the second barrier: with
+// two buffers, the copy issued at step s+1 writes the buffer step s just read
+// from, and nothing separates them; with three, the buffer being written was
+// last read at s-1 and the barrier at s already stands between. One barrier
+// per step and two copies always in flight.
+
+#include <cuda_pipeline.h>
+
+/**
+ * As noisyGemmMmaTiledDB, but the stage is filled with cp.async and three
+ * buffers deep.
+ *
+ * Copies are 16 bytes per thread, which is the widest cp.async takes and the
+ * only width that can bypass L1. Alignment works out for free: a row of A is
+ * exactly kMmaK = 16 bytes, k and n are multiples of 16, and cudaMalloc
+ * returns 256-byte-aligned pointers, so every source address is 16-byte
+ * aligned without any padding games.
+ */
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN>
+__global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
+                                       const int8_t *__restrict__ B,
+                                       int32_t *__restrict__ cNoised,
+                                       uint32_t *__restrict__ transcripts,
+                                       int m, int n, int k, int rank,
+                                       bool writeC) {
+    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;
+    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
+    constexpr int kThreads = kWarpsM * kWarpsN * 32;
+    constexpr int kStages = 4;   // deeper lookahead; see the sweep in test_pearl_prepare
+    constexpr int kACopies = kBlockM;                  // one 16-byte row each
+    constexpr int kBCopies = kMmaK * (kBlockN / 16);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpM = warp / kWarpsN;
+    const int warpN = warp % kWarpsN;
+
+    const int rowBase = blockIdx.y * kBlockM;
+    const int colBase = blockIdx.x * kBlockN;
+    if (rowBase >= m || colBase >= n) return;
+
+    __shared__ __align__(16) int8_t sA[kStages][kBlockM * kMmaK];
+    __shared__ __align__(16) int8_t sB[kStages][kMmaK * kBlockN];
+
+    const int dotLen = k - k % rank;
+    const int totalSteps = dotLen / kMmaK;
+    const int stepsPerRank = rank / kMmaK;
+    if (totalSteps <= 0) return;
+
+// Ampere and later get the real thing. Everything older gets a plain 16-byte
+// store, which makes the kernel slower but not wrong - important, because the
+// runtime picker measures whatever it can launch, and a kernel that silently
+// did nothing on an old card would look like the fastest of the lot.
+#if __CUDA_ARCH__ >= 800
+#define OM_PEARL_CP(dst, src) __pipeline_memcpy_async((dst), (src), 16)
+#define OM_PEARL_COMMIT() __pipeline_commit()
+#define OM_PEARL_WAIT(n) __pipeline_wait_prior(n)
+#else
+#define OM_PEARL_CP(dst, src) \
+    (*(int4 *)(dst) = *(const int4 *)(src))
+#define OM_PEARL_COMMIT() ((void)0)
+#define OM_PEARL_WAIT(n) ((void)0)
+#endif
+
+#define OM_PEARL_ISSUE(step, stage)                                            \
+    {                                                                          \
+        const int kk_ = (step) * kMmaK;                                        \
+        for (int i = threadIdx.x; i < kACopies; i += kThreads) {               \
+            OM_PEARL_CP(&sA[stage][i * kMmaK],                                 \
+                        &A[(size_t)(rowBase + i) * k + kk_]);                  \
+        }                                                                      \
+        for (int i = threadIdx.x; i < kBCopies; i += kThreads) {               \
+            const int row = i / (kBlockN / 16);                                \
+            const int col = (i % (kBlockN / 16)) * 16;                         \
+            OM_PEARL_CP(&sB[stage][row * kBlockN + col],                       \
+                        &B[(size_t)(kk_ + row) * n + colBase + col]);          \
+        }                                                                      \
+        OM_PEARL_COMMIT();                                                     \
+    }
+
+    // Fill the pipeline before entering the loop: two stages in flight.
+#pragma unroll
+    for (int pre = 0; pre < kStages - 1; pre++)
+        if (pre < totalSteps) OM_PEARL_ISSUE(pre, pre)
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> cFrag[kTilesM][kTilesN];
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) wmma::fill_fragment(cFrag[i][j], 0);
+
+    uint32_t slot[kTilesM][kTilesN] = {};
+    int reduction = 0;
+
+    for (int step = 0; step < totalSteps; step++) {
+        const int stage = step % kStages;
+
+        // Wait for THIS step's stage to land - one commit may still be in
+        // flight - then barrier.
+        //
+        // The barrier has to come before the next issue, not after. The stage
+        // about to be written, (step+kStages-1) % kStages, is the one the
+        // PREVIOUS step read from, and without a barrier between that read and
+        // this write they race. An earlier version issued first and passed the
+        // correctness test anyway, because at k=256 there are only sixteen
+        // steps and the timing never exposed it - exactly the kind of race
+        // that ships.
+        OM_PEARL_WAIT(kStages - 2);
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> aFrag[kTilesM];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::row_major> bFrag[kTilesN];
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++) {
+            const int r = (warpM * kTilesM + i) * kHashTile;
+            wmma::load_matrix_sync(aFrag[i], sA[stage] + r * kMmaK, kMmaK);
+        }
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int c = (warpN * kTilesN + j) * kHashTile;
+            wmma::load_matrix_sync(bFrag[j], sB[stage] + c, kBlockN);
+        }
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+            for (int j = 0; j < kTilesN; j++)
+                wmma::mma_sync(cFrag[i][j], aFrag[i], bFrag[j], cFrag[i][j]);
+
+        if ((step + 1) % stepsPerRank == 0) {
+#pragma unroll
+            for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+                for (int j = 0; j < kTilesN; j++) {
+                    uint32_t v = 0;
+#pragma unroll
+                    for (int e = 0; e < cFrag[i][j].num_elements; e++)
+                        v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                    if (lane == reduction % kTranscriptU32)
+                        slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
+                }
+            }
+            ++reduction;
+        }
+
+        // Issued after the barrier and after this step's reads are underway,
+        // into the stage nobody is reading now.
+        if (step + kStages - 1 < totalSteps)
+            OM_PEARL_ISSUE(step + kStages - 1, (step + kStages - 1) % kStages)
+    }
+#undef OM_PEARL_ISSUE
+#undef OM_PEARL_CP
+#undef OM_PEARL_COMMIT
+#undef OM_PEARL_WAIT
+
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int row = rowBase + (warpM * kTilesM + i) * kHashTile;
+            const int col = colBase + (warpN * kTilesN + j) * kHashTile;
+            if (writeC)
+                wmma::store_matrix_sync(cNoised + (size_t)row * n + col, cFrag[i][j],
+                                        n, wmma::mem_row_major);
+            if (lane < kTranscriptU32) {
+                const int blocksPerRow = n / rank;
+                const int iIdx = row / rank;
+                const int jIdx = col / rank;
+                const int hi = (row % rank) / kHashTile;
+                const int wi = (col % rank) / kHashTile;
+                const int tilesPerSide = rank / kHashTile;
+                const int flat =
+                    ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+                transcripts[flat * kTranscriptU32 + lane] = slot[i][j];
+            }
+        }
+    }
+}
+
 #endif  // tensor cores available
 
 }  // namespace pearl

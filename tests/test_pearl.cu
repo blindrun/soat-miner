@@ -258,6 +258,18 @@ int main(int argc, char **argv) {
     CHECK_DB(2, 4, 4, 4)
     CHECK_DB(4, 2, 2, 2)
     CHECK_DB(4, 4, 2, 2)
+#define CHECK_ASYNC(WM, WN, TM, TN) \
+    CHECK_TILED_K(om::pearl::noisyGemmMmaTiledAsync, "async", WM, WN, TM, TN)
+
+    // cp.async writes shared memory behind the thread's back, so a missing
+    // wait is invisible until the data is wrong. Same reference, same ranks.
+    CHECK_ASYNC(2, 4, 2, 2)
+    CHECK_ASYNC(2, 4, 4, 2)
+    CHECK_ASYNC(2, 4, 2, 4)
+    CHECK_ASYNC(2, 4, 4, 4)
+    CHECK_ASYNC(4, 2, 2, 2)
+    CHECK_ASYNC(4, 4, 2, 2)
+#undef CHECK_ASYNC
 #undef CHECK_DB
 #undef CHECK_TILED
 #undef CHECK_TILED_K

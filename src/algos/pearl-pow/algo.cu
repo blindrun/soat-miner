@@ -116,6 +116,14 @@ void launchTiledDB(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
         <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
+template <int WM, int WN, int TM, int TN>
+void launchTiledAsync(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
+                      const int8_t *b, uint32_t *t, int m, int n, int k,
+                      int rank) {
+    noisyGemmMmaTiledAsync<WM, WN, TM, TN>
+        <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
+}
+
 const TileConfig kTileConfigs[] = {
     {"single 2x4/2x2", 64, 128, 256, &launchTiled<2, 4, 2, 2>},
     {"single 2x4/4x2", 128, 128, 256, &launchTiled<2, 4, 4, 2>},
@@ -131,6 +139,15 @@ const TileConfig kTileConfigs[] = {
     {"dbuf 2x4/4x4", 128, 256, 256, &launchTiledDB<2, 4, 4, 4>},
     {"dbuf 4x2/2x2", 128, 64, 256, &launchTiledDB<4, 2, 2, 2>},
     {"dbuf 4x4/2x2", 128, 128, 512, &launchTiledDB<4, 4, 2, 2>},
+    // cp.async, three stages. Ampere and later only - on an older card the
+    // launch fails with "invalid device function" and pickTileConfig() skips
+    // it, which is exactly the behaviour wanted rather than a build-time split.
+    {"async 2x4/2x2", 64, 128, 256, &launchTiledAsync<2, 4, 2, 2>},
+    {"async 2x4/4x2", 128, 128, 256, &launchTiledAsync<2, 4, 4, 2>},
+    {"async 2x4/2x4", 64, 256, 256, &launchTiledAsync<2, 4, 2, 4>},
+    {"async 2x4/4x4", 128, 256, 256, &launchTiledAsync<2, 4, 4, 4>},
+    {"async 4x2/2x2", 128, 64, 256, &launchTiledAsync<4, 2, 2, 2>},
+    {"async 4x4/2x2", 128, 128, 512, &launchTiledAsync<4, 4, 2, 2>},
 };
 
 class PearlPow : public Algorithm {
@@ -164,87 +181,116 @@ class PearlPow : public Algorithm {
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) return false;
 
-        // Leave the driver and whatever is on screen a real margin. Pearl's
-        // working set is small enough that shrinking a step costs a few
-        // percent, so there is no reason to sail close.
+        // Leave the driver and whatever is on screen a real margin.
         const size_t headroom = 512ULL << 20;
-        for (const Shape &s : kShapes) {
-            if (bytesFor(s) + headroom <= freeB) {
-                shape_ = s;
-                break;
+
+        // Tune SHAPE and TILE CONFIGURATION together, because they interact.
+        // Neither can be chosen first: the best shape moved once the kernel got
+        // faster (a bigger working set stopped fitting L2), and the best
+        // configuration differs per card - a 4090 wants 4x2 tiles per warp, a
+        // 5080 wants 2x4, and each is near the other's worst. Choosing one and
+        // then the other picks a local optimum on some card.
+        //
+        // A second or so at startup, once, against differences of 60%+.
+        double bestRate = 0;
+        bool found = false;
+        for (const Shape &cand : kShapes) {
+            if (bytesFor(cand) + headroom > freeB) continue;
+            size_t cfg = 0;
+            const double rate = tuneShape(cand, &cfg);
+            if (rate > bestRate) {
+                bestRate = rate;
+                shape_ = cand;
+                tile_ = cfg;
+                found = true;
             }
         }
+        if (!found) {
+            fprintf(stderr,
+                    "[pearl-pow] no shape fits in %.0f MB of free device "
+                    "memory\n", freeB / 1e6);
+            return false;
+        }
+
         if (!allocate()) {
             fprintf(stderr, "[pearl-pow] could not allocate %.0f MB\n",
                     bytesFor(shape_) / 1e6);
             return false;
         }
         allocated_ = true;
-        tile_ = pickTileConfig();
+        fprintf(stderr,
+                "[pearl-pow] %ux%u with %s: %.1f M candidates/s, %.0f MB\n",
+                shape_.m, shape_.n, kTileConfigs[tile_].name, bestRate,
+                bytesFor(shape_) / 1e6);
         return true;
     }
 
     /**
-     * Time every eligible tile configuration on this device and keep the best.
+     * Time every eligible configuration at one shape; return the best rate in
+     * millions of candidates per second and which configuration got it.
      *
-     * A few hundred milliseconds, once, against a 64% throughput difference
-     * between the best and worst choice on a 5080 - and the wrong choice is
-     * invisible, because a slow miner looks exactly like a slow GPU.
+     * Candidates per second, not milliseconds: shapes produce different numbers
+     * of transcripts per GEMM, so raw time is not comparable across them.
      *
-     * Timed on real data: the buffers are filled first, because a GEMM reading
-     * pages that were never written is not measuring the same thing as one
-     * reading real data, which cost an hour to work out once already.
+     * The buffers are filled before timing. A GEMM reading pages that were
+     * never written is not measuring the same thing as one reading real data,
+     * which already cost an hour once in this project's history.
      */
-    size_t pickTileConfig() {
-        const size_t aBytes = (size_t)shape_.m * kK;
-        const size_t bBytes = (size_t)kK * shape_.n;
-        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(dAn_, aBytes, 1);
-        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(dBn_, bBytes, 2);
+    double tuneShape(const Shape &s, size_t *bestCfg) {
+        const size_t aBytes = (size_t)s.m * kK;
+        const size_t bBytes = (size_t)kK * s.n;
+        const size_t tiles = (size_t)(s.m / kTileSide) * (s.n / kTileSide);
+
+        int8_t *tA = nullptr, *tB = nullptr;
+        uint32_t *tT = nullptr;
+        if (cudaMalloc(&tA, aBytes) != cudaSuccess) return 0;
+        if (cudaMalloc(&tB, bBytes) != cudaSuccess) { cudaFree(tA); return 0; }
+        if (cudaMalloc(&tT, tiles * 16 * sizeof(uint32_t)) != cudaSuccess) {
+            cudaFree(tA);
+            cudaFree(tB);
+            return 0;
+        }
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(tA, aBytes, 1);
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(tB, bBytes, 2);
         cudaStreamSynchronize(stream_);
 
-        cudaEvent_t a, b;
-        cudaEventCreate(&a);
-        cudaEventCreate(&b);
+        cudaEvent_t evA, evB;
+        cudaEventCreate(&evA);
+        cudaEventCreate(&evB);
 
-        size_t best = 0;
-        float bestMs = 0.0f;
-        bool haveBest = false;
+        double best = 0;
+        *bestCfg = 0;
         for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
             const TileConfig &tc = kTileConfigs[i];
-            if (shape_.m % tc.blockM || shape_.n % tc.blockN) continue;
-            dim3 grid(shape_.n / tc.blockN, shape_.m / tc.blockM);
+            if (s.m % tc.blockM || s.n % tc.blockN) continue;
+            dim3 grid(s.n / tc.blockN, s.m / tc.blockM);
 
             float ms = 0.0f;
             bool ok = true;
             for (int rep = 0; rep < 2 && ok; rep++) {     // first pays warmup
-                cudaEventRecord(a, stream_);
-                tc.launch(grid, tc.threads, stream_, dAn_, dBn_, dTranscripts_,
-                          (int)shape_.m, (int)shape_.n, (int)kK, kRank);
-                cudaEventRecord(b, stream_);
+                cudaEventRecord(evA, stream_);
+                tc.launch(grid, tc.threads, stream_, tA, tB, tT, (int)s.m,
+                          (int)s.n, (int)kK, kRank);
+                cudaEventRecord(evB, stream_);
                 if (cudaStreamSynchronize(stream_) != cudaSuccess ||
                     cudaGetLastError() != cudaSuccess) {
                     ok = false;
                     break;
                 }
-                cudaEventElapsedTime(&ms, a, b);
+                cudaEventElapsedTime(&ms, evA, evB);
             }
-            if (!ok) continue;
-            if (!haveBest || ms < bestMs) {
-                bestMs = ms;
-                best = i;
-                haveBest = true;
+            if (!ok || ms <= 0.0f) continue;
+            const double rate = (double)tiles / (ms * 1e-3) / 1e6;
+            if (rate > best) {
+                best = rate;
+                *bestCfg = i;
             }
         }
-        cudaEventDestroy(a);
-        cudaEventDestroy(b);
-
-        if (haveBest) {
-            const double mac = (double)shape_.m * shape_.n * kK;
-            fprintf(stderr,
-                    "[pearl-pow] tile %s at %ux%u: %.2f ms, %.1f TOPS int8\n",
-                    kTileConfigs[best].name, shape_.m, shape_.n, bestMs,
-                    2.0 * mac / (bestMs * 1e-3) / 1e12);
-        }
+        cudaEventDestroy(evA);
+        cudaEventDestroy(evB);
+        cudaFree(tA);
+        cudaFree(tB);
+        cudaFree(tT);
         return best;
     }
 
