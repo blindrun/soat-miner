@@ -42,6 +42,18 @@ struct Job {
 struct Solution {
     uint64_t nonce = 0;
     uint64_t hit[4] = {};
+
+    /**
+     * Algorithm-specific payload for the submission, opaque to the core - the
+     * mirror of Job::extra on the way back out.
+     *
+     * A nonce is enough to describe a win for every hash-and-compare PoW, and
+     * is not enough for all of them. Pearl's win is a tile of a matrix product
+     * the miner chose, and what gets submitted is a Merkle opening of sixteen
+     * rows and sixteen columns - tens of kilobytes that no fixed field can
+     * hold. Empty for algorithms whose nonce says everything.
+     */
+    std::string extra;
 };
 
 class Algorithm {

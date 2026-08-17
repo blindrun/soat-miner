@@ -11,3 +11,5 @@ tests/test_algo
 # build-binary variants and experiment scratch binaries (never commit these)
 soat-miner-*
 sm-*
+tests/test_pearl_job
+tests/test_pearl_gateway

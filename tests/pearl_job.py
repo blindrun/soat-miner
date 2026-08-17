@@ -740,7 +740,21 @@ def main():
 
 
 # ----------------------------------------------------------------- vectors
-VECTOR_MAGIC = b"PRLJ0001"
+VECTOR_MAGIC = b"PRLJ0002"          # 0002 adds the noise matrices
+
+
+def permutation_indices(P, assign_columns):
+    """Recover the +1 and -1 positions from a permutation matrix.
+
+    The kernels never build these matrices - E_AL @ E_AR has column j equal to
+    E_AL[:, first_j] - E_AL[:, second_j], which is two subtractions rather than
+    a rank-long dot product. Deriving the indices from the matrix here proves
+    the two formulations are the same thing rather than assuming it.
+    """
+    axis = 0 if assign_columns else 1
+    first = np.argmax(P == 1, axis=axis).astype(np.uint16)
+    second = np.argmax(P == -1, axis=axis).astype(np.uint16)
+    return first, second
 
 
 def synth_matrix(rows, cols, salt):
@@ -754,7 +768,7 @@ def synth_matrix(rows, cols, salt):
     return (((idx * 37 + salt) & 0x7F) - 64).astype(np.int8).reshape(rows, cols)
 
 
-def emit_vectors(path, m=64, n=48, k=2048, rank=128):
+def emit_vectors(path, m=128, n=128, k=2048, rank=128):
     header = bytes((i * 7 + 3) & 0xFF for i in range(76))
     cfg = MiningConfiguration.contiguous(k, rank)
     key = job_key(header, cfg)
@@ -775,6 +789,20 @@ def emit_vectors(path, m=64, n=48, k=2048, rank=128):
         leaf_indices_from_rows(b_cols, k))
     blob = encode_plain_proof(m, n, k, rank, a_proof, a_rows, bt_proof, b_cols)
 
+    gen = NoiseGenerator(noise_rank=rank)
+    E_AL, E_AR, E_BL, E_BR = gen.generate(ca, cb, m, k, n)
+    ar_first, ar_second = permutation_indices(E_AR, True)
+    bl_first, bl_second = permutation_indices(E_BL, False)
+
+    # B is stored transposed everywhere else, so undo that for the noising:
+    # B_noised is k x n and the vectors record a hash of it rather than the
+    # whole array.
+    B = np.ascontiguousarray(B_t.T)
+    A_noised = (A.astype(np.int32)
+                + E_AL.astype(np.int32) @ E_AR.astype(np.int32)).astype(np.int8)
+    B_noised = (B.astype(np.int32)
+                + E_BL.astype(np.int32) @ E_BR.astype(np.int32)).astype(np.int8)
+
     bound = cfg.penalized_target(2**232)
     with open(path, "wb") as fh:
         fh.write(VECTOR_MAGIC)
@@ -784,6 +812,12 @@ def emit_vectors(path, m=64, n=48, k=2048, rank=128):
         fh.write(key)
         fh.write(a_root + bt_root + ca + cb)
         fh.write(bound.to_bytes(32, "little"))
+        fh.write(E_AL.tobytes())
+        fh.write(np.ascontiguousarray(E_BR).tobytes())
+        fh.write(ar_first.tobytes() + ar_second.tobytes())
+        fh.write(bl_first.tobytes() + bl_second.tobytes())
+        fh.write(blake3_unkeyed(A_noised.tobytes()))
+        fh.write(blake3_unkeyed(B_noised.tobytes()))
         fh.write(struct.pack("<I", len(blob)))
         fh.write(blob)
     print(f"wrote {path}: m={m} n={n} k={k} rank={rank}, "

@@ -104,8 +104,8 @@ int main(int argc, char **argv) {
 
     Reader r{blob.data(), blob.data() + blob.size()};
     const uint8_t *magic = r.take(8);
-    if (!magic || memcmp(magic, "PRLJ0001", 8) != 0) {
-        fprintf(stderr, "not a PRLJ0001 vector file\n");
+    if (!magic || memcmp(magic, "PRLJ0002", 8) != 0) {
+        fprintf(stderr, "not a PRLJ0002 vector file\n");
         return 2;
     }
     const int32_t *dims = (const int32_t *)r.take(16);
@@ -120,6 +120,14 @@ int main(int argc, char **argv) {
     const uint8_t *wantCommitA = r.take(32);
     const uint8_t *wantCommitB = r.take(32);
     const uint8_t *wantBound = r.take(32);
+    const int8_t *wantEAL = (const int8_t *)r.take((size_t)m * rank);
+    const int8_t *wantEBR = (const int8_t *)r.take((size_t)rank * n);
+    const uint8_t *wantArFirst = r.take((size_t)k * 2);
+    const uint8_t *wantArSecond = r.take((size_t)k * 2);
+    const uint8_t *wantBlFirst = r.take((size_t)k * 2);
+    const uint8_t *wantBlSecond = r.take((size_t)k * 2);
+    const uint8_t *wantANoised = r.take(32);
+    const uint8_t *wantBNoised = r.take(32);
     const uint8_t *proofLenP = r.take(4);
     if (!r.ok) {
         fprintf(stderr, "vector file truncated\n");
@@ -245,7 +253,69 @@ int main(int argc, char **argv) {
         check("and not the other way round", !target.le(small));
     }
 
-    printf("6. leaf indices, Merkle proofs and the wire encoding\n");
+    printf("6. noise generation and the noising\n");
+    {
+        Noise noise;
+        noise.generate(wantCommitA, wantCommitB, m, n, k, (int)rank);
+
+        check("E_AL matches",
+              memcmp(noise.eAL.data(), wantEAL, (size_t)m * rank) == 0);
+        check("E_BR matches (transposed to rank x n)",
+              memcmp(noise.eBR.data(), wantEBR, (size_t)rank * n) == 0);
+        check("E_AR column indices match",
+              memcmp(noise.ar.first.data(), wantArFirst, (size_t)k * 2) == 0 &&
+                  memcmp(noise.ar.second.data(), wantArSecond, (size_t)k * 2) == 0);
+        check("E_BL row indices match",
+              memcmp(noise.bl.first.data(), wantBlFirst, (size_t)k * 2) == 0 &&
+                  memcmp(noise.bl.second.data(), wantBlSecond, (size_t)k * 2) == 0);
+
+        // Uniform noise has to land in [-32, 31]: half the nominal range,
+        // because two index draws share it before the zero-point shift. Out of
+        // range here and A + E overflows int8 on real data.
+        int8_t lo = 127, hi = -128;
+        for (size_t i = 0; i < noise.eAL.size(); i++) {
+            if (noise.eAL[i] < lo) lo = noise.eAL[i];
+            if (noise.eAL[i] > hi) hi = noise.eAL[i];
+        }
+        check("uniform noise stays in [-32, 31]", lo >= -32 && hi <= 31,
+              std::to_string(lo) + ".." + std::to_string(hi));
+
+        bool distinct = true;
+        for (size_t i = 0; i < noise.ar.first.size(); i++)
+            if (noise.ar.first[i] == noise.ar.second[i]) distinct = false;
+        check("every permutation line has a distinct +1 and -1", distinct);
+
+        // The noising, written the way the kernel will: two subtractions per
+        // element, never a rank-long dot product against a matrix of mostly
+        // zeros.
+        std::vector<int8_t> aNoised((size_t)m * k);
+        for (size_t row = 0; row < m; row++)
+            for (size_t col = 0; col < k; col++) {
+                const int32_t e = (int32_t)noise.eAL[row * rank + noise.ar.first[col]] -
+                                  (int32_t)noise.eAL[row * rank + noise.ar.second[col]];
+                aNoised[row * k + col] = (int8_t)(A[row * k + col] + e);
+            }
+        std::vector<int8_t> bNoised((size_t)k * n);
+        for (size_t row = 0; row < k; row++)
+            for (size_t col = 0; col < n; col++) {
+                const int32_t e = (int32_t)noise.eBR[(size_t)noise.bl.first[row] * n + col] -
+                                  (int32_t)noise.eBR[(size_t)noise.bl.second[row] * n + col];
+                // Bt is n x k, so B[row][col] is Bt[col][row].
+                bNoised[row * n + col] = (int8_t)(Bt[col * k + row] + e);
+            }
+
+        uint8_t got[32];
+        b3::hash(nullptr, (const uint8_t *)aNoised.data(), aNoised.size(), got);
+        check("A + E_AL@E_AR matches, computed as index subtractions",
+              memcmp(got, wantANoised, 32) == 0,
+              hex(got, 32) + " vs " + hex(wantANoised, 32));
+        b3::hash(nullptr, (const uint8_t *)bNoised.data(), bNoised.size(), got);
+        check("B + E_BL@E_BR matches, computed as index subtractions",
+              memcmp(got, wantBNoised, 32) == 0,
+              hex(got, 32) + " vs " + hex(wantBNoised, 32));
+    }
+
+    printf("7. leaf indices, Merkle proofs and the wire encoding\n");
     {
         const std::vector<uint64_t> aLeaves = leafIndicesFromRows(16, 16, k);
         const std::vector<uint64_t> bLeaves = leafIndicesFromRows(16, 16, k);
@@ -270,7 +340,7 @@ int main(int argc, char **argv) {
               std::to_string(blob2.size()) + " vs " + std::to_string(proofLen));
     }
 
-    printf("7. base64 round-trips\n");
+    printf("8. base64 round-trips\n");
     {
         for (size_t len = 0; len < 8; len++) {
             std::vector<uint8_t> in(len);

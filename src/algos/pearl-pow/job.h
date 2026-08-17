@@ -440,6 +440,201 @@ inline void commitments(const uint8_t aRoot[32], const uint8_t btRoot[32],
     b3::hash(nullptr, buf, 64, commitA);
 }
 
+// ------------------------------------------------------------------ noise
+//
+// The four noise matrices are derived from the two commitments, so they change
+// on every attempt and cannot be precomputed across one. That sounds ruinous
+// and is not, because of their structure:
+//
+//   E_AL is m x r uniform int8, E_BR is r x n uniform int8, and E_AR (r x k)
+//   and E_BL (k x r) are PERMUTATION matrices with exactly one +1 and one -1
+//   per column and per row respectively.
+//
+// So E_AL @ E_AR has column j equal to E_AL[:, first_j] - E_AL[:, second_j],
+// and E_BL @ E_BR has row i equal to E_BR[first_i, :] - E_BR[second_i, :]. The
+// noising is two subtractions per element, O(m*k + k*n), not the O(r*(m*k +
+// k*n)) that writing it as a matrix product implies. Neither permutation
+// matrix ever has to exist; only its index pairs do.
+//
+// Every draw is one keyed blake3 of a single 64-byte block: eight int32 with a
+// counter in slot 0 or 1, then the 32-byte domain seed.
+
+struct PermIndices {
+    std::vector<uint16_t> first;
+    std::vector<uint16_t> second;
+};
+
+/** blake3(int32[8]{prependIndex slot = 1+index} || seed, key). */
+inline void noiseDraw(const uint8_t key[32], const uint8_t seed[32], uint32_t index,
+                      int prependSlot, uint8_t out[32]) {
+    uint8_t msg[64] = {0};
+    const uint32_t v = 1u + index;
+    msg[prependSlot * 4 + 0] = (uint8_t)v;
+    msg[prependSlot * 4 + 1] = (uint8_t)(v >> 8);
+    msg[prependSlot * 4 + 2] = (uint8_t)(v >> 16);
+    msg[prependSlot * 4 + 3] = (uint8_t)(v >> 24);
+    memcpy(msg + 32, seed, 32);
+    b3::hash(key, msg, sizeof(msg), out);
+}
+
+inline void seedForA(uint8_t out[32]) {
+    memset(out, 0, 32);
+    memcpy(out, "A_tensor", 8);
+}
+
+inline void seedForB(uint8_t out[32]) {
+    memset(out, 0, 32);
+    memcpy(out, "B_tensor", 8);
+}
+
+/**
+ * `rows` x `rank` uniform int8 noise.
+ *
+ * With the default noise_range of 128 the mask is 63 and the shift is 32, so
+ * entries land in [-32, 31] - half the nominal range, because two index draws
+ * share it before the zero-point shift.
+ */
+inline std::vector<int8_t> uniformNoise(const uint8_t key[32], const uint8_t seed[32],
+                                        size_t rows, int rank, int noiseRange = 128) {
+    const int mask = noiseRange / 2 - 1;
+    const int shift = (noiseRange / 2) / 2;
+    const size_t want = rows * (size_t)rank;
+    const size_t draws = (want + kDigestLen - 1) / kDigestLen;
+
+    std::vector<int8_t> out(want);
+    uint8_t digest[32];
+    for (size_t i = 0; i < draws; i++) {
+        noiseDraw(key, seed, (uint32_t)i, 0, digest);
+        const size_t base = i * kDigestLen;
+        const size_t n = (want - base < kDigestLen) ? want - base : kDigestLen;
+        for (size_t j = 0; j < n; j++)
+            out[base + j] = (int8_t)(((int)digest[j] & mask) - shift);
+    }
+    return out;
+}
+
+/** The +1 and -1 positions of a permutation matrix's `count` lines. */
+inline PermIndices permutationIndices(const uint8_t key[32], const uint8_t seed[32],
+                                      size_t count, int rank) {
+    PermIndices out;
+    out.first.resize(count);
+    out.second.resize(count);
+    const uint32_t rankMask = (uint32_t)rank - 1;
+
+    const size_t perDraw = kDigestLen / 4;               // eight u32 per digest
+    const size_t draws = (count + perDraw - 1) / perDraw;
+    uint8_t digest[32];
+    for (size_t i = 0; i < draws; i++) {
+        noiseDraw(key, seed, (uint32_t)i, 1, digest);
+        for (size_t w = 0; w < perDraw; w++) {
+            const size_t idx = i * perDraw + w;
+            if (idx >= count) break;
+            const uint32_t r = (uint32_t)digest[w * 4] |
+                               ((uint32_t)digest[w * 4 + 1] << 8) |
+                               ((uint32_t)digest[w * 4 + 2] << 16) |
+                               ((uint32_t)digest[w * 4 + 3] << 24);
+            const uint32_t first = r & rankMask;
+            // The xor operand is at least 1, so second is never first - which
+            // is what stops a column being all zeros instead of +1/-1.
+            const uint32_t hi = (uint32_t)(((uint64_t)(rank - 1) * (uint64_t)r) >> 32);
+            out.first[idx] = (uint16_t)first;
+            out.second[idx] = (uint16_t)(first ^ (1u + hi));
+        }
+    }
+    return out;
+}
+
+/** Everything the noising needs, derived from one attempt's commitments. */
+struct Noise {
+    std::vector<int8_t> eAL;      // m x rank, row-major
+    std::vector<int8_t> eBR;      // rank x n, row-major
+    PermIndices ar;               // one pair per column of E_AR, k of them
+    PermIndices bl;               // one pair per row of E_BL, k of them
+
+    void generate(const uint8_t commitA[32], const uint8_t commitB[32], size_t m,
+                  size_t n, size_t k, int rank) {
+        uint8_t seedA[32], seedB[32];
+        seedForA(seedA);
+        seedForB(seedB);
+
+        eAL = uniformNoise(commitA, seedA, m, rank);
+        ar = permutationIndices(commitA, seedA, k, rank);
+        bl = permutationIndices(commitB, seedB, k, rank);
+
+        // E_BR is generated as n x rank and used transposed, so transpose it
+        // once here rather than striding over it in the inner loop.
+        const std::vector<int8_t> flat = uniformNoise(commitB, seedB, n, rank);
+        eBR.resize((size_t)rank * n);
+        for (size_t row = 0; row < n; row++)
+            for (int c = 0; c < rank; c++)
+                eBR[(size_t)c * n + row] = flat[row * rank + c];
+    }
+};
+
+// -------------------------------------------------------------- transcript
+//
+// The host-side copy of what the kernels do, for one tile only. This is what
+// Algorithm::verify() runs before anything is submitted: a card overclocked
+// into instability produces wrong accumulators, and there is no other way to
+// tell that from a genuine win. Sixteen rows by sixteen columns over k is half
+// a million multiply-accumulates, so re-checking a win costs nothing.
+//
+// It is also exactly what the node recomputes from the opened rows and
+// columns, which is why the same routine can stand in for both.
+
+constexpr int kTranscriptWords = 16;         // 64 bytes, one blake3 block
+constexpr int kRotation = 13;
+
+inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+/**
+ * Fold the transcript of the tile at (tRow, tCol) from the noised matrices.
+ *
+ * `aNoised` is m x k row-major, `bNoised` is k x n row-major. Only the tile's
+ * own rows and columns are touched, so a caller holding just the opened strips
+ * can pass those instead.
+ */
+inline void tileTranscript(const int8_t *aNoised, const int8_t *bNoised, size_t k,
+                           size_t n, int rank, size_t tRow, size_t tCol, int tileH,
+                           int tileW, uint32_t out[kTranscriptWords]) {
+    for (int i = 0; i < kTranscriptWords; i++) out[i] = 0;
+
+    std::vector<int32_t> acc((size_t)tileH * tileW, 0);
+    int step = 0;
+    for (size_t p = 0; p + rank <= k; p += rank) {
+        for (int i = 0; i < tileH; i++) {
+            const int8_t *aRow = aNoised + (tRow + i) * k;
+            for (int j = 0; j < tileW; j++) {
+                int32_t sum = acc[(size_t)i * tileW + j];
+                for (size_t d = 0; d < (size_t)rank; d++)
+                    sum += (int32_t)aRow[p + d] * (int32_t)bNoised[(p + d) * n + tCol + j];
+                acc[(size_t)i * tileW + j] = sum;
+            }
+        }
+        // The "inner hash" is an XOR fold, not a hash function. XOR is
+        // commutative and associative, so no ordering here can disagree with
+        // the device - any mismatch is a real bug rather than an artifact.
+        uint32_t h = 0;
+        for (size_t i = 0; i < acc.size(); i++) h ^= (uint32_t)acc[i];
+        const int slot = step % kTranscriptWords;
+        out[slot] = rotl32(out[slot], kRotation) ^ h;
+        step++;
+    }
+}
+
+/** blake3 of a transcript under the PoW key. One block, one compression. */
+inline void powDigest(const uint32_t transcript[kTranscriptWords],
+                      const uint8_t key[32], uint8_t out[32]) {
+    uint8_t msg[kTranscriptWords * 4];
+    for (int i = 0; i < kTranscriptWords; i++) {
+        msg[4 * i] = (uint8_t)transcript[i];
+        msg[4 * i + 1] = (uint8_t)(transcript[i] >> 8);
+        msg[4 * i + 2] = (uint8_t)(transcript[i] >> 16);
+        msg[4 * i + 3] = (uint8_t)(transcript[i] >> 24);
+    }
+    b3::hash(key, msg, sizeof(msg), out);
+}
+
 // ----------------------------------------------------------- merkle proof
 
 struct MerkleProof {
