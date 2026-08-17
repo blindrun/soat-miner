@@ -41,6 +41,28 @@ __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
+/**
+ * XOR-reduce a value across the warp.
+ *
+ * Ampere has this as a single instruction. The butterfly it replaces is five
+ * shuffles, and the fold runs once per rank step for EVERY tile a warp owns -
+ * with 4x4 tiles that is eighty shuffles per hundred and twenty-eight mma, on
+ * the same ALU pipeline the profiler showed as the highest-utilised at 37%.
+ *
+ * The fallback is the original butterfly, so pre-Ampere is unaffected.
+ */
+__device__ __forceinline__ uint32_t warpXor(uint32_t v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_xor_sync(0xffffffffu, v);
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v ^= __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+#endif
+}
+
+
 // ------------------------------------------------------------------ blake3
 //
 // Only the case Pearl needs: a keyed hash of exactly one 64-byte block. The
@@ -303,9 +325,7 @@ __global__ void noisyGemmMma(const int8_t *__restrict__ A,
 #pragma unroll
         for (int i = 0; i < cFrag.num_elements; ++i)
             v ^= static_cast<uint32_t>(cFrag.x[i]);
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            v ^= __shfl_xor_sync(0xffffffffu, v, off);
+        v = warpXor(v);
 
         if (lane == reduction % kTranscriptU32) slot = rotl32(slot, kRotation) ^ v;
         ++reduction;
@@ -387,9 +407,7 @@ __global__ void noisyGemmMmaStaged(const int8_t *__restrict__ A,
 #pragma unroll
         for (int i = 0; i < cFrag.num_elements; ++i)
             v ^= static_cast<uint32_t>(cFrag.x[i]);
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            v ^= __shfl_xor_sync(0xffffffffu, v, off);
+        v = warpXor(v);
 
         if (lane == reduction % kTranscriptU32) slot = rotl32(slot, kRotation) ^ v;
         ++reduction;
@@ -524,9 +542,7 @@ __global__ void noisyGemmMmaTiled(const int8_t *__restrict__ A,
 #pragma unroll
                 for (int e = 0; e < cFrag[i][j].num_elements; e++)
                     v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                v = warpXor(v);
                 if (lane == reduction % kTranscriptU32)
                     slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
             }
@@ -714,9 +730,7 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
 #pragma unroll
                     for (int e = 0; e < cFrag[i][j].num_elements; e++)
                         v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
-#pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                    v = warpXor(v);
                     if (lane == reduction % kTranscriptU32)
                         slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
                 }
@@ -911,9 +925,7 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
 #pragma unroll
                     for (int e = 0; e < cFrag[i][j].num_elements; e++)
                         v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
-#pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                    v = warpXor(v);
                     if (lane == reduction % kTranscriptU32)
                         slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
                 }

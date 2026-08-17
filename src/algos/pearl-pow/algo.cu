@@ -265,9 +265,14 @@ class PearlPow : public Algorithm {
             if (s.m % tc.blockM || s.n % tc.blockN) continue;
             dim3 grid(s.n / tc.blockN, s.m / tc.blockM);
 
+            // Best of several, not the last of two. A single timed rep picked
+            // a shape 20% off the best one here, because anything else on the
+            // card perturbs one sample and the tuner then commits to it for
+            // the whole run. Interference only ever makes a rep slower, so the
+            // minimum is the honest estimate of what the kernel can do.
             float ms = 0.0f;
             bool ok = true;
-            for (int rep = 0; rep < 2 && ok; rep++) {     // first pays warmup
+            for (int rep = 0; rep < 4 && ok; rep++) {     // first pays warmup
                 cudaEventRecord(evA, stream_);
                 tc.launch(grid, tc.threads, stream_, tA, tB, tT, (int)s.m,
                           (int)s.n, (int)kK, kRank);
@@ -277,7 +282,9 @@ class PearlPow : public Algorithm {
                     ok = false;
                     break;
                 }
-                cudaEventElapsedTime(&ms, evA, evB);
+                float d = 0.0f;
+                cudaEventElapsedTime(&d, evA, evB);
+                if (rep && (ms == 0.0f || d < ms)) ms = d;
             }
             if (!ok || ms <= 0.0f) continue;
             const double rate = (double)tiles / (ms * 1e-3) / 1e6;
