@@ -55,5 +55,5 @@ TESTED
     RTX 4060 Ti      64 MH/s
   Confirmed to run on a machine with no CUDA Toolkit installed, so the static
   link and the bundled DLLs do their job. The Vulkan path is tested on Linux on
-  NVIDIA and AMD; Windows itself is lightly exercised, so please report what
+  NVIDIA and AMD. Windows itself is lightly exercised, so please report what
   happens.

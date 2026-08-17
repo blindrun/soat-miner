@@ -1,7 +1,7 @@
 # SOAT Miner configuration
 #
 # Edit this file, then run ./soat-miner.sh (Linux) or soat-miner.bat (Windows).
-# Anything you set here is passed to the miner; command-line flags override it.
+# Anything you set here is passed to the miner. Command-line flags override it.
 
 # ---------------------------------------------------------------- POOL MODE
 # Your Ergo payout address. REQUIRED for pool mining.

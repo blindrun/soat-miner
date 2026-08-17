@@ -126,7 +126,7 @@ root - and it prints how to if it is off.
 On **NVIDIA GDDR6X** (4090/4080/4070-family, 3090/3080/3070 Ti) it restores the
 P2 downclock back to the rated speed, worth about 2.5%. That is undoing a
 downclock, not an overclock. GDDR6 and GDDR7 NVIDIA cards have no such downclock,
-so they are left alone; use --mclk-offset by hand if you know your card.
+so they are left alone. Use --mclk-offset by hand if you know your card.
 
 Either way the clock is put back when the miner stops.
 
@@ -251,7 +251,7 @@ actually improves mining decentralisation, not because it pays.
 > live Lithos client (v4.2.0) on the Ergo **test network**: the miner connects,
 > receives real jobs, and its shares are accepted by the client (verified at 95
 > accepted / 0 rejected). It has **not** been validated on mainnet yet, so run it
-> on testnet only for now — the quickstart below defaults to testnet on purpose.
+> on testnet only for now. The quickstart below defaults to testnet on purpose.
 > The rest of the miner is unaffected either way.
 
 [Lithos](https://docs.ergoplatform.com/eco/lithos/) is a decentralised pool
@@ -306,7 +306,7 @@ tells you your super-shares per hour against the payout bar (you need about
 Payouts settle on-chain to the wallet the setup created. Back up its mnemonic
 (the setup prints where it saved it).
 
-If you already run your own node and client, skip the script — the client's
+If you already run your own node and client, skip the script. The client's
 stratum server is on `127.0.0.1:4444` and you just mine into it:
 
 ```
