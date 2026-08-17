@@ -10,9 +10,7 @@
 name: windows-cuda
 
 on:
-  workflow_dispatch: {}        # build on demand
-  push:
-    tags: ['v*']               # and attach to a version tag's release
+  workflow_dispatch: {}        # build + validate on demand
 
 jobs:
   build:
@@ -56,21 +54,11 @@ jobs:
           if ($imports -match 'cudart') { throw "cudart64 dynamically linked - static link failed" }
           Get-ChildItem $pkg | Select-Object Name,Length | Format-Table -AutoSize
 
+      # The staged package (soat-miner.exe + the VC++ DLLs) is what the
+      # Makefile's windows-package target folds into the full Windows zip
+      # alongside the Linux-cross-built Vulkan binary. Download it from here.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: soat-miner-win64-cuda
           path: cuda-pkg/
-
-      # Only when a version tag pushed this run: attach the CUDA bits to that
-      # release so the download page has both backends.
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          Compress-Archive -Path cuda-pkg\* -DestinationPath "soat-miner_${{ github.ref_name }}_Win64_CUDA.zip" -Force
-      - name: Publish release asset
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: soat-miner_${{ github.ref_name }}_Win64_CUDA.zip
