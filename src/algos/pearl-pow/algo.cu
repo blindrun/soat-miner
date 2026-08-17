@@ -339,12 +339,19 @@ class PearlPow : public Algorithm {
         const size_t tiles = (size_t)(s.m / kTileSide) * (s.n / kTileSide);
 
         int8_t *tA = nullptr, *tB = nullptr;
-        uint32_t *tT = nullptr;
+        uint32_t *tT = nullptr, *tFp = nullptr;
         if (cudaMalloc(&tA, aBytes) != cudaSuccess) return 0;
         if (cudaMalloc(&tB, bBytes) != cudaSuccess) { cudaFree(tA); return 0; }
         if (cudaMalloc(&tT, tiles * 16 * sizeof(uint32_t)) != cudaSuccess) {
             cudaFree(tA);
             cudaFree(tB);
+            return 0;
+        }
+        // Allocated here rather than in allocate(), which runs AFTER tuning.
+        if (cudaMalloc(&tFp, sizeof(uint32_t)) != cudaSuccess) {
+            cudaFree(tA);
+            cudaFree(tB);
+            cudaFree(tT);
             return 0;
         }
         genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(tA, aBytes, 1);
@@ -357,6 +364,13 @@ class PearlPow : public Algorithm {
 
         double best = 0;
         *bestCfg = 0;
+        // The anchor is whichever configuration produces a result first, and
+        // the table is ordered with the simplest kernel first on purpose: no
+        // cp.async, no raw PTX, and the one held to the reference vectors
+        // longest. If that one were wrong, the reference gate would have
+        // failed long before this ran.
+        uint32_t refFp = 0;
+        bool haveRef = false;
         for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
             const TileConfig &tc = kTileConfigs[i];
             if (arch10_ && arch10_ < tc.minArch) continue;
@@ -377,6 +391,9 @@ class PearlPow : public Algorithm {
             // minimum is the honest estimate of what the kernel can do.
             float ms = 0.0f;
             bool ok = true;
+            // Zeroed first, so a configuration that does not run leaves a
+            // buffer that cannot be mistaken for a result.
+            cudaMemsetAsync(tT, 0, tiles * 16 * sizeof(uint32_t), stream_);
             for (int rep = 0; rep < 4 && ok; rep++) {     // first pays warmup
                 cudaEventRecord(evA, stream_);
                 tc.launch(grid, tc.threads, stream_, tA, tB, tT, (int)s.m,
@@ -392,6 +409,42 @@ class PearlPow : public Algorithm {
                 if (rep && (ms == 0.0f || d < ms)) ms = d;
             }
             if (!ok || ms <= 0.0f) continue;
+
+            // A NUMBER IS NOT ACCEPTED WITHOUT PROOF THE WORK HAPPENED.
+            //
+            // Three separate configurations in this branch's history have won
+            // a timing sweep by not running: a launch that failed (0.004 ms,
+            // 123893 TOPS), a pre-Ampere fallback that is a no-op so the
+            // multi-arch build links, and a k-block that does not divide k so
+            // the kernel returns before the first mma (33664 TOPS). Each was
+            // patched by hand afterwards. They are all the same skeleton - a
+            // kernel that does nothing is arbitrarily fast, and a stopwatch
+            // cannot tell "quick" from "didn't happen" - so the defence
+            // belongs here, once, and not one guard per costume.
+            //
+            // Every configuration computes the same product from the same
+            // inputs, so all of them must leave a bit-identical transcript
+            // buffer. Fingerprint it and require agreement. This also catches
+            // a configuration that is simply WRONG on a card we have never
+            // owned, which no amount of offline testing can do.
+            uint32_t fp = 0;
+            cudaMemsetAsync(tFp, 0, sizeof(uint32_t), stream_);
+            transcriptFingerprint<<<256, 256, 0, stream_>>>(
+                tT, (uint64_t)tiles * 16, tFp);
+            cudaMemcpyAsync(&fp, tFp, sizeof(uint32_t),
+                            cudaMemcpyDeviceToHost, stream_);
+            if (cudaStreamSynchronize(stream_) != cudaSuccess) continue;
+            if (fp == 0) continue;                  // wrote nothing at all
+            if (!haveRef) {
+                refFp = fp;
+                haveRef = true;
+            } else if (fp != refFp) {
+                fprintf(stderr,
+                        "[pearl-pow] %s disagrees with the other kernels on "
+                        "this card - not selected\n", tc.name);
+                continue;
+            }
+
             const double rate = (double)tiles / (ms * 1e-3) / 1e6;
             if (rate > best) {
                 best = rate;
@@ -403,6 +456,7 @@ class PearlPow : public Algorithm {
         cudaFree(tA);
         cudaFree(tB);
         cudaFree(tT);
+        cudaFree(tFp);
         return best;
     }
 

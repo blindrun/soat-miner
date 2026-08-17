@@ -103,6 +103,25 @@ __global__ void genMatrix(int8_t *__restrict__ out, uint64_t count, uint64_t see
 // ----------------------------------------------------------- merkle roots
 
 /** One thread per 1024-byte chunk. */
+/**
+ * A cheap order-independent fingerprint of the transcript buffer.
+ *
+ * Exists so the tuner can prove a configuration DID THE WORK before it is
+ * allowed to win on speed. Every configuration computes the same product from
+ * the same inputs, so every one of them must produce a bit-identical
+ * transcript buffer; anything that fails to run, returns early, or silently
+ * computes nothing leaves the zeroed buffer behind and is caught.
+ */
+__global__ void transcriptFingerprint(const uint32_t *__restrict__ t,
+                                      uint64_t words, uint32_t *__restrict__ out) {
+    uint32_t acc = 0;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < words;
+         i += (uint64_t)gridDim.x * blockDim.x)
+        acc ^= t[i] * 2654435761u + (uint32_t)i;
+    for (int off = 16; off > 0; off >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, off);
+    if ((threadIdx.x & 31) == 0) atomicXor(out, acc);
+}
+
 __global__ void chunkCvs(const uint8_t *__restrict__ data, uint32_t chunks,
                          const uint32_t *__restrict__ key,
                          uint8_t *__restrict__ cvs) {
