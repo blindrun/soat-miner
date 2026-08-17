@@ -36,11 +36,21 @@
 // the PoW key recur, and A is still a free choice, so nothing is given up.
 // That is 0.50 ms down to 0.196, and 42.2 to 52.6 M candidates/s.
 //
-// Shape then matters, less than it looks like it should: hashing A grows as
-// m*k and the GEMM as m*n*k, so holding m*n fixed and widening trades A-side
-// cost for nothing. 4096x4096 is 18.7% overhead, 1024x16384 is 14.7% and
-// 54.4 M candidates/s. It stops improving there because what is left is
-// mostly per-launch overhead rather than work.
+// Shape then matters, and the obvious metric picks the wrong one. Hashing A
+// grows as m*k and the GEMM as m*n*k, so overhead falls monotonically as the
+// shape widens - but candidates per second does not:
+//
+//     4096x4096    18.6% overhead   52.7 M/s   65.5 TOPS
+//     1024x16384   14.7%            54.4       65.5
+//     2048x32768    4.3%            60.9       66.6
+//     4096x32768    2.6%            62.1       66.8
+//     4096x65536    0.9%            42.8       45.3
+//
+// The last row has the lowest overhead and is the slowest, because B^t at
+// 128 MB stops being servable from L2 and the GEMM itself drops from 67 to 45
+// TOPS. So the shape is chosen on candidates per second, and 4096x32768 is the
+// default here: about 180 MB of device memory, and past the point where more
+// amortisation is worth anything.
 //
 // The one constraint all this imposes: the padded matrices must have a POWER
 // OF TWO number of 1024-byte chunks, so the Merkle tree is perfectly balanced

@@ -484,12 +484,17 @@ int main(int argc, char **argv) {
         // per attempt identical, and only moves that ratio.
         struct Shape { uint32_t m, n; };
         static const Shape kShapes[] = {
-            {4096, 4096}, {2048, 8192}, {1024, 16384}, {512, 32768}};
+            {4096, 4096},  {1024, 16384}, {2048, 16384},
+            {2048, 32768}, {4096, 32768}, {4096, 65536}};
         const uint32_t bk = 2048, br = 128;
 
         printf("    %-14s %8s %8s %8s %8s  %s\n", "shape", "attempt", "GEMM",
                "over%", "Mcand/s", "TOPS");
-        double bestOver = 1e9;
+        // Rank by candidates per second, not by overhead. They disagree, and
+        // overhead is the misleading one: the widest shape has the lowest
+        // overhead and is not the fastest, because B stops fitting in L2 and
+        // the GEMM itself slows down.
+        double bestRate = 0, bestOver = 0;
         uint32_t bestM = 0, bestN = 0;
         for (size_t si = 0; si < sizeof(kShapes) / sizeof(kShapes[0]); si++) {
             const uint32_t bm = kShapes[si].m, bn = kShapes[si].n;
@@ -569,7 +574,13 @@ int main(int argc, char **argv) {
             printf("    %-14s %7.3f %8.3f %7.1f%% %8.1f  %.1f\n", shape, prepMs,
                    gemmMs, over, tiles / ((prepMs + gemmMs) * 1e-3) / 1e6,
                    2.0 * mac / (gemmMs * 1e-3) / 1e12);
-            if (over < bestOver) { bestOver = over; bestM = bm; bestN = bn; }
+            const double rate = tiles / ((prepMs + gemmMs) * 1e-3) / 1e6;
+            if (rate > bestRate) {
+                bestRate = rate;
+                bestOver = over;
+                bestM = bm;
+                bestN = bn;
+            }
 
             CHECK(cudaFree(gA)); CHECK(cudaFree(gBt)); CHECK(cudaFree(gAn));
             CHECK(cudaFree(gBn)); CHECK(cudaFree(gEAL)); CHECK(cudaFree(gEBRf));
@@ -580,14 +591,15 @@ int main(int argc, char **argv) {
             CHECK(cudaEventDestroy(e0)); CHECK(cudaEventDestroy(e1));
             CHECK(cudaEventDestroy(e2));
         }
-        printf("    lowest overhead at %ux%u: %.1f%%\n", bestM, bestN, bestOver);
+        printf("    fastest is %ux%u at %.1f M candidates/s (%.1f%% overhead)\n",
+               bestM, bestN, bestRate, bestOver);
 
-        // A gate, not just a number. If the recurring half of the prepare
-        // stage ever costs more than a fifth of the GEMM it feeds, the shape
-        // or the kernels have regressed and this should say so rather than
-        // quietly halving the hashrate.
-        check("a wide shape keeps the per-attempt prepare under a fifth of the GEMM",
-              bestOver < 20.0, std::to_string(bestOver) + "%");
+        // A gate, not just a number. If the best shape this card can find ever
+        // drops below the square baseline, either a kernel or the shape choice
+        // has regressed - and the failure mode is a quietly halved hashrate,
+        // which nothing else here would notice.
+        check("the best shape beats the square one", bestM != 4096 || bestN != 4096,
+              std::to_string(bestM) + "x" + std::to_string(bestN));
     }
 
 
