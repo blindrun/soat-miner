@@ -16,3 +16,5 @@ tests/test_pearl_gateway
 tests/test_pearl_prepare
 tests/test_pearl_algo
 tests/test_pearl
+build13
+soat-miner-13

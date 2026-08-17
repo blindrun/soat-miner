@@ -28,6 +28,23 @@ NVCC    ?= nvcc
 
 # Newest virtual arch this toolkit supports: compute_90 on CUDA 12.4,
 # compute_120 on 12.8+. This is the one shipped as JIT-forward PTX.
+#
+# The toolkit is a per-architecture choice, measured on pearl-pow:
+#
+#   RTX 5080   CUDA 13.1 native sm_120  268.7 M cand/s   vs 253.7 JIT   +5.9%
+#   RTX 4090   CUDA 13.1                334.6            vs 350.0 (12.4) -4.4%
+#
+# Same 110 registers and no spills either way, so the Ada regression is ptxas
+# scheduling, not allocation. There is no toolkit that wins both here: Ubuntu
+# 26.04 ships only 13-1 and NVIDIA's own repo for 26.04 has only 13-3, so no
+# 12.8/12.9 exists for this glibc. Build Ada with 12.4 and Blackwell with 13.x:
+#
+#   make NVCC=/usr/local/cuda-13.1/bin/nvcc BUILD=build13 BIN=soat-miner-13
+#
+# CUDA 13.1 needs a one-line fix against glibc 2.43, which declares rsqrt and
+# rsqrtf __THROW while CUDA declares them without. Both are marked noexcept in
+# crt/math_functions.h on this box; the original is beside it as
+# .orig-preglibc243. Without it even an empty .cu file fails to compile.
 NVCC_MAX_COMPUTE := $(shell $(NVCC) --list-gpu-arch 2>/dev/null | tail -1)
 NVCC_HAS_BLACKWELL := $(shell $(NVCC) --list-gpu-arch 2>/dev/null | grep -c compute_120)
 
