@@ -46,6 +46,15 @@ bool rawValue(const std::string &j, const char *key, std::string *out) {
         p++;
     } else {
         while (p < j.size() && j[p] != ',' && j[p] != '}' && j[p] != ']') p++;
+        // Trim surrounding whitespace: `"id": 1 ,` is conforming JSON, and the
+        // raw value must compare equal to "1"/"true", not "1 ". A quiet miss
+        // here leaves a discarded subscribe reply on the default extranonce.
+        size_t b = start, e = p;
+        auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        while (b < e && ws(j[b])) b++;
+        while (e > b && ws(j[e - 1])) e--;
+        *out = j.substr(b, e - b);
+        return true;
     }
     *out = j.substr(start, p - start);
     return true;
@@ -93,7 +102,8 @@ std::string unquote(const std::string &s) {
 
 bool StratumSource::sendLine(const std::string &s) {
     const std::string line = s + "\n";
-    return socketSend(fd_, line.data(), line.size()) > 0;
+    // socketSend now writes all bytes or returns -1, so require the full length.
+    return socketSend(fd_, line.data(), line.size()) == (int)line.size();
 }
 
 bool StratumSource::reconnect() {
@@ -238,10 +248,11 @@ void StratumSource::handleLine(const std::string &line) {
                 return;
             }
             j.valid = true;
+            j.jobId = unquote(p[0]);  // carry it with the job, not just in jobId_
 
             std::lock_guard<std::mutex> lk(mu_);
             current_ = j;
-            jobId_ = unquote(p[0]);
+            jobId_ = j.jobId;
             haveJob_ = true;
             return;
         }
@@ -366,12 +377,15 @@ std::string StratumSource::takeJobWarning() {
 }
 
 bool StratumSource::submit(const Job &job, const Solution &sol, std::string *err) {
-    (void)job;
-    std::string id;
+    // The job id must be the one this solution was computed against - a
+    // mining.notify arriving mid-batch updates jobId_, and submitting the old
+    // solution under the new id gets it rejected. So use the id carried in the
+    // job, falling back to the current one only for a job with none.
+    std::string id = !job.jobId.empty() ? job.jobId : "";
     int ownedBits;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        id = jobId_;
+        if (id.empty()) id = jobId_;
         ownedBits = nonceBitsOwned_;
     }
     char nhex[17];

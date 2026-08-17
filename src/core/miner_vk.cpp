@@ -63,7 +63,14 @@ int main(int argc, char **argv) {
         else if (a == "--node") opt.target.host = next();
         else if (a == "--port") opt.target.port = atoi(next().c_str());
         else if (a == "--api-key") opt.target.apiKey = next();
-        else if (a == "--batch") opt.batch = strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--batch") {
+            // The grid launches 256 threads per block and advances the nonce
+            // counter by exactly this many, so it must be a multiple of 256
+            // and non-zero, or batches overlap, skip, or retest forever.
+            uint64_t b = strtoull(next().c_str(), nullptr, 10);
+            if (b < 256) b = 256;
+            opt.batch = b & ~UINT64_C(255);
+        }
         else if (a == "--bench") opt.bench = true;
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
@@ -141,6 +148,9 @@ int main(int argc, char **argv) {
     signal(SIGINT, onSignal);
 #if defined(SIGTERM)
     signal(SIGTERM, onSignal);
+#endif
+#if defined(SIGPIPE)
+    signal(SIGPIPE, SIG_IGN);  // a pool disconnecting mid-send must not kill us
 #endif
 #if defined(_WIN32)
     SetConsoleCtrlHandler(consoleHandler, TRUE);

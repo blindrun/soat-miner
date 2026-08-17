@@ -52,12 +52,30 @@ inline void sleepSeconds(int s) {
     std::this_thread::sleep_for(std::chrono::seconds(s));
 }
 
+// Sends the WHOLE buffer, looping over partial writes, and returns len on
+// success or -1 on error/peer-close. A single send() can accept fewer bytes
+// than asked, so the old "one send, treat any positive as success" truncated
+// JSON silently. MSG_NOSIGNAL keeps a send into a socket the peer already
+// closed from raising SIGPIPE and killing the process.
 inline int socketSend(socket_t fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
 #if defined(_WIN32)
-    return ::send(fd, buf, (int)len, 0);
+        const int n = ::send(fd, buf + off, (int)(len - off), 0);
+#elif defined(MSG_NOSIGNAL)
+        const int n = (int)::send(fd, buf + off, len - off, MSG_NOSIGNAL);
 #else
-    return (int)::send(fd, buf, len, 0);
+        const int n = (int)::send(fd, buf + off, len - off, 0);
 #endif
+        if (n <= 0) {
+#if !defined(_WIN32)
+            if (n < 0 && errno == EINTR) continue;
+#endif
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return (int)off;
 }
 
 inline int socketRecv(socket_t fd, char *buf, size_t len) {

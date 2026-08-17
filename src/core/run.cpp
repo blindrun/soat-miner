@@ -328,7 +328,24 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
 
         sols.clear();
-        if (!algo->search(job, nonce, opt.batch, &sols)) return 1;
+        // Never let a launch cross the owned-subspace boundary. The kernel adds
+        // the thread index to `nonce` by plain addition, so a batch straddling
+        // the boundary carries into the pool's extranonce prefix and mines
+        // nonces we do not own (which the pool then rejects). Shrink the launch
+        // that would cross so it lands exactly on the boundary; the next one
+        // starts fresh at counter 0. `remaining` wraps correctly when the whole
+        // 64-bit nonce is ours (nonceMask all ones), which is the case with no
+        // pool prefix - so this is a no-op for solo and for Pearl.
+        //
+        // NB: `batch` is a nonce count on the pool/node path, but some algorithms
+        // (Pearl) treat it as a candidate budget that is not 1:1 with nonces.
+        // This clamp only ever SHRINKS a launch, which is safe either way - do
+        // not "fix" it into an assumption that exactly `batch` nonces are
+        // consumed, nor into expanding a launch to fill a range.
+        const uint64_t remaining = nonceMask - nonceCounter + 1;
+        const uint64_t batchThisLaunch =
+            (opt.batch < remaining) ? opt.batch : remaining;
+        if (!algo->search(job, nonce, batchThisLaunch, &sols)) return 1;
 
         for (const auto &s : sols) {
             char buf[160];
@@ -388,10 +405,10 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             }
         }
 
-        nonceCounter = (nonceCounter + opt.batch) & nonceMask;
+        nonceCounter = (nonceCounter + batchThisLaunch) & nonceMask;
         nonce = noncePrefix | nonceCounter;
-        intervalHashes += opt.batch;
-        stats.totalNonces += opt.batch;
+        intervalHashes += batchThisLaunch;
+        stats.totalNonces += batchThisLaunch;
 
         // Surface each pool rejection once, with the pool's own words. Without
         // this a miner that is being refused every share looks identical to

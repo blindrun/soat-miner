@@ -32,6 +32,9 @@ struct Job {
     uint64_t target[4] = {};   ///< 256-bit target, limb[0] least significant
     uint64_t epoch = 0;        ///< height/epoch; a change triggers prepare()
     std::string extra;         ///< algorithm-specific payload (e.g. Ergo pk)
+    std::string jobId;         ///< pool's job id; travels with the job so a
+                               ///< solution is submitted under the id it was
+                               ///< computed against, not whatever arrived since
     bool valid = false;
 };
 

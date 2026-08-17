@@ -568,6 +568,19 @@ class Autolykos2VK : public Algorithm {
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VKCHECK(vkBeginCommandBuffer(cmd_, &bi));
+        // Make storage-buffer writes from any earlier dispatch (the dataset
+        // build) visible to this dispatch's shader reads. The fence wait between
+        // dispatches guarantees the prior one finished executing, but execution
+        // completion is not a shader-write -> shader-read memory dependency; that
+        // needs a barrier. Global and cheap, since the fence already serialises
+        // the dispatches. In submission order this depends on the prior submit.
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0,
                                 1, &descSet_, 0, nullptr);
