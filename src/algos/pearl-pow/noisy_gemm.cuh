@@ -410,6 +410,153 @@ __global__ void noisyGemmMmaStaged(const int8_t *__restrict__ A,
     }
 }
 
+/**
+ * As noisyGemmMmaStaged, but each warp owns a 2x2 block of output tiles and
+ * both operands come from shared memory.
+ *
+ * The staged kernel shares A across a block's warps and reads B per warp from
+ * global. That leaves B as the whole traffic story: every 16x16 output tile
+ * pulls 16 columns of B over the full k, so a 4096x32768 GEMM moves about
+ * 16 GB of B - which only runs at all because B_noised at 64 MB still fits the
+ * 4090's 72 MB L2. It is why the shape sweep falls off a cliff at 128 MB.
+ *
+ * Two changes, both aimed at that:
+ *
+ *   * A block of 8 warps is arranged 2 by 4 over a 64x128 output region, so a
+ *     staged A row-strip serves 4 warps and a staged B column-strip serves 2.
+ *   * Each warp computes 2x2 tiles, so one pair of A fragments and one pair of
+ *     B fragments feeds four mma instructions instead of one feeding one.
+ *
+ * Together that is four fragment loads per four mmas rather than two per one,
+ * and both loads come from shared memory rather than L2.
+ *
+ * The transcript trick from noisyGemmMma still holds and has to be repeated
+ * per tile: four accumulators means four slots, but they are indexed by tile
+ * on an unrolled loop rather than by the reduction counter, so they stay in
+ * registers. Indexing by the counter is what spilled before.
+ *
+ * Requires m % 64 == 0, n % 128 == 0, and k and rank multiples of 16.
+ * Launch with 256 threads and grid (n/128, m/64).
+ */
+__global__ void noisyGemmMmaTiled(const int8_t *__restrict__ A,
+                                  const int8_t *__restrict__ B,
+                                  int32_t *__restrict__ cNoised,
+                                  uint32_t *__restrict__ transcripts,
+                                  int m, int n, int k, int rank, bool writeC) {
+    constexpr int kWarpsM = 2, kWarpsN = 4;   // warp grid inside the block
+    constexpr int kTilesM = 2, kTilesN = 2;   // tiles each warp owns
+    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;   // 64 rows
+    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;   // 128 cols
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpM = warp / kWarpsN;
+    const int warpN = warp % kWarpsN;
+
+    const int rowBase = blockIdx.y * kBlockM;
+    const int colBase = blockIdx.x * kBlockN;
+    if (rowBase >= m || colBase >= n) return;
+
+    __shared__ int8_t sA[kBlockM * kMmaK];      // 64 x 16
+    __shared__ int8_t sB[kMmaK * kBlockN];      // 16 x 128
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> cFrag[kTilesM][kTilesN];
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) wmma::fill_fragment(cFrag[i][j], 0);
+
+    uint32_t slot[kTilesM][kTilesN] = {};
+    int reduction = 0;
+
+    for (int p = 0; p < k; p += rank) {
+        if (k - p < rank) break;                 // partial tiles do not fold
+        for (int kk = p; kk < p + rank; kk += kMmaK) {
+            __syncthreads();
+            // 64x16 bytes as 256 int32, one per thread: each row of 16 bytes
+            // is one four-lane group, so a warp covers eight rows per issue.
+            {
+                const int t = threadIdx.x;
+                const int row = t >> 2;
+                const int byte = (t & 3) << 2;
+                *(int32_t *)&sA[row * kMmaK + byte] =
+                    *(const int32_t *)&A[(size_t)(rowBase + row) * k + kk + byte];
+            }
+            // 16x128 bytes as 512 int32, two per thread. Consecutive threads
+            // take consecutive four-byte groups of the same row, so each row
+            // is one fully coalesced 128-byte transaction.
+#pragma unroll
+            for (int rep = 0; rep < 2; rep++) {
+                const int t = threadIdx.x + rep * 256;
+                const int row = t >> 5;
+                const int byte = (t & 31) << 2;
+                *(int32_t *)&sB[row * kBlockN + byte] =
+                    *(const int32_t *)&B[(size_t)(kk + row) * n + colBase + byte];
+            }
+            __syncthreads();
+
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> aFrag[kTilesM];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::row_major> bFrag[kTilesN];
+#pragma unroll
+            for (int i = 0; i < kTilesM; i++) {
+                const int r = (warpM * kTilesM + i) * kHashTile;
+                wmma::load_matrix_sync(aFrag[i], sA + r * kMmaK, kMmaK);
+            }
+#pragma unroll
+            for (int j = 0; j < kTilesN; j++) {
+                const int c = (warpN * kTilesN + j) * kHashTile;
+                wmma::load_matrix_sync(bFrag[j], sB + c, kBlockN);
+            }
+#pragma unroll
+            for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+                for (int j = 0; j < kTilesN; j++)
+                    wmma::mma_sync(cFrag[i][j], aFrag[i], bFrag[j], cFrag[i][j]);
+        }
+
+        // Fold every tile this warp owns, straight off the accumulators.
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+            for (int j = 0; j < kTilesN; j++) {
+                uint32_t v = 0;
+#pragma unroll
+                for (int e = 0; e < cFrag[i][j].num_elements; e++)
+                    v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                if (lane == reduction % kTranscriptU32)
+                    slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
+            }
+        }
+        ++reduction;
+    }
+
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int row = rowBase + (warpM * kTilesM + i) * kHashTile;
+            const int col = colBase + (warpN * kTilesN + j) * kHashTile;
+            if (writeC)
+                wmma::store_matrix_sync(cNoised + (size_t)row * n + col, cFrag[i][j],
+                                        n, wmma::mem_row_major);
+            if (lane < kTranscriptU32) {
+                const int blocksPerRow = n / rank;
+                const int iIdx = row / rank;
+                const int jIdx = col / rank;
+                const int hi = (row % rank) / kHashTile;
+                const int wi = (col % rank) / kHashTile;
+                const int tilesPerSide = rank / kHashTile;
+                const int flat =
+                    ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+                transcripts[flat * kTranscriptU32 + lane] = slot[i][j];
+            }
+        }
+    }
+}
+
 #endif  // tensor cores available
 
 }  // namespace pearl

@@ -333,9 +333,13 @@ class PearlPow : public Algorithm {
         applyNoiseA<<<(aBytes + 255) / 256, 256, 0, stream_>>>(
             dA_, dEAL_, dArF_, dArS_, dAn_, shape_.m, kK, kRank);
 
-        const int warps = 8;
-        dim3 grid((shape_.n / kTileSide + warps - 1) / warps, shape_.m / kTileSide);
-        noisyGemmMmaStaged<<<grid, 256, 0, stream_>>>(
+        // The register-tiled kernel: 1.74x the staged one on a 4090 (4.75 ms
+        // against 8.23 at 4096x32768, 115.8 TOPS against 65.8), because both
+        // operands come from shared memory and one pair of fragment loads
+        // feeds four mma instructions. Every shape in kShapes satisfies its
+        // m % 64 and n % 128 requirement.
+        dim3 grid(shape_.n / 128, shape_.m / 64);
+        noisyGemmMmaTiled<<<grid, 256, 0, stream_>>>(
             dAn_, dBn_, nullptr, dTranscripts_, (int)shape_.m, (int)shape_.n,
             (int)kK, kRank, false);
 

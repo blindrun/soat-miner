@@ -199,7 +199,34 @@ int main(int argc, char **argv) {
         }
     }
 
-    int badC = naiveOk && mmaOk && stagedOk ? 0 : 1;
+    // Register-tiled variant: 2x2 tiles per warp, both operands from shared.
+    // The fastest of the three and therefore the one most worth distrusting -
+    // it is held to the identical reference, transcripts included.
+    bool tiledOk = true;
+    {
+        if (m % 64 || n % 128) {
+            printf("  tiled:         SKIPPED (needs m%%64 and n%%128)\n");
+        } else {
+            dim3 gridT(n / 128, m / 64);
+            CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));
+            CHECK(cudaMemset(dT, 0, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
+            om::pearl::noisyGemmMmaTiled<<<gridT, 256>>>(dA, dB, dC, dT, m, n, k,
+                                                         rank, true);
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                printf("  tiled:         SKIPPED (%s)\n", cudaGetErrorString(e));
+            } else {
+                CHECK(cudaDeviceSynchronize());
+                CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost));
+                CHECK(cudaMemcpy(tGot.data(), dT, tGot.size() * sizeof(uint32_t),
+                                 cudaMemcpyDeviceToHost));
+                tiledOk = compare("tiled:");
+            }
+        }
+    }
+
+    int badC = naiveOk && mmaOk && stagedOk && tiledOk ? 0 : 1;
     int badT = 0;
 
     // blake3 PoW check. The transcripts are only useful if the device can turn

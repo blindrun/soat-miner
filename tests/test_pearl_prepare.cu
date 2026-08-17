@@ -488,8 +488,8 @@ int main(int argc, char **argv) {
             {2048, 32768}, {4096, 32768}, {4096, 65536}};
         const uint32_t bk = 2048, br = 128;
 
-        printf("    %-14s %8s %8s %8s %8s  %s\n", "shape", "attempt", "GEMM",
-               "over%", "Mcand/s", "TOPS");
+        printf("    %-14s %8s %8s %8s %8s %8s  %s\n", "shape", "attempt",
+               "staged", "tiled", "over%", "Mcand/s", "TOPS");
         // Rank by candidates per second, not by overhead. They disagree, and
         // overhead is the misleading one: the widest shape has the lowest
         // overhead and is not the fastest, because B stops fitting in L2 and
@@ -529,12 +529,13 @@ int main(int argc, char **argv) {
                                                                matrixSeed(7, true));
             merkleRoot((const uint8_t *)gBt, bCh, dKey, gScratch, gRoots + 32, s);
 
-            cudaEvent_t e0, e1, e2;
+            cudaEvent_t e0, e1, e2, e3;
             CHECK(cudaEventCreate(&e0));
             CHECK(cudaEventCreate(&e1));
             CHECK(cudaEventCreate(&e2));
+            CHECK(cudaEventCreate(&e3));
 
-            double prepMs = 0, gemmMs = 0;
+            double prepMs = 0, gemmMs = 0, tiledMs = 0;
             const int kReps = 6;
             for (int rep = 0; rep < kReps; rep++) {
                 CHECK(cudaEventRecord(e0, s));
@@ -557,24 +558,39 @@ int main(int argc, char **argv) {
                                                         (int)bm, (int)bn, (int)bk,
                                                         (int)br, false);
                 CHECK(cudaEventRecord(e2, s));
+
+                // The register-tiled kernel over the identical inputs. Both
+                // are held to the same reference in tests/test_pearl.cu, so
+                // this is purely which one is faster.
+                if (bm % 64 == 0 && bn % 128 == 0) {
+                    dim3 gridT(bn / 128, bm / 64);
+                    noisyGemmMmaTiled<<<gridT, 256, 0, s>>>(gAn, gBn, nullptr,
+                                                            gTrans, (int)bm, (int)bn,
+                                                            (int)bk, (int)br, false);
+                }
+                CHECK(cudaEventRecord(e3, s));
                 CHECK(cudaStreamSynchronize(s));
 
-                float a = 0, b = 0;
+                float a = 0, b = 0, c = 0;
                 CHECK(cudaEventElapsedTime(&a, e0, e1));
                 CHECK(cudaEventElapsedTime(&b, e1, e2));
-                if (rep) { prepMs += a; gemmMs += b; }
+                CHECK(cudaEventElapsedTime(&c, e2, e3));
+                if (rep) { prepMs += a; gemmMs += b; tiledMs += c; }
             }
             prepMs /= (kReps - 1);
             gemmMs /= (kReps - 1);
+            tiledMs /= (kReps - 1);
 
+            const double best = (tiledMs > 0 && tiledMs < gemmMs) ? tiledMs : gemmMs;
             const double mac = (double)bm * bn * bk;
-            const double over = 100.0 * prepMs / gemmMs;
+            const double over = 100.0 * prepMs / best;
             char shape[32];
             snprintf(shape, sizeof(shape), "%ux%u", bm, bn);
-            printf("    %-14s %7.3f %8.3f %7.1f%% %8.1f  %.1f\n", shape, prepMs,
-                   gemmMs, over, tiles / ((prepMs + gemmMs) * 1e-3) / 1e6,
-                   2.0 * mac / (gemmMs * 1e-3) / 1e12);
-            const double rate = tiles / ((prepMs + gemmMs) * 1e-3) / 1e6;
+            printf("    %-14s %7.3f %8.3f %8.3f %7.1f%% %8.1f  %.1f\n", shape,
+                   prepMs, gemmMs, tiledMs, over,
+                   tiles / ((prepMs + best) * 1e-3) / 1e6,
+                   2.0 * mac / (best * 1e-3) / 1e12);
+            const double rate = tiles / ((prepMs + best) * 1e-3) / 1e6;
             if (rate > bestRate) {
                 bestRate = rate;
                 bestOver = over;
@@ -589,7 +605,7 @@ int main(int argc, char **argv) {
             CHECK(cudaFree(gRoots)); CHECK(cudaFree(gCA)); CHECK(cudaFree(gCB));
             CHECK(cudaFree(gTrans));
             CHECK(cudaEventDestroy(e0)); CHECK(cudaEventDestroy(e1));
-            CHECK(cudaEventDestroy(e2));
+            CHECK(cudaEventDestroy(e2)); CHECK(cudaEventDestroy(e3));
         }
         printf("    fastest is %ux%u at %.1f M candidates/s (%.1f%% overhead)\n",
                bestM, bestN, bestRate, bestOver);
