@@ -65,10 +65,17 @@ const Shape kShapes[] = {
     // ranking MOVED when the kernel got faster: 4096x32768 was the winner
     // while the GEMM was compute-bound and is well behind now that it is not,
     // because its working set no longer fits L2. Bigger is not better here.
-    {2048, 32768},   // ~160 M candidates/s on a 4090, ~130 MB
-    {2048, 16384},   // ~148
-    {4096, 32768},   // ~94, was the old default
-    {1024, 16384},   // ~129
+    // Per-attempt prepare is dominated by A (Merkle root + noising, both ~m*k)
+    // while candidates go as m*n, so overhead per candidate falls as 1/n and
+    // the widest shape the card can hold tends to win. On a 5080 the sweep
+    // puts 4096x65536 top at 2.1% overhead against 4.1% for 4096x32768 -
+    // and that shape was not in this list at all, so the tuner could not
+    // reach it however hard it measured.
+    {4096, 65536},   // ~340 MB of B in both layouts; needs a 16 GB card
+    {4096, 32768},
+    {2048, 32768},
+    {2048, 16384},
+    {1024, 16384},
     {512, 8192},     // small cards and integrated parts
     {256, 2048},
 };
