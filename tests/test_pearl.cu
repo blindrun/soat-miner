@@ -204,13 +204,13 @@ int main(int argc, char **argv) {
     // measurement on whatever card is present - so a config that is only ever
     // benchmarked and never verified is a trap waiting for a faster GPU.
     bool tiledOk = true;
-#define CHECK_TILED(WM, WN, TM, TN)                                            \
+#define CHECK_TILED_K(KERNEL, TAG, WM, WN, TM, TN)                             \
     {                                                                          \
         constexpr int threads = (WM) * (WN) * 32;                              \
         constexpr int blockM = (WM) * (TM) * 16;                               \
         constexpr int blockN = (WN) * (TN) * 16;                               \
         char label[32];                                                        \
-        snprintf(label, sizeof(label), "tiled %dx%d/%dx%d:", WM, WN, TM, TN);   \
+        snprintf(label, sizeof(label), "%s %dx%d/%dx%d:", TAG, WM, WN, TM, TN); \
         if (m % blockM || n % blockN) {                                        \
             printf("  %-14s SKIPPED (needs m%%%d and n%%%d)\n", label, blockM,  \
                    blockN);                                                    \
@@ -219,8 +219,8 @@ int main(int argc, char **argv) {
             CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));         \
             CHECK(cudaMemset(dT, 0,                                            \
                              (size_t)numTranscripts * 16 * sizeof(uint32_t))); \
-            om::pearl::noisyGemmMmaTiled<WM, WN, TM, TN><<<g, threads>>>(      \
-                dA, dB, dC, dT, m, n, k, rank, true);                          \
+            KERNEL<WM, WN, TM, TN><<<g, threads>>>(dA, dB, dC, dT, m, n, k,   \
+                                                   rank, true);                \
             cudaError_t e = cudaGetLastError();                                \
             if (e != cudaSuccess) {                                            \
                 printf("  %-14s SKIPPED (%s)\n", label, cudaGetErrorString(e)); \
@@ -236,13 +236,31 @@ int main(int argc, char **argv) {
         }                                                                      \
     }
 
+#define CHECK_TILED(WM, WN, TM, TN) \
+    CHECK_TILED_K(om::pearl::noisyGemmMmaTiled, "tiled", WM, WN, TM, TN)
+#define CHECK_DB(WM, WN, TM, TN) \
+    CHECK_TILED_K(om::pearl::noisyGemmMmaTiledDB, "dbuf ", WM, WN, TM, TN)
+
     CHECK_TILED(2, 4, 2, 2)
     CHECK_TILED(2, 4, 4, 2)
     CHECK_TILED(2, 4, 2, 4)
     CHECK_TILED(2, 4, 4, 4)
     CHECK_TILED(4, 2, 2, 2)
     CHECK_TILED(4, 4, 2, 2)
+
+    // The double-buffered variant is held to exactly the same reference. A
+    // prefetch that races is the classic way to make a fast kernel wrong, and
+    // it would show up here as a transcript mismatch rather than as anything
+    // obvious at runtime.
+    CHECK_DB(2, 4, 2, 2)
+    CHECK_DB(2, 4, 4, 2)
+    CHECK_DB(2, 4, 2, 4)
+    CHECK_DB(2, 4, 4, 4)
+    CHECK_DB(4, 2, 2, 2)
+    CHECK_DB(4, 4, 2, 2)
+#undef CHECK_DB
 #undef CHECK_TILED
+#undef CHECK_TILED_K
 
     int badC = naiveOk && mmaOk && stagedOk && tiledOk ? 0 : 1;
     int badT = 0;

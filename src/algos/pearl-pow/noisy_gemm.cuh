@@ -558,6 +558,196 @@ __global__ void noisyGemmMmaTiled(const int8_t *__restrict__ A,
     }
 }
 
+/**
+ * As noisyGemmMmaTiled, but the shared stage is double buffered.
+ *
+ * The single-buffered kernel spends every k-step doing this:
+ *
+ *     __syncthreads(); load global -> shared; __syncthreads(); mma
+ *
+ * The tensor cores are idle across BOTH barriers and for the whole global
+ * load, which at 18-24% of peak is where a lot of the missing time goes. With
+ * two buffers the loads for step i+1 are issued before the mma for step i and
+ * land in the buffer nobody is reading, so a step becomes:
+ *
+ *     issue global loads -> registers; mma from buf[i&1];
+ *     store registers -> buf[(i+1)&1]; __syncthreads()
+ *
+ * One barrier per step instead of two, and the global latency sits underneath
+ * the mma instead of in front of it. The store targets the buffer the compute
+ * is not reading, and by the time that buffer is read again two barriers have
+ * passed, so no extra synchronisation is needed.
+ *
+ * Costs two things: shared memory doubles (still only 4-12 KB), and a handful
+ * of registers hold the in-flight slice. Both are cheap here - occupancy is
+ * not what limits this kernel.
+ */
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN>
+__global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
+                                    const int8_t *__restrict__ B,
+                                    int32_t *__restrict__ cNoised,
+                                    uint32_t *__restrict__ transcripts,
+                                    int m, int n, int k, int rank, bool writeC) {
+    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;
+    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
+    constexpr int kThreads = kWarpsM * kWarpsN * 32;
+    constexpr int kAWords = kBlockM * kMmaK / 4;
+    constexpr int kBWords = kMmaK * kBlockN / 4;
+    // Ceiling division: with an odd word count some threads carry one fewer.
+    constexpr int kARegs = (kAWords + kThreads - 1) / kThreads;
+    constexpr int kBRegs = (kBWords + kThreads - 1) / kThreads;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpM = warp / kWarpsN;
+    const int warpN = warp % kWarpsN;
+
+    const int rowBase = blockIdx.y * kBlockM;
+    const int colBase = blockIdx.x * kBlockN;
+    if (rowBase >= m || colBase >= n) return;
+
+    __shared__ int8_t sA[2][kBlockM * kMmaK];
+    __shared__ int8_t sB[2][kMmaK * kBlockN];
+
+    int32_t regA[kARegs], regB[kBRegs];
+
+    // Only whole rank blocks fold, so the step count is trimmed the same way
+    // the single-buffered loop's `if (k - p < rank) break` trims it.
+    const int dotLen = k - k % rank;
+    const int totalSteps = dotLen / kMmaK;
+    const int stepsPerRank = rank / kMmaK;
+    if (totalSteps <= 0) return;
+
+#define OM_PEARL_LOAD(step)                                                    \
+    {                                                                          \
+        const int kk_ = (step) * kMmaK;                                        \
+        _Pragma("unroll") for (int r = 0; r < kARegs; r++) {                    \
+            const int idx = threadIdx.x + r * kThreads;                        \
+            if (idx < kAWords) {                                               \
+                const int row = idx / (kMmaK / 4);                             \
+                const int byte = (idx % (kMmaK / 4)) * 4;                      \
+                regA[r] = *(const int32_t *)&A[(size_t)(rowBase + row) * k +   \
+                                               kk_ + byte];                    \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll") for (int r = 0; r < kBRegs; r++) {                    \
+            const int idx = threadIdx.x + r * kThreads;                        \
+            if (idx < kBWords) {                                               \
+                const int row = idx / (kBlockN / 4);                           \
+                const int byte = (idx % (kBlockN / 4)) * 4;                    \
+                regB[r] = *(const int32_t *)&B[(size_t)(kk_ + row) * n +       \
+                                               colBase + byte];                \
+            }                                                                  \
+        }                                                                      \
+    }
+
+#define OM_PEARL_STORE(buf)                                                    \
+    {                                                                          \
+        _Pragma("unroll") for (int r = 0; r < kARegs; r++) {                    \
+            const int idx = threadIdx.x + r * kThreads;                        \
+            if (idx < kAWords) {                                               \
+                const int row = idx / (kMmaK / 4);                             \
+                const int byte = (idx % (kMmaK / 4)) * 4;                      \
+                *(int32_t *)&sA[buf][row * kMmaK + byte] = regA[r];            \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll") for (int r = 0; r < kBRegs; r++) {                    \
+            const int idx = threadIdx.x + r * kThreads;                        \
+            if (idx < kBWords) {                                               \
+                const int row = idx / (kBlockN / 4);                           \
+                const int byte = (idx % (kBlockN / 4)) * 4;                    \
+                *(int32_t *)&sB[buf][row * kBlockN + byte] = regB[r];          \
+            }                                                                  \
+        }                                                                      \
+    }
+
+    OM_PEARL_LOAD(0)
+    OM_PEARL_STORE(0)
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> cFrag[kTilesM][kTilesN];
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) wmma::fill_fragment(cFrag[i][j], 0);
+
+    uint32_t slot[kTilesM][kTilesN] = {};
+    int reduction = 0;
+
+    for (int step = 0; step < totalSteps; step++) {
+        const int buf = step & 1;
+        // Issued before the mma so the memory latency hides under the tensor
+        // cores rather than in front of them.
+        if (step + 1 < totalSteps) OM_PEARL_LOAD(step + 1)
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> aFrag[kTilesM];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::row_major> bFrag[kTilesN];
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++) {
+            const int r = (warpM * kTilesM + i) * kHashTile;
+            wmma::load_matrix_sync(aFrag[i], sA[buf] + r * kMmaK, kMmaK);
+        }
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int c = (warpN * kTilesN + j) * kHashTile;
+            wmma::load_matrix_sync(bFrag[j], sB[buf] + c, kBlockN);
+        }
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+            for (int j = 0; j < kTilesN; j++)
+                wmma::mma_sync(cFrag[i][j], aFrag[i], bFrag[j], cFrag[i][j]);
+
+        // Written into the buffer the compute above did not read.
+        if (step + 1 < totalSteps) OM_PEARL_STORE((step + 1) & 1)
+        __syncthreads();
+
+        if ((step + 1) % stepsPerRank == 0) {
+#pragma unroll
+            for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+                for (int j = 0; j < kTilesN; j++) {
+                    uint32_t v = 0;
+#pragma unroll
+                    for (int e = 0; e < cFrag[i][j].num_elements; e++)
+                        v ^= static_cast<uint32_t>(cFrag[i][j].x[e]);
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        v ^= __shfl_xor_sync(0xffffffffu, v, off);
+                    if (lane == reduction % kTranscriptU32)
+                        slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
+                }
+            }
+            ++reduction;
+        }
+    }
+#undef OM_PEARL_LOAD
+#undef OM_PEARL_STORE
+
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int row = rowBase + (warpM * kTilesM + i) * kHashTile;
+            const int col = colBase + (warpN * kTilesN + j) * kHashTile;
+            if (writeC)
+                wmma::store_matrix_sync(cNoised + (size_t)row * n + col, cFrag[i][j],
+                                        n, wmma::mem_row_major);
+            if (lane < kTranscriptU32) {
+                const int blocksPerRow = n / rank;
+                const int iIdx = row / rank;
+                const int jIdx = col / rank;
+                const int hi = (row % rank) / kHashTile;
+                const int wi = (col % rank) / kHashTile;
+                const int tilesPerSide = rank / kHashTile;
+                const int flat =
+                    ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+                transcripts[flat * kTranscriptU32 + lane] = slot[i][j];
+            }
+        }
+    }
+}
+
 #endif  // tensor cores available
 
 }  // namespace pearl

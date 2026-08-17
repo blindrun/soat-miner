@@ -60,10 +60,14 @@ struct Shape {
 };
 
 const Shape kShapes[] = {
-    {4096, 32768},   // ~114 M candidates/s on a 4090, ~180 MB
-    {2048, 32768},   // 102.9
-    {2048, 16384},   //  97.4
-    {1024, 16384},   //  87.4
+    // Ordered by measured candidates/s, largest-first only incidentally. The
+    // ranking MOVED when the kernel got faster: 4096x32768 was the winner
+    // while the GEMM was compute-bound and is well behind now that it is not,
+    // because its working set no longer fits L2. Bigger is not better here.
+    {2048, 32768},   // ~160 M candidates/s on a 4090, ~130 MB
+    {2048, 16384},   // ~148
+    {4096, 32768},   // ~94, was the old default
+    {1024, 16384},   // ~129
     {512, 8192},     // small cards and integrated parts
     {256, 2048},
 };
@@ -105,13 +109,28 @@ void launchTiled(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
         <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
+template <int WM, int WN, int TM, int TN>
+void launchTiledDB(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
+                   const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
+    noisyGemmMmaTiledDB<WM, WN, TM, TN>
+        <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
+}
+
 const TileConfig kTileConfigs[] = {
-    {"2x4/2x2", 64, 128, 256, &launchTiled<2, 4, 2, 2>},
-    {"2x4/4x2", 128, 128, 256, &launchTiled<2, 4, 4, 2>},
-    {"2x4/2x4", 64, 256, 256, &launchTiled<2, 4, 2, 4>},
-    {"2x4/4x4", 128, 256, 256, &launchTiled<2, 4, 4, 4>},
-    {"4x2/2x2", 128, 64, 256, &launchTiled<4, 2, 2, 2>},
-    {"4x4/2x2", 128, 128, 512, &launchTiled<4, 4, 2, 2>},
+    {"single 2x4/2x2", 64, 128, 256, &launchTiled<2, 4, 2, 2>},
+    {"single 2x4/4x2", 128, 128, 256, &launchTiled<2, 4, 4, 2>},
+    {"single 2x4/2x4", 64, 256, 256, &launchTiled<2, 4, 2, 4>},
+    {"single 2x4/4x4", 128, 256, 256, &launchTiled<2, 4, 4, 4>},
+    {"single 4x2/2x2", 128, 64, 256, &launchTiled<4, 2, 2, 2>},
+    {"single 4x4/2x2", 128, 128, 512, &launchTiled<4, 4, 2, 2>},
+    // Double-buffered: prefetch the next k-slice while the tensor cores chew
+    // the current one. 1.6x the single-buffered kernel in isolation.
+    {"dbuf 2x4/2x2", 64, 128, 256, &launchTiledDB<2, 4, 2, 2>},
+    {"dbuf 2x4/4x2", 128, 128, 256, &launchTiledDB<2, 4, 4, 2>},
+    {"dbuf 2x4/2x4", 64, 256, 256, &launchTiledDB<2, 4, 2, 4>},
+    {"dbuf 2x4/4x4", 128, 256, 256, &launchTiledDB<2, 4, 4, 4>},
+    {"dbuf 4x2/2x2", 128, 64, 256, &launchTiledDB<4, 2, 2, 2>},
+    {"dbuf 4x4/2x2", 128, 128, 512, &launchTiledDB<4, 4, 2, 2>},
 };
 
 class PearlPow : public Algorithm {

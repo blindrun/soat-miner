@@ -135,6 +135,13 @@ void launchCfg(dim3 g, int thr, cudaStream_t s, const int8_t *a, const int8_t *b
                                                         k, rank, false);
 }
 
+template <int WM, int WN, int TM, int TN>
+void launchCfgDB(dim3 g, int thr, cudaStream_t s, const int8_t *a,
+                 const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
+    noisyGemmMmaTiledDB<WM, WN, TM, TN><<<g, thr, 0, s>>>(a, b, nullptr, t, m, n,
+                                                          k, rank, false);
+}
+
 const TileCfg kCfgs[] = {
     {"2x4/2x2", 2, 4, 2, 2, 64, 128, 256, &launchCfg<2, 4, 2, 2>},
     {"2x4/4x2", 2, 4, 4, 2, 128, 128, 256, &launchCfg<2, 4, 4, 2>},
@@ -156,6 +163,11 @@ const TileCfg *findCfg(const int c[4]) {
 int main(int argc, char **argv) {
     int bestCfg[4] = {2, 4, 4, 2}, secondCfg[4] = {2, 4, 2, 2};
     char bestName[32] = "2x4/4x2", secondName[32] = "2x4/2x2";
+    // Sections 8 and 9 run at whatever shape section 7 measured fastest, not a
+    // constant. The optimum moved once the kernel got faster - a shape that
+    // wins when the GEMM is compute-bound loses when it is not - so pinning it
+    // would have both later sections measuring a shape the miner would not use.
+    uint32_t bestShapeM = 2048, bestShapeN = 32768;
     if (argc < 2) {
         fprintf(stderr, "usage: %s <pearl_job_vectors.bin>\n", argv[0]);
         return 2;
@@ -538,6 +550,7 @@ int main(int argc, char **argv) {
         uint32_t bestM = 0, bestN = 0;
         for (size_t si = 0; si < sizeof(kShapes) / sizeof(kShapes[0]); si++) {
             const uint32_t bm = kShapes[si].m, bn = kShapes[si].n;
+            if (bm % 128 || bn % 256) continue;   // the kernel's block shape
             const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
             const uint32_t aCh = (uint32_t)(aBytes / kChunkLen);
             const uint32_t bCh = (uint32_t)(bBytes / kChunkLen);
@@ -612,8 +625,8 @@ int main(int argc, char **argv) {
                 // kernel - 8.2 ms of heavy work immediately before it evicts
                 // L2 and heats the card. Kernels get compared in section 8,
                 // one at a time; this section is about the shape.
-                dim3 gridT(bn / 128, bm / 128);
-                noisyGemmMmaTiled<2, 4, 4, 2><<<gridT, 256, 0, s>>>(
+                dim3 gridT(bn / 256, bm / 128);
+                noisyGemmMmaTiledDB<2, 4, 4, 4><<<gridT, 256, 0, s>>>(
                     gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
                     false);
                 CHECK(cudaEventRecord(e2, s));
@@ -654,6 +667,8 @@ int main(int argc, char **argv) {
         }
         printf("    fastest is %ux%u at %.1f M candidates/s (%.1f%% overhead)\n",
                bestM, bestN, bestRate, bestOver);
+        bestShapeM = bestM;
+        bestShapeN = bestN;
 
         // A gate, not just a number. If the best shape this card can find ever
         // drops below the square baseline, either a kernel or the shape choice
@@ -665,14 +680,15 @@ int main(int argc, char **argv) {
 
 
     // ------------------------------------------------------------------
-    printf("8. GEMM tile configurations, at the shape that won\n");
+    printf("8. GEMM tile configurations, at %ux%u (section 7's winner)\n",
+           bestShapeM, bestShapeN);
     {
         // The tiled kernel trades arithmetic intensity against register
         // pressure, and where that balance lands is a property of the card
         // rather than of the algorithm - so it is swept, not guessed. Each
         // warp holds kTilesM*kTilesN accumulator fragments of eight int32, so
         // 4x4 is 128 registers of accumulator alone and may well spill.
-        const uint32_t bm = 4096, bn = 32768, bk = 2048, br = 128;
+        const uint32_t bm = bestShapeM, bn = bestShapeN, bk = 2048, br = 128;
         const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
         const uint32_t tiles = (bm / 16) * (bn / 16);
 
@@ -695,7 +711,7 @@ int main(int argc, char **argv) {
         // on. The ranking is not the same across architectures - see below.
         double bestMs = 1e9, secondMs = 1e9;
 
-#define SWEEP(WM, WN, TM, TN)                                                  \
+#define SWEEP_K(KERNEL, TAG, WM, WN, TM, TN)                                   \
         {                                                                      \
             constexpr int threads = (WM) * (WN) * 32;                          \
             constexpr int blockM = (WM) * (TM) * 16;                           \
@@ -705,7 +721,7 @@ int main(int argc, char **argv) {
                 double ms = 0;                                                 \
                 for (int rep = 0; rep < 4; rep++) {                            \
                     CHECK(cudaEventRecord(a, s));                              \
-                    noisyGemmMmaTiled<WM, WN, TM, TN><<<g, threads, 0, s>>>(   \
+                    KERNEL<WM, WN, TM, TN><<<g, threads, 0, s>>>(              \
                         gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk,  \
                         (int)br, false);                                       \
                     CHECK(cudaEventRecord(b, s));                              \
@@ -716,22 +732,22 @@ int main(int argc, char **argv) {
                 }                                                              \
                 ms /= 3;                                                       \
                 const double mac = (double)bm * bn * bk;                       \
-                printf("    warps %dx%d tiles %dx%d  block %3dx%3d  %2d acc  " \
-                       "%7.3f ms  %6.1f TOPS\n", WM, WN, TM, TN, blockM,       \
+                printf("    %s %dx%d/%dx%d  block %3dx%3d  %2d acc  "         \
+                       "%7.3f ms  %6.1f TOPS\n", TAG, WM, WN, TM, TN, blockM,   \
                        blockN, (TM) * (TN), ms, 2.0 * mac / (ms * 1e-3) / 1e12);\
                 if (ms < bestMs) {                                             \
                     secondMs = bestMs;                                         \
                     memcpy(secondName, bestName, sizeof(secondName));          \
                     memcpy(secondCfg, bestCfg, sizeof(secondCfg));             \
                     bestMs = ms;                                               \
-                    snprintf(bestName, sizeof(bestName), "%dx%d/%dx%d", WM, WN,\
-                             TM, TN);                                          \
+                    snprintf(bestName, sizeof(bestName), "%s%dx%d/%dx%d", TAG, \
+                             WM, WN, TM, TN);                                  \
                     int c[4] = {WM, WN, TM, TN};                               \
                     memcpy(bestCfg, c, sizeof(bestCfg));                       \
                 } else if (ms < secondMs) {                                    \
                     secondMs = ms;                                             \
-                    snprintf(secondName, sizeof(secondName), "%dx%d/%dx%d",    \
-                             WM, WN, TM, TN);                                  \
+                    snprintf(secondName, sizeof(secondName), "%s%dx%d/%dx%d",  \
+                             TAG, WM, WN, TM, TN);                             \
                     int c[4] = {WM, WN, TM, TN};                               \
                     memcpy(secondCfg, c, sizeof(secondCfg));                   \
                 }                                                              \
@@ -762,6 +778,9 @@ int main(int argc, char **argv) {
                    2.0 * (double)bm * bn * bk / (ms * 1e-3) / 1e12);
         }
 
+#define SWEEP(WM, WN, TM, TN)    SWEEP_K(noisyGemmMmaTiled, "single", WM, WN, TM, TN)
+#define SWEEP_DB(WM, WN, TM, TN) SWEEP_K(noisyGemmMmaTiledDB, "dbuf  ", WM, WN, TM, TN)
+
         SWEEP(2, 4, 2, 2)
         SWEEP(4, 2, 2, 2)
         SWEEP(2, 4, 4, 2)
@@ -770,7 +789,16 @@ int main(int argc, char **argv) {
         SWEEP(4, 4, 2, 2)
         SWEEP(2, 8, 2, 2)
         SWEEP(4, 4, 2, 4)
+
+        SWEEP_DB(2, 4, 2, 2)
+        SWEEP_DB(4, 2, 2, 2)
+        SWEEP_DB(2, 4, 4, 2)
+        SWEEP_DB(2, 4, 2, 4)
+        SWEEP_DB(2, 4, 4, 4)
+        SWEEP_DB(4, 4, 2, 2)
+#undef SWEEP_DB
 #undef SWEEP
+#undef SWEEP_K
 
         printf("    fastest: %s at %.3f ms (%.1f TOPS), %.1f M candidates/s\n",
                bestName, bestMs,
@@ -785,17 +813,25 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
-    printf("9. does the kernel win survive the pipeline?\n");
+    printf("9. relative check: does the isolated winner win in a pipeline?\n");
     {
-        // Section 8 says 2x4/4x2 beats 2x4/2x2 by 24% with nothing else
-        // running. Section 7 says the whole attempt barely moved. Both cannot
-        // be the number that matters, so this settles it the way this repo
-        // learned to: A and B INTERLEAVED, not one after the other, because
-        // sequential runs drift with clocks and cache state.
+        // RELATIVE ONLY. The absolute milliseconds here run about 3x slower
+        // than sections 7 and 8 report for the identical kernel and shape, and
+        // slower than the miner itself achieves - `[pearl-pow] tile` prints
+        // 1.49 ms where this prints 4.6. Ruled out: thermal (a hot second run
+        // is FASTER, clocks hold at 2775 MHz), the A-chain evicting L2 (a
+        // control with no A-chain is just as slow), and ordering within this
+        // section (running the control first changes nothing). What is left is
+        // an allocator/placement artifact of running after section 8 has
+        // churned a dozen kernel variants and ~85 MB of buffers.
         //
-        // Each rep runs a real attempt - A's chain, then the GEMM - and
-        // alternates which kernel finishes it.
-        const uint32_t bm = 4096, bn = 32768, bk = 2048, br = 128;
+        // So do not read the absolutes off this section - section 7 and the
+        // miner's own startup measurement are the representative ones. What
+        // this section still answers correctly is the RELATIVE question, since
+        // both configurations meet the identical conditions: A and B
+        // INTERLEAVED, not one after the other, because sequential runs drift
+        // with clocks and cache state.
+        const uint32_t bm = bestShapeM, bn = bestShapeN, bk = 2048, br = 128;
         const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
         const uint32_t aCh = (uint32_t)(aBytes / kChunkLen);
         const uint32_t bCh = (uint32_t)(bBytes / kChunkLen);
@@ -835,6 +871,30 @@ int main(int argc, char **argv) {
         CHECK(cudaEventCreate(&b));
         double ms[2] = {0, 0};
         int reps[2] = {0, 0};
+        // Control FIRST, before the interleaved loop touches anything:
+        // the same kernel, same buffers, same allocation context - but
+        // back to back with NO A-chain between runs. Section 7 and section 8
+        // disagreed by 3x on this kernel at this shape, and the only way to
+        // tell "the A-chain evicts B from L2" from "these two differ in
+        // some other way" is to remove the A-chain and change nothing else.
+        double ctrlMs = 0;
+        {
+            const TileCfg *tc = findCfg(bestCfg);
+            dim3 g(bn / tc->blockN, bm / tc->blockM);
+            for (int rep = 0; rep < 5; rep++) {
+                CHECK(cudaEventRecord(a, s));
+                tc->launch(g, tc->threads, s, gAn, gBn, gTrans, (int)bm, (int)bn,
+                           (int)bk, (int)br);
+                CHECK(cudaEventRecord(b, s));
+                CHECK(cudaStreamSynchronize(s));
+                float d = 0;
+                CHECK(cudaEventElapsedTime(&d, a, b));
+                if (rep) ctrlMs += d;
+            }
+            ctrlMs /= 4;
+        }
+
+
         for (int rep = 0; rep < 12; rep++) {
             const int which = rep & 1;
             genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, s>>>(
@@ -866,6 +926,10 @@ int main(int argc, char **argv) {
         printf("    %s (1st in section 8) live: %.3f ms  %.1f TOPS\n",
                bestName, ms[1], 2.0 * mac / (ms[1] * 1e-3) / 1e12);
         printf("    gap here %.1f%%\n", 100.0 * (ms[0] - ms[1]) / ms[0]);
+        printf("    SAME kernel back-to-back, no A-chain: %.3f ms  %.1f TOPS\n",
+               ctrlMs, 2.0 * mac / (ctrlMs * 1e-3) / 1e12);
+        printf("    -> the A-chain costs the GEMM %.1f%% beyond its own %.2f ms\n",
+               100.0 * (ms[1] - ctrlMs) / ctrlMs, 0.0);
 
         // The claim under test is that an ISOLATED kernel benchmark predicts
         // the pipeline, not that any particular configuration wins - which one
