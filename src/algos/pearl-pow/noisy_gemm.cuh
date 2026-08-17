@@ -1023,6 +1023,31 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
 // Defined for every device pass so the host launcher links on a multi-arch
 // build; mmaS8 itself falls back to a no-op below sm_80 and the host tuner
 // refuses to select this kernel there (TileConfig::minArch).
+/**
+ * Load four 8x8 b16 tiles from shared in one instruction.
+ *
+ * The fragment loads were four separate 32-bit shared reads each, running 32
+ * loads per k-slice against 32 mma - one issue slot apiece, on a kernel whose
+ * top stall is math_pipe_throttle. ldmatrix collapses each fragment to one
+ * instruction and hands back the same register distribution the mma wants.
+ *
+ * Thread t supplies the address of row (t%8) of matrix (t/8), and matrix i
+ * lands in register i. Callers choose what each matrix means purely by the
+ * address they pass, which is how one instruction serves both the A fragment
+ * (rows, then k-halves) and the B fragment (columns, then k-halves).
+ */
+__device__ __forceinline__ void ldmatrixX4(uint32_t r[4], const void *src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+#else
+    (void)src;
+    r[0] = r[1] = r[2] = r[3] = 0;
+#endif
+}
+
 __device__ __forceinline__ void mmaS8(uint32_t d[4], const uint32_t a[4],
                                       const uint32_t b[2], const uint32_t c[4]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -1138,37 +1163,39 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
         __pipeline_wait_prior(kStages - 2);
         __syncthreads();
 
+        // One ldmatrix per fragment instead of four scalar loads. The lane
+        // splits into which row-of-eight it addresses (r) and which of the
+        // four 8x8 tiles it feeds (q); the tile index chooses the row half and
+        // the k half, in exactly the order the mma wants its four registers.
+        const int ldRow = (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int ldOff = ((lane >> 3) >> 1) * 16;
+
         uint32_t aReg[kTilesM][4], bReg[kTilesN][2][2];
 #pragma unroll
         for (int i = 0; i < kTilesM; i++) {
-            const int r0 = (warpM * kTilesM + i) * kHashTile + (lane >> 2);
-            const int byte = (lane & 3) * 4;
-            const int8_t *p = &sA[stage][r0 * kAStride + byte];
-            aReg[i][0] = *(const uint32_t *)(p);
-            aReg[i][1] = *(const uint32_t *)(p + 8 * kAStride);
-            aReg[i][2] = *(const uint32_t *)(p + 16);
-            aReg[i][3] = *(const uint32_t *)(p + 8 * kAStride + 16);
+            const int row = (warpM * kTilesM + i) * kHashTile + ldRow;
+            ldmatrixX4(aReg[i], &sA[stage][row * kAStride + ldOff]);
         }
 #pragma unroll
         for (int j = 0; j < kTilesN; j++) {
-#pragma unroll
-            for (int h = 0; h < 2; h++) {          // the tile's two n-halves
-                // b0 and b1 differ by COLUMN, not by k: the fragment is eight
-                // columns wide and threadID_in_group only spans four, so the
-                // second register picks up columns 4-7. Getting this wrong
-                // reads the right bytes in the wrong places and produces a
-                // plausible, entirely incorrect product.
-                // groupID picks the COLUMN and threadID_in_group picks k -
-                // the opposite of A, and the opposite of what the operand
-                // order suggests. Established by running a single mma against
-                // a CPU product (scratchpad/mmaprobe.cu) rather than reasoning
-                // about it; three plausible readings were all wrong.
-                const int col = (warpN * kTilesN + j) * kHashTile + h * 8 + (lane >> 2);
-                const int kOff = (lane & 3) * 4;
-                const int8_t *pb = &sB[stage][col * kBStride + kOff];
-                bReg[j][h][0] = *(const uint32_t *)(pb);
-                bReg[j][h][1] = *(const uint32_t *)(pb + 16);
-            }
+            // B is n-major, so its "rows" are columns of B and the same
+            // ldmatrix serves it. The four tiles come back as (cols 0-7, low
+            // k), (cols 8-15, low k), (cols 0-7, high k), (cols 8-15, high k),
+            // which is bReg[j][h][e] with h the column half and e the k half -
+            // hence the deinterleave rather than a straight copy.
+            //
+            // For the record of what the layout is, since the loads no longer
+            // spell it out: groupID picks the COLUMN and threadID_in_group
+            // picks k, the opposite of A. Established by running a single mma
+            // against a CPU product (scratchpad/mmaprobe.cu), not by reading
+            // the operand order - three plausible readings were all wrong.
+            const int col = (warpN * kTilesN + j) * kHashTile + ldRow;
+            uint32_t t[4];
+            ldmatrixX4(t, &sB[stage][col * kBStride + ldOff]);
+            bReg[j][0][0] = t[0];
+            bReg[j][1][0] = t[1];
+            bReg[j][0][1] = t[2];
+            bReg[j][1][1] = t[3];
         }
 #pragma unroll
         for (int i = 0; i < kTilesM; i++)

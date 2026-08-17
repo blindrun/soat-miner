@@ -322,6 +322,15 @@ int main(int argc, char **argv) {
         CHECK_PTX(2, 4, 2, 2)
         CHECK_PTX(2, 4, 4, 2)
         CHECK_PTX(2, 4, 4, 4)
+        // Every geometry kTileConfigs can select has to be checked here. These
+        // two are the 16-warp shapes ldmatrix made worth shipping; without
+        // this they would be selectable on someone's card and never verified.
+        CHECK_PTX(4, 4, 4, 2)
+        CHECK_PTX(4, 4, 2, 4)
+        CHECK_PTX(4, 2, 2, 2)
+        CHECK_PTX(4, 4, 2, 2)
+        CHECK_PTX(2, 4, 2, 4)
+        CHECK_PTX(8, 2, 2, 2)
 #undef CHECK_PTX
         CHECK(cudaFree(dBn));
     }

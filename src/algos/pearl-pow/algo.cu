@@ -177,6 +177,13 @@ const TileConfig kTileConfigs[] = {
     {"ptx 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4>},
     {"ptx 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2>},
     {"ptx 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2>},
+    // Sixteen-warp geometries. These lost while the fragment loads were four
+    // scalar shared reads apiece - the extra warps had no issue slots to use.
+    // With ldmatrix collapsing each fragment to one instruction, 4x4/4x2 went
+    // from 323.5 to 363.2 TOPS and became the fastest thing on a 4090.
+    {"ptx 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2>},
+    {"ptx 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4>},
+    {"ptx 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2>},
 };
 
 class PearlPow : public Algorithm {
