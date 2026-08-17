@@ -440,6 +440,43 @@ inline void commitments(const uint8_t aRoot[32], const uint8_t btRoot[32],
     b3::hash(nullptr, buf, 64, commitA);
 }
 
+// ------------------------------------------------------- matrix generation
+//
+// A and B ARE the nonce, so they have to be reproducible on the host: a win is
+// found on the device and then re-derived here to build the Merkle opening,
+// which needs the whole matrix rather than the sixteen rows it discloses.
+//
+// The device twin is om::pearl::genMatrix in prepare.cuh, and the test checks
+// the two agree byte for byte. Regenerating rather than reading 16 MB back per
+// attempt is the whole point.
+
+inline uint64_t splitmix(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/** Distinct streams for A and B from one attempt number. */
+inline uint64_t matrixSeed(uint64_t nonce, bool forB) {
+    return splitmix(nonce ^ (forB ? 0xB1B1B1B1B1B1B1B1ULL : 0xA0A0A0A0A0A0A0A0ULL));
+}
+
+/**
+ * Fill an int8 matrix with values in [-64, 63]. `count` must be a multiple of
+ * eight.
+ *
+ * That range is not a style choice: A and B have to leave room for noise in
+ * [-63, 63] without overflowing int8, and the verifier checks it.
+ */
+inline void fillMatrix(int8_t *out, size_t count, uint64_t seed) {
+    for (size_t group = 0; group * 8 < count; group++) {
+        const uint64_t v = splitmix(seed + group);
+        for (int i = 0; i < 8; i++)
+            out[group * 8 + i] = (int8_t)((int)((v >> (8 * i)) & 0x7F) - 64);
+    }
+}
+
 // ------------------------------------------------------------------ noise
 //
 // The four noise matrices are derived from the two commitments, so they change
@@ -583,9 +620,9 @@ struct Noise {
 // columns, which is why the same routine can stand in for both.
 
 constexpr int kTranscriptWords = 16;         // 64 bytes, one blake3 block
-constexpr int kRotation = 13;
+constexpr int kTranscriptRotation = 13;   // noisy_gemm.cuh names its own copy kRotation
 
-inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+inline uint32_t rotl32h(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 
 /**
  * Fold the transcript of the tile at (tRow, tCol) from the noised matrices.
@@ -617,7 +654,7 @@ inline void tileTranscript(const int8_t *aNoised, const int8_t *bNoised, size_t 
         uint32_t h = 0;
         for (size_t i = 0; i < acc.size(); i++) h ^= (uint32_t)acc[i];
         const int slot = step % kTranscriptWords;
-        out[slot] = rotl32(out[slot], kRotation) ^ h;
+        out[slot] = rotl32h(out[slot], kTranscriptRotation) ^ h;
         step++;
     }
 }
