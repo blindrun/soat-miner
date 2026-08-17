@@ -699,14 +699,22 @@ int main(int argc, char **argv) {
         const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
         const uint32_t tiles = (bm / 16) * (bn / 16);
 
-        int8_t *gAn, *gBn;
+        // gBnT is the same size and the same random junk, standing in for the
+        // n-major layout the raw-mma kernel reads. This section times kernels;
+        // it does not check them - the layout is proved correct against the
+        // reference vectors in test_pearl.cu, and timing does not depend on
+        // the values, only on the access pattern, which is what differs.
+        int8_t *gAn, *gBn, *gBnT;
         uint32_t *gTrans;
         CHECK(cudaMalloc(&gAn, aBytes));
         CHECK(cudaMalloc(&gBn, bBytes));
+        CHECK(cudaMalloc(&gBnT, bBytes));
         CHECK(cudaMalloc(&gTrans, (size_t)tiles * 16 * sizeof(uint32_t)));
         genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, s>>>((int8_t *)gAn, aBytes,
                                                            matrixSeed(8, false));
         genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, s>>>((int8_t *)gBn, bBytes,
+                                                           matrixSeed(8, true));
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, s>>>((int8_t *)gBnT, bBytes,
                                                            matrixSeed(8, true));
 
         cudaEvent_t a, b;
@@ -785,6 +793,42 @@ int main(int argc, char **argv) {
                    2.0 * (double)bm * bn * bk / (ms * 1e-3) / 1e12);
         }
 
+// Same body, but reading the n-major copy of B. Kept as a separate macro
+// rather than a flag so a wrong-layout launch cannot happen by omission.
+#define SWEEP_PTX(WM, WN, TM, TN)                                              \
+        {                                                                      \
+            constexpr int threads = (WM) * (WN) * 32;                          \
+            constexpr int blockM = (WM) * (TM) * 16;                           \
+            constexpr int blockN = (WN) * (TN) * 16;                           \
+            if (bm % blockM == 0 && bn % blockN == 0) {                         \
+                dim3 g(bn / blockN, bm / blockM);                              \
+                double ms = 0;                                                 \
+                for (int rep = 0; rep < 4; rep++) {                            \
+                    CHECK(cudaEventRecord(a, s));                              \
+                    noisyGemmPtx<WM, WN, TM, TN><<<g, threads, 0, s>>>(        \
+                        gAn, gBnT, nullptr, gTrans, (int)bm, (int)bn, (int)bk, \
+                        (int)br, false);                                       \
+                    CHECK(cudaEventRecord(b, s));                              \
+                    CHECK(cudaStreamSynchronize(s));                           \
+                    float d = 0;                                               \
+                    CHECK(cudaEventElapsedTime(&d, a, b));                     \
+                    if (rep) ms += d;                                          \
+                }                                                              \
+                ms /= 3;                                                       \
+                const double mac = (double)bm * bn * bk;                       \
+                printf("    ptx    %dx%d/%dx%d  block %3dx%3d  %2d acc  "      \
+                       "%7.3f ms  %6.1f TOPS\n", WM, WN, TM, TN, blockM,       \
+                       blockN, (TM) * (TN), ms, 2.0 * mac / (ms * 1e-3) / 1e12);\
+                if (ms < bestMs) {                                             \
+                    secondMs = bestMs;                                         \
+                    memcpy(secondName, bestName, sizeof(secondName));          \
+                    bestMs = ms;                                               \
+                    snprintf(bestName, sizeof(bestName), "ptx   %dx%d/%dx%d",  \
+                             WM, WN, TM, TN);                                  \
+                }                                                              \
+            }                                                                  \
+        }
+
 #define SWEEP(WM, WN, TM, TN)    SWEEP_K(noisyGemmMmaTiled, "single", WM, WN, TM, TN)
 #define SWEEP_DB(WM, WN, TM, TN) SWEEP_K(noisyGemmMmaTiledDB, "dbuf  ", WM, WN, TM, TN)
 
@@ -810,6 +854,13 @@ int main(int argc, char **argv) {
         SWEEP_AS(2, 4, 2, 4)
         SWEEP_AS(2, 4, 4, 4)
         SWEEP_AS(4, 4, 2, 2)
+        SWEEP_PTX(2, 4, 2, 2)
+        SWEEP_PTX(4, 2, 2, 2)
+        SWEEP_PTX(2, 4, 4, 2)
+        SWEEP_PTX(2, 4, 2, 4)
+        SWEEP_PTX(2, 4, 4, 4)
+        SWEEP_PTX(4, 4, 2, 2)
+#undef SWEEP_PTX
 #undef SWEEP_AS
 #undef SWEEP_DB
 #undef SWEEP
@@ -822,6 +873,7 @@ int main(int argc, char **argv) {
 
         CHECK(cudaFree(gAn));
         CHECK(cudaFree(gBn));
+        CHECK(cudaFree(gBnT));
         CHECK(cudaFree(gTrans));
         CHECK(cudaEventDestroy(a));
         CHECK(cudaEventDestroy(b));

@@ -27,6 +27,7 @@
 // in Solution::extra.
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <string>
@@ -98,6 +99,18 @@ constexpr int kTileSide = 16;
 struct TileConfig {
     const char *name;
     int blockM, blockN, threads;
+    // The raw-mma kernel wants B stored n-major, because its B fragment reads
+    // four consecutive k for one column. Both layouts are built once per job
+    // (B is per-job work), so carrying a flag here costs nothing and keeps the
+    // two kernel families in one table the tuner can sweep uniformly.
+    bool nMajorB;
+    // Minimum compute capability x10. The pre-Ampere fallbacks inside the
+    // Ampere-only kernels are no-ops so the code still links for an sm_75
+    // device pass - which means on such a card the tuner would time an empty
+    // kernel, find it unbeatable, and select a configuration that mines
+    // nothing at a spectacular rate. Skipping by capability is the fix; a
+    // failed launch is not a reliable signal when the fallback succeeds.
+    int minArch;
     void (*launch)(dim3, int, cudaStream_t, const int8_t *, const int8_t *,
                    uint32_t *, int, int, int, int);
 };
@@ -124,30 +137,46 @@ void launchTiledAsync(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
         <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
+template <int WM, int WN, int TM, int TN>
+void launchPtx(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
+               const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
+    noisyGemmPtx<WM, WN, TM, TN>
+        <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
+}
+
 const TileConfig kTileConfigs[] = {
-    {"single 2x4/2x2", 64, 128, 256, &launchTiled<2, 4, 2, 2>},
-    {"single 2x4/4x2", 128, 128, 256, &launchTiled<2, 4, 4, 2>},
-    {"single 2x4/2x4", 64, 256, 256, &launchTiled<2, 4, 2, 4>},
-    {"single 2x4/4x4", 128, 256, 256, &launchTiled<2, 4, 4, 4>},
-    {"single 4x2/2x2", 128, 64, 256, &launchTiled<4, 2, 2, 2>},
-    {"single 4x4/2x2", 128, 128, 512, &launchTiled<4, 4, 2, 2>},
+    {"single 2x4/2x2", 64, 128, 256, false, 70, &launchTiled<2, 4, 2, 2>},
+    {"single 2x4/4x2", 128, 128, 256, false, 70, &launchTiled<2, 4, 4, 2>},
+    {"single 2x4/2x4", 64, 256, 256, false, 70, &launchTiled<2, 4, 2, 4>},
+    {"single 2x4/4x4", 128, 256, 256, false, 70, &launchTiled<2, 4, 4, 4>},
+    {"single 4x2/2x2", 128, 64, 256, false, 70, &launchTiled<4, 2, 2, 2>},
+    {"single 4x4/2x2", 128, 128, 512, false, 70, &launchTiled<4, 4, 2, 2>},
     // Double-buffered: prefetch the next k-slice while the tensor cores chew
     // the current one. 1.6x the single-buffered kernel in isolation.
-    {"dbuf 2x4/2x2", 64, 128, 256, &launchTiledDB<2, 4, 2, 2>},
-    {"dbuf 2x4/4x2", 128, 128, 256, &launchTiledDB<2, 4, 4, 2>},
-    {"dbuf 2x4/2x4", 64, 256, 256, &launchTiledDB<2, 4, 2, 4>},
-    {"dbuf 2x4/4x4", 128, 256, 256, &launchTiledDB<2, 4, 4, 4>},
-    {"dbuf 4x2/2x2", 128, 64, 256, &launchTiledDB<4, 2, 2, 2>},
-    {"dbuf 4x4/2x2", 128, 128, 512, &launchTiledDB<4, 4, 2, 2>},
+    {"dbuf 2x4/2x2", 64, 128, 256, false, 70, &launchTiledDB<2, 4, 2, 2>},
+    {"dbuf 2x4/4x2", 128, 128, 256, false, 70, &launchTiledDB<2, 4, 4, 2>},
+    {"dbuf 2x4/2x4", 64, 256, 256, false, 70, &launchTiledDB<2, 4, 2, 4>},
+    {"dbuf 2x4/4x4", 128, 256, 256, false, 70, &launchTiledDB<2, 4, 4, 4>},
+    {"dbuf 4x2/2x2", 128, 64, 256, false, 70, &launchTiledDB<4, 2, 2, 2>},
+    {"dbuf 4x4/2x2", 128, 128, 512, false, 70, &launchTiledDB<4, 4, 2, 2>},
     // cp.async, three stages. Ampere and later only - on an older card the
     // launch fails with "invalid device function" and pickTileConfig() skips
     // it, which is exactly the behaviour wanted rather than a build-time split.
-    {"async 2x4/2x2", 64, 128, 256, &launchTiledAsync<2, 4, 2, 2>},
-    {"async 2x4/4x2", 128, 128, 256, &launchTiledAsync<2, 4, 4, 2>},
-    {"async 2x4/2x4", 64, 256, 256, &launchTiledAsync<2, 4, 2, 4>},
-    {"async 2x4/4x4", 128, 256, 256, &launchTiledAsync<2, 4, 4, 4>},
-    {"async 4x2/2x2", 128, 64, 256, &launchTiledAsync<4, 2, 2, 2>},
-    {"async 4x4/2x2", 128, 128, 512, &launchTiledAsync<4, 4, 2, 2>},
+    {"async 2x4/2x2", 64, 128, 256, false, 80, &launchTiledAsync<2, 4, 2, 2>},
+    {"async 2x4/4x2", 128, 128, 256, false, 80, &launchTiledAsync<2, 4, 4, 2>},
+    {"async 2x4/2x4", 64, 256, 256, false, 80, &launchTiledAsync<2, 4, 2, 4>},
+    {"async 2x4/4x4", 128, 256, 256, false, 80, &launchTiledAsync<2, 4, 4, 4>},
+    {"async 4x2/2x2", 128, 64, 256, false, 80, &launchTiledAsync<4, 2, 2, 2>},
+    {"async 4x4/2x2", 128, 128, 512, false, 80, &launchTiledAsync<4, 4, 2, 2>},
+    // Raw mma.m16n8k32. WMMA's m16n16k16 needs two issues to cover the same
+    // k that Ampere's native shape does in one, and the profiler had Tensor as
+    // the busiest pipeline, so halving the issues is the point.
+    {"ptx 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2>},
+    {"ptx 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2>},
+    {"ptx 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4>},
+    {"ptx 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4>},
+    {"ptx 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2>},
+    {"ptx 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2>},
 };
 
 class PearlPow : public Algorithm {
@@ -177,6 +206,12 @@ class PearlPow : public Algorithm {
     bool prepare(const Job &job) override {
         (void)job;
         if (allocated_) return true;
+
+        cudaDeviceProp prop{};
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+            arch10_ = prop.major * 10 + prop.minor;
 
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) return false;
@@ -262,6 +297,13 @@ class PearlPow : public Algorithm {
         *bestCfg = 0;
         for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
             const TileConfig &tc = kTileConfigs[i];
+            if (arch10_ && arch10_ < tc.minArch) continue;
+            // Escape hatch for A/B work: SOAT_PEARL_TILE=ptx restricts the
+            // sweep to configurations whose name starts with that string, so
+            // "is the new kernel actually faster end to end" can be answered
+            // by measurement instead of by scaling one number by another.
+            if (tileFilter_ && strncmp(tc.name, tileFilter_, strlen(tileFilter_)))
+                continue;
             if (s.m % tc.blockM || s.n % tc.blockN) continue;
             dim3 grid(s.n / tc.blockN, s.m / tc.blockM);
 
@@ -408,7 +450,7 @@ class PearlPow : public Algorithm {
         const size_t bBytes = (size_t)shape_.n * k;
         const size_t chunks = (aBytes > bBytes ? aBytes : bBytes) / kChunkLen;
         return alloc(&dA_, aBytes) && alloc(&dAn_, aBytes) &&
-               alloc(&dBt_, bBytes) && alloc(&dBn_, bBytes) &&
+               alloc(&dBt_, bBytes) && alloc(&dBn_, bBytes) && alloc(&dBnT_, bBytes) &&
                alloc(&dEAL_, (size_t)shape_.m * rank) &&
                alloc(&dEBRflat_, (size_t)shape_.n * rank) &&
                alloc(&dEBR_, (size_t)shape_.n * rank) &&
@@ -483,6 +525,8 @@ class PearlPow : public Algorithm {
             dBlF_, dBlS_, kK, dCommitB_, dSeedB_, kRank);
         applyNoiseB<<<(((size_t)kK * shape_.n) + 255) / 256, 256, 0, stream_>>>(
             dBt_, dEBR_, dBlF_, dBlS_, dBn_, shape_.n, kK);
+        applyNoiseBt<<<(((size_t)kK * shape_.n) + 255) / 256, 256, 0, stream_>>>(
+            dBt_, dEBR_, dBlF_, dBlS_, dBnT_, shape_.n, kK);
 
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
             fprintf(stderr, "[pearl-pow] per-job setup failed: %s\n",
@@ -517,7 +561,8 @@ class PearlPow : public Algorithm {
         // card. See kTileConfigs for why that is not a constant.
         const TileConfig &tc = kTileConfigs[tile_];
         dim3 grid(shape_.n / tc.blockN, shape_.m / tc.blockM);
-        tc.launch(grid, tc.threads, stream_, dAn_, dBn_, dTranscripts_,
+        tc.launch(grid, tc.threads, stream_, dAn_, tc.nMajorB ? dBnT_ : dBn_,
+                  dTranscripts_,
                   (int)shape_.m, (int)shape_.n, (int)kK, kRank);
 
         powScan<<<(tiles() + 255) / 256, 256, 0, stream_>>>(
@@ -667,6 +712,8 @@ class PearlPow : public Algorithm {
     static constexpr int kNoiseMask = 63, kNoiseShift = 32;
 
     Shape shape_ = kShapes[sizeof(kShapes) / sizeof(kShapes[0]) - 1];
+    int arch10_ = 0;           // compute capability x10, 0 until queried
+    const char *tileFilter_ = getenv("SOAT_PEARL_TILE");
     size_t tile_ = 0;          // index into kTileConfigs, chosen by measurement
     bool allocated_ = false;
     bool haveJob_ = false;
@@ -682,6 +729,7 @@ class PearlPow : public Algorithm {
     std::vector<void *> owned_;
 
     int8_t *dA_ = nullptr, *dAn_ = nullptr, *dBt_ = nullptr, *dBn_ = nullptr;
+    int8_t *dBnT_ = nullptr;   // the same noised B, stored n-major
     int8_t *dEAL_ = nullptr, *dEBRflat_ = nullptr, *dEBR_ = nullptr;
     uint16_t *dArF_ = nullptr, *dArS_ = nullptr, *dBlF_ = nullptr, *dBlS_ = nullptr;
     uint8_t *dScratch_ = nullptr, *dRoots_ = nullptr;

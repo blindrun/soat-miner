@@ -274,7 +274,59 @@ int main(int argc, char **argv) {
 #undef CHECK_TILED
 #undef CHECK_TILED_K
 
-    int badC = naiveOk && mmaOk && stagedOk && tiledOk ? 0 : 1;
+    // The raw-PTX kernel reads B n-major, so it needs its own copy. Transposed
+    // here on the host from the same reference bytes - a kernel that is only
+    // ever fed data it transposed itself could agree with its own mistake.
+    bool ptxOk = true;
+    {
+        std::vector<int8_t> bT((size_t)n * k);
+        for (int p2 = 0; p2 < k; p2++)
+            for (int j = 0; j < n; j++) bT[(size_t)j * k + p2] = bNoised[(size_t)p2 * n + j];
+        int8_t *dBn = nullptr;
+        CHECK(cudaMalloc(&dBn, (size_t)n * k));
+        CHECK(cudaMemcpy(dBn, bT.data(), (size_t)n * k, cudaMemcpyHostToDevice));
+
+#define CHECK_PTX(WM, WN, TM, TN)                                              \
+        {                                                                      \
+            constexpr int threads = (WM) * (WN) * 32;                          \
+            constexpr int blockM = (WM) * (TM) * 16;                           \
+            constexpr int blockN = (WN) * (TN) * 16;                           \
+            char label[32];                                                    \
+            snprintf(label, sizeof(label), "ptx %dx%d/%dx%d:", WM, WN, TM, TN); \
+            if (m % blockM || n % blockN || k % 32) {                          \
+                printf("  %-14s SKIPPED\n", label);                            \
+            } else {                                                           \
+                dim3 g(n / blockN, m / blockM);                                \
+                CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));     \
+                CHECK(cudaMemset(dT, 0,                                        \
+                                 (size_t)numTranscripts * 16 * sizeof(uint32_t))); \
+                om::pearl::noisyGemmPtx<WM, WN, TM, TN><<<g, threads>>>(       \
+                    dA, dBn, dC, dT, m, n, k, rank, true);                     \
+                cudaError_t e = cudaGetLastError();                            \
+                if (e != cudaSuccess) {                                        \
+                    printf("  %-14s SKIPPED (%s)\n", label,                    \
+                           cudaGetErrorString(e));                             \
+                } else {                                                       \
+                    CHECK(cudaDeviceSynchronize());                            \
+                    CHECK(cudaMemcpy(cGot.data(), dC,                          \
+                                     cGot.size() * sizeof(int32_t),            \
+                                     cudaMemcpyDeviceToHost));                 \
+                    CHECK(cudaMemcpy(tGot.data(), dT,                          \
+                                     tGot.size() * sizeof(uint32_t),           \
+                                     cudaMemcpyDeviceToHost));                 \
+                    if (!compare(label)) ptxOk = false;                        \
+                }                                                              \
+            }                                                                  \
+        }
+
+        CHECK_PTX(2, 4, 2, 2)
+        CHECK_PTX(2, 4, 4, 2)
+        CHECK_PTX(2, 4, 4, 4)
+#undef CHECK_PTX
+        CHECK(cudaFree(dBn));
+    }
+
+    int badC = naiveOk && mmaOk && stagedOk && tiledOk && ptxOk ? 0 : 1;
     int badT = 0;
 
     // blake3 PoW check. The transcripts are only useful if the device can turn

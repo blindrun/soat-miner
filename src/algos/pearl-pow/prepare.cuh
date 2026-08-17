@@ -464,6 +464,32 @@ __global__ void applyNoiseB(const int8_t *__restrict__ Bt,
 }
 
 /**
+ * As applyNoiseB, but leaves B_noised in n-major (n x k) order.
+ *
+ * The WMMA kernels want B as k x n, so applyNoiseB transposes on the way in.
+ * The raw-PTX kernel wants the opposite: its mma fragment holds four
+ * CONSECUTIVE k for one n, which is a four-byte contiguous read out of an
+ * n-major tile and four strided single-byte reads out of a k-major one.
+ *
+ * Not transposing is also the cheaper kernel - B^t already arrives n-major, so
+ * both the read and the write are coalesced and the shared-memory tile
+ * gymnastics disappear.
+ */
+__global__ void applyNoiseBt(const int8_t *__restrict__ Bt,
+                             const int8_t *__restrict__ eBR,
+                             const uint16_t *__restrict__ first,
+                             const uint16_t *__restrict__ second,
+                             int8_t *__restrict__ out, uint32_t n, uint32_t k) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n * k) return;
+    const uint32_t j = (uint32_t)(idx / k);       // which column of B
+    const uint32_t p = (uint32_t)(idx % k);       // which k
+    const int32_t e = (int32_t)eBR[(size_t)first[p] * n + j] -
+                      (int32_t)eBR[(size_t)second[p] * n + j];
+    out[idx] = (int8_t)(Bt[idx] + e);
+}
+
+/**
  * E_BR is drawn as n x rank and used as rank x n. Transposing it once here is
  * cheaper than striding over it for every element of B.
  */

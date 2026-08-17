@@ -967,6 +967,219 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
     }
 }
 
+// ------------------------------------------------------------- raw mma PTX
+//
+// WMMA's int8 fragment shape is m16n16k16. Ampere's actual instruction is
+// m16n8k32, so every wmma::mma_sync becomes several of them and the k-loop
+// runs twice as many iterations as it needs to. The profiler put the tensor
+// pipeline at 37.4% - the highest of any pipeline, but far from saturated -
+// with the rest going on fragment loads and loop overhead.
+//
+// This issues m16n8k32 directly. Half the k-steps for the same work, one
+// instruction per half-tile, and the register layout is ours to arrange rather
+// than the fragment API's.
+//
+// **B is read n-major here.** The mma's B fragment holds four CONSECUTIVE k
+// for one n, which is a four-byte contiguous load out of an n-major tile and
+// four separate strided bytes out of a k-major one. So this kernel takes
+// B_noised from applyNoiseBt, not applyNoiseB - which is also the cheaper
+// noising kernel, because B^t already arrives n-major and nothing has to
+// transpose.
+//
+// Layouts, from the PTX ISA for mma.m16n8k32.row.col.s32.s8.s8.s32. Per thread
+// t of a warp:
+//
+//   A (16x32): a0 = row t/4,   bytes (t%4)*4 .. +3
+//              a1 = row t/4+8, bytes (t%4)*4 .. +3
+//              a2 = row t/4,   bytes 16+(t%4)*4 .. +3
+//              a3 = row t/4+8, bytes 16+(t%4)*4 .. +3
+//   B (32x8):  b0 = col t%4,   k = (t/4)*4 .. +3
+//              b1 = col t%4,   k = 16+(t/4)*4 .. +3
+//   D (16x8):  d0,d1 = row t/4,   cols (t%4)*2, +1
+//              d2,d3 = row t/4+8, cols (t%4)*2, +1
+
+// Defined for every device pass so the host launcher links on a multi-arch
+// build; mmaS8 itself falls back to a no-op below sm_80 and the host tuner
+// refuses to select this kernel there (TileConfig::minArch).
+__device__ __forceinline__ void mmaS8(uint32_t d[4], const uint32_t a[4],
+                                      const uint32_t b[2], const uint32_t c[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+#else
+    (void)a; (void)b;
+    d[0] = c[0]; d[1] = c[1]; d[2] = c[2]; d[3] = c[3];
+#endif
+}
+
+/**
+ * Raw-PTX NoisyGEMM. One 16x16 output tile is two m16n8k32 accumulators.
+ *
+ * Requires B in n-major order (applyNoiseBt). Launch with
+ * kWarpsM*kWarpsN*32 threads and grid (n/kBlockN, m/kBlockM).
+ */
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN>
+__global__ void noisyGemmPtx(const int8_t *__restrict__ A,
+                             const int8_t *__restrict__ Bn,
+                             int32_t *__restrict__ cNoised,
+                             uint32_t *__restrict__ transcripts,
+                             int m, int n, int k, int rank, bool writeC) {
+    constexpr int kK32 = 32;                       // the instruction's k
+    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;
+    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
+    constexpr int kThreads = kWarpsM * kWarpsN * 32;
+    constexpr int kStages = 3;
+    constexpr int kAStride = kK32;                 // 32 bytes per row
+    constexpr int kBStride = kK32 + 16;            // n-major, padded off a wrap
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpM = warp / kWarpsN;
+    const int warpN = warp % kWarpsN;
+
+    const int rowBase = blockIdx.y * kBlockM;
+    const int colBase = blockIdx.x * kBlockN;
+    if (rowBase >= m || colBase >= n) return;
+
+    __shared__ __align__(16) int8_t sA[kStages][kBlockM * kAStride];
+    __shared__ __align__(16) int8_t sB[kStages][kBlockN * kBStride];
+
+    const int dotLen = k - k % rank;
+    const int totalSteps = dotLen / kK32;
+    const int stepsPerRank = rank / kK32;
+    if (totalSteps <= 0 || stepsPerRank <= 0) return;
+
+    // Two accumulators per 16x16 tile: columns 0-7 and 8-15.
+    uint32_t acc[kTilesM][kTilesN][2][4] = {};
+    uint32_t slot[kTilesM][kTilesN] = {};
+    int reduction = 0;
+
+#define OM_PTX_ISSUE(step, stage)                                              \
+    {                                                                          \
+        const int kk_ = (step) * kK32;                                         \
+        for (int i = threadIdx.x; i < kBlockM * 2; i += kThreads) {            \
+            const int row = i >> 1;                                            \
+            const int half = (i & 1) * 16;                                     \
+            __pipeline_memcpy_async(&sA[stage][row * kAStride + half],         \
+                                    &A[(size_t)(rowBase + row) * k + kk_ + half], 16); \
+        }                                                                      \
+        for (int i = threadIdx.x; i < kBlockN * 2; i += kThreads) {            \
+            const int col = i >> 1;                                            \
+            const int half = (i & 1) * 16;                                     \
+            __pipeline_memcpy_async(&sB[stage][col * kBStride + half],         \
+                                    &Bn[(size_t)(colBase + col) * k + kk_ + half], 16); \
+        }                                                                      \
+        __pipeline_commit();                                                   \
+    }
+
+#pragma unroll
+    for (int pre = 0; pre < kStages - 1; pre++)
+        if (pre < totalSteps) OM_PTX_ISSUE(pre, pre)
+
+    for (int step = 0; step < totalSteps; step++) {
+        const int stage = step % kStages;
+        __pipeline_wait_prior(kStages - 2);
+        __syncthreads();
+
+        uint32_t aReg[kTilesM][4], bReg[kTilesN][2][2];
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++) {
+            const int r0 = (warpM * kTilesM + i) * kHashTile + (lane >> 2);
+            const int byte = (lane & 3) * 4;
+            const int8_t *p = &sA[stage][r0 * kAStride + byte];
+            aReg[i][0] = *(const uint32_t *)(p);
+            aReg[i][1] = *(const uint32_t *)(p + 8 * kAStride);
+            aReg[i][2] = *(const uint32_t *)(p + 16);
+            aReg[i][3] = *(const uint32_t *)(p + 8 * kAStride + 16);
+        }
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {          // the tile's two n-halves
+                // b0 and b1 differ by COLUMN, not by k: the fragment is eight
+                // columns wide and threadID_in_group only spans four, so the
+                // second register picks up columns 4-7. Getting this wrong
+                // reads the right bytes in the wrong places and produces a
+                // plausible, entirely incorrect product.
+                // groupID picks the COLUMN and threadID_in_group picks k -
+                // the opposite of A, and the opposite of what the operand
+                // order suggests. Established by running a single mma against
+                // a CPU product (scratchpad/mmaprobe.cu) rather than reasoning
+                // about it; three plausible readings were all wrong.
+                const int col = (warpN * kTilesN + j) * kHashTile + h * 8 + (lane >> 2);
+                const int kOff = (lane & 3) * 4;
+                const int8_t *pb = &sB[stage][col * kBStride + kOff];
+                bReg[j][h][0] = *(const uint32_t *)(pb);
+                bReg[j][h][1] = *(const uint32_t *)(pb + 16);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kTilesM; i++)
+#pragma unroll
+            for (int j = 0; j < kTilesN; j++)
+#pragma unroll
+                for (int h = 0; h < 2; h++)
+                    mmaS8(acc[i][j][h], aReg[i], bReg[j][h], acc[i][j][h]);
+
+        if ((step + 1) % stepsPerRank == 0) {
+#pragma unroll
+            for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+                for (int j = 0; j < kTilesN; j++) {
+                    uint32_t v = 0;
+#pragma unroll
+                    for (int h = 0; h < 2; h++)
+#pragma unroll
+                        for (int e = 0; e < 4; e++) v ^= acc[i][j][h][e];
+                    v = warpXor(v);
+                    if (lane == reduction % kTranscriptU32)
+                        slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
+                }
+            }
+            ++reduction;
+        }
+
+        if (step + kStages - 1 < totalSteps)
+            OM_PTX_ISSUE(step + kStages - 1, (step + kStages - 1) % kStages)
+    }
+#undef OM_PTX_ISSUE
+
+#pragma unroll
+    for (int i = 0; i < kTilesM; i++) {
+#pragma unroll
+        for (int j = 0; j < kTilesN; j++) {
+            const int row = rowBase + (warpM * kTilesM + i) * kHashTile;
+            const int col = colBase + (warpN * kTilesN + j) * kHashTile;
+            if (writeC) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int r = row + (lane >> 2);
+                    const int c = col + h * 8 + (lane & 3) * 2;
+                    cNoised[(size_t)r * n + c] = (int32_t)acc[i][j][h][0];
+                    cNoised[(size_t)r * n + c + 1] = (int32_t)acc[i][j][h][1];
+                    cNoised[(size_t)(r + 8) * n + c] = (int32_t)acc[i][j][h][2];
+                    cNoised[(size_t)(r + 8) * n + c + 1] = (int32_t)acc[i][j][h][3];
+                }
+            }
+            if (lane < kTranscriptU32) {
+                const int blocksPerRow = n / rank;
+                const int iIdx = row / rank;
+                const int jIdx = col / rank;
+                const int hi = (row % rank) / kHashTile;
+                const int wi = (col % rank) / kHashTile;
+                const int tilesPerSide = rank / kHashTile;
+                const int flat =
+                    ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+                transcripts[flat * kTranscriptU32 + lane] = slot[i][j];
+            }
+        }
+    }
+}
+
 #endif  // tensor cores available
 
 }  // namespace pearl
