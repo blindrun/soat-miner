@@ -319,7 +319,107 @@ class PearlPow : public Algorithm {
                 "[pearl-pow] %ux%u with %s: %.1f M candidates/s, %.0f MB\n",
                 shape_.m, shape_.n, kTileConfigs[tile_].name, bestRate,
                 bytesFor(shape_) / 1e6);
+
+        if (!selfCheck()) {
+            fprintf(stderr,
+                    "[pearl-pow] REFUSING TO MINE: this GPU or driver does not "
+                    "compute the kernel correctly. Every share would be "
+                    "rejected.\n");
+            return false;
+        }
         return true;
+    }
+
+    /**
+     * Prove the SELECTED kernel is right on THIS card, before mining a thing.
+     *
+     * The tuner's fingerprint check proves the configurations agree with each
+     * other, which is not the same as being correct - if they were all wrong
+     * the same way it would pass. This is the stronger form: a small GEMM on
+     * the device against the host's own tileTranscript(), which is the code
+     * `recheck()` uses and which Pearl's own Rust verifier has accepted.
+     *
+     * It exists because offline testing can only ever cover the cards we own.
+     * The reference vectors gate every shipped configuration on a 4090 and a
+     * 5080 and say nothing whatsoever about a 3070, a 5090 or next quarter's
+     * driver. A compiler that miscompiles this kernel is not hypothetical -
+     * NVIDIA's Vulkan compiler was found doing exactly that to a byte repack
+     * in this repo's other algorithm, deterministically and silently, with
+     * every share rejected by the pool. This turns that class of thing from
+     * "found by a user mining into a live pool" into a refusal at startup.
+     *
+     * 256x256 so it fits every block shape in the table, and one tile checked
+     * rather than all 256 - a miscompile that corrupts one tile and no other
+     * is not a thing, and this runs on every start.
+     */
+    bool selfCheck() {
+        constexpr uint32_t m = 256, n = 256;
+        const size_t aBytes = (size_t)m * kK, bBytes = (size_t)n * kK;
+        const uint32_t tiles = (m / kTileSide) * (n / kTileSide);
+
+        int8_t *dA = nullptr, *dBk = nullptr, *dBn = nullptr;
+        uint32_t *dT = nullptr;
+        if (cudaMalloc(&dA, aBytes) != cudaSuccess) return true;   // no memory: skip
+        if (cudaMalloc(&dBk, bBytes) != cudaSuccess) { cudaFree(dA); return true; }
+        if (cudaMalloc(&dBn, bBytes) != cudaSuccess) {
+            cudaFree(dA); cudaFree(dBk); return true;
+        }
+        if (cudaMalloc(&dT, (size_t)tiles * 16 * 4) != cudaSuccess) {
+            cudaFree(dA); cudaFree(dBk); cudaFree(dBn); return true;
+        }
+
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(dA, aBytes, 0x5e1f01);
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(dBk, bBytes, 0x5e1f02);
+        cudaMemsetAsync(dT, 0, (size_t)tiles * 16 * 4, stream_);
+        cudaStreamSynchronize(stream_);
+
+        std::vector<int8_t> A(aBytes), Bk(bBytes), Bn(bBytes);
+        cudaMemcpy(A.data(), dA, aBytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(Bk.data(), dBk, bBytes, cudaMemcpyDeviceToHost);
+        for (uint32_t j = 0; j < n; j++)
+            for (uint32_t q = 0; q < kK; q++)
+                Bn[(size_t)j * kK + q] = Bk[(size_t)q * n + j];
+        cudaMemcpy(dBn, Bn.data(), bBytes, cudaMemcpyHostToDevice);
+
+        const TileConfig &tc = kTileConfigs[tile_];
+        bool ok = true;
+        if (m % tc.blockM || n % tc.blockN) {
+            ok = true;                       // cannot pose the question here
+        } else {
+            dim3 grid(n / tc.blockN, m / tc.blockM);
+            tc.launch(grid, tc.threads, stream_, dA, tc.nMajorB ? dBn : dBk, dT,
+                      (int)m, (int)n, (int)kK, kRank);
+            if (cudaStreamSynchronize(stream_) != cudaSuccess ||
+                cudaGetLastError() != cudaSuccess) {
+                ok = false;
+            } else {
+                std::vector<uint32_t> got((size_t)tiles * 16);
+                cudaMemcpy(got.data(), dT, (size_t)tiles * 16 * 4,
+                           cudaMemcpyDeviceToHost);
+
+                // Tile (0,0). bStrip is k-major 16 columns, matching recheck().
+                std::vector<int8_t> aStrip((size_t)kTileSide * kK);
+                std::vector<int8_t> bStrip((size_t)kK * kTileSide);
+                for (int i = 0; i < kTileSide; i++)
+                    memcpy(&aStrip[(size_t)i * kK], &A[(size_t)i * kK], kK);
+                for (size_t q = 0; q < kK; q++)
+                    for (int j = 0; j < kTileSide; j++)
+                        bStrip[q * kTileSide + j] = Bk[q * n + j];
+
+                uint32_t want[kTranscriptWords];
+                tileTranscript(aStrip.data(), bStrip.data(), kK, kTileSide, kRank,
+                               0, 0, kTileSide, kTileSide, want);
+                for (uint32_t w = 0; w < kTranscriptWords; w++)
+                    if (got[w] != want[w]) ok = false;
+                if (!ok)
+                    fprintf(stderr,
+                            "[pearl-pow] self-check FAILED for %s: the device "
+                            "and the host disagree on tile 0\n", tc.name);
+            }
+        }
+
+        cudaFree(dA); cudaFree(dBk); cudaFree(dBn); cudaFree(dT);
+        return ok;
     }
 
     /**
