@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-#include "../src/algos/pearl-pow/gateway.h"
+#include "../src/core/pearl_gateway.h"
 #include "../src/core/algo.h"
 
 namespace om {

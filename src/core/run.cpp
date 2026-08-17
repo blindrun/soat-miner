@@ -3,6 +3,7 @@
 // "test these nonces".
 
 #include "run.h"
+#include "pearl_gateway.h"
 #include "stratum.h"
 #include <thread>
 
@@ -127,11 +128,15 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     // Banner before any network or GPU work. Connecting to a pool and
     // building the dataset take ~15s combined, and printing nothing for that
     // long reads as a hang - it is the first thing a new user sees.
-    stats.source = opt.bench ? "BENCHMARK ONLY - not mining, nothing submitted"
-                 : (!opt.poolHost.empty()
-                        ? opt.poolHost + ":" + std::to_string(opt.poolPort) + " (pool)"
-                        : "ergo node " + opt.target.host + ":" +
-                              std::to_string(opt.target.port) + " (solo)");
+    stats.source =
+        opt.bench ? "BENCHMARK ONLY - not mining, nothing submitted"
+        : !opt.pearlHost.empty()
+            ? opt.pearlHost + ":" + std::to_string(opt.pearlPort) +
+                  " (pearl-gateway)"
+        : !opt.poolHost.empty()
+            ? opt.poolHost + ":" + std::to_string(opt.poolPort) + " (pool)"
+            : "ergo node " + opt.target.host + ":" +
+                  std::to_string(opt.target.port) + " (solo)";
     printBanner(stats, tty);
 
     if (opt.bench) {
@@ -150,6 +155,24 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     int nonceBits = 64;
     if (opt.bench) {
         stats.source = "benchmark (no pool/node)";
+    } else if (!opt.pearlHost.empty()) {
+        // Pearl has no pool and no solo path - see RunOptions::pearlHost.
+        auto *pg = new PearlGatewaySource(opt.pearlHost, opt.pearlPort);
+        Job probe;
+        if (!pg->fetch(&probe)) {
+            logLine(tty, "error",
+                    "no pearl-gateway answering on " + opt.pearlHost + ":" +
+                        std::to_string(opt.pearlPort) + ".");
+            logLine(tty, "info",
+                    "Pearl mining goes through pearl-gateway, not straight to a "
+                    "node: a block carries a proof only the gateway can "
+                    "generate. Start one against your node first.");
+            delete pg;
+            return 1;
+        }
+        source.reset(pg);
+        stats.source = source->describe();
+        logLine(tty, "ok", "gateway answered with work");
     } else if (!opt.poolHost.empty()) {
         // Catch the obvious cases before spending a connection on them. Skipped
         // for Lithos, where the address is a label rather than a payout
@@ -333,12 +356,17 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             // Only warn about a wait when there is going to be one. Building
             // ahead makes this instant, and "please wait" followed immediately
             // by "ready in 0.00s" is just noise.
-            if (!algo->prefetchReadyFor(job)) {
+            // Not every algorithm has a dataset. Autolykos rebuilds 7.27 GB
+            // and the wait is the first thing a user notices; Pearl allocates
+            // a couple of hundred megabytes in a few milliseconds and has no
+            // epoch at all, so telling someone to please wait for a 0.01 GB
+            // dataset is just wrong.
+            const double gb = algo->memoryBytes(job) / 1e9;
+            if (!algo->prefetchReadyFor(job) && gb >= 1.0) {
                 char pre[160];
                 snprintf(pre, sizeof(pre),
                          "epoch %llu - building %.2f GB dataset, please wait...",
-                         (unsigned long long)job.epoch,
-                         algo->memoryBytes(job) / 1e9);
+                         (unsigned long long)job.epoch, gb);
                 logLine(tty, "info", pre);
             }
             const auto t0 = std::chrono::steady_clock::now();
@@ -348,8 +376,12 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     .count();
             stats.datasetGB = algo->memoryBytes(job) / 1e9;
             char buf[160];
-            snprintf(buf, sizeof(buf), "dataset ready in %.2fs%s - mining", secs,
-                     algo->servedFromPrefetch() ? " (built ahead)" : "");
+            if (stats.datasetGB >= 1.0)
+                snprintf(buf, sizeof(buf), "dataset ready in %.2fs%s - mining",
+                         secs, algo->servedFromPrefetch() ? " (built ahead)" : "");
+            else
+                snprintf(buf, sizeof(buf), "ready in %.2fs (%.0f MB) - mining",
+                         secs, stats.datasetGB * 1e3);
             logLine(tty, "ok", buf);
             preparedEpoch = job.epoch;
             stats.epochs++;

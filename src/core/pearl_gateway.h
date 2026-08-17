@@ -1,5 +1,12 @@
 // Work source for Pearl: line-delimited JSON-RPC to pearl-gateway.
 //
+// This lives in core/ rather than under the algorithm because it is a protocol
+// client, and core/ is where the other one already lives: stratum.h is just as
+// algorithm-specific - it parses Ergo's own mining.notify field layout - and
+// sits here for the same reason. What is under src/algos/pearl-pow/ is the
+// arithmetic; what talks to a network peer belongs next to the code that owns
+// the run loop.
+//
 // Pearl's miner does not talk to the node. It talks to `pearl-gateway`, which
 // owns the node connection, builds the coinbase, assembles the block and runs
 // the plonky2 prover that turns a submitted PlainProof into the certificate a
@@ -42,11 +49,11 @@
 
 #include <string>
 
-#include "../../core/algo.h"
-#include "../../core/http.h"
-#include "../../core/platform.h"
-#include "../../core/run.h"
-#include "job.h"
+#include "algo.h"
+#include "http.h"
+#include "platform.h"
+#include "run.h"
+#include "../algos/pearl-pow/job.h"
 
 namespace om {
 

@@ -127,6 +127,14 @@ struct RunOptions {
     std::string worker = "soat";
     std::string password = "x";
 
+    // Pearl mode. Pearl's miner cannot talk to a node directly: a block
+    // carries a plonky2 certificate generated from the submitted proof, so
+    // pearl-gateway is unavoidably in the path and does the node talking, the
+    // block assembly and the proving. Set when --algo pearl-pow is chosen;
+    // 8337 is pearl-gateway's own default TCP port.
+    std::string pearlHost;
+    int pearlPort = 0;
+
     // Lithos mode. Lithos is not a coin or an algorithm: it is a decentralised
     // pool protocol whose reference client runs a local stratum server (default
     // 127.0.0.1:4444) speaking ordinary Ergo/Autolykos v2 stratum. The PoW,

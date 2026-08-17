@@ -40,6 +40,16 @@ int main(int argc, char **argv) {
         };
         if (a == "--algo") algoName = next();
         else if (a == "--device") deviceIndex = atoi(next().c_str());
+        else if (a == "--gateway") {
+            std::string v = next();
+            const size_t c = v.rfind(':');
+            if (c != std::string::npos) {
+                opt.pearlHost = v.substr(0, c);
+                opt.pearlPort = atoi(v.c_str() + c + 1);
+            } else {
+                opt.pearlHost = v;
+            }
+        }
                 else if (a == "--pool") {
             std::string v = next();
             const size_t c = v.rfind(':');
@@ -107,6 +117,10 @@ int main(int argc, char **argv) {
                 "  --list-devices    list CUDA GPUs and exit\n"
                 "  --device N        GPU index (default 0; one process per GPU)\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
+                "  --gateway H:PORT  pearl-gateway (pearl-pow only; default\n"
+                "                    127.0.0.1:8337). Pearl has no pool and no\n"
+                "                    solo path - a block carries a proof only\n"
+                "                    the gateway can generate\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
                 "  --lithos          mine to a Lithos client (decentralised\n"
@@ -158,6 +172,23 @@ int main(int argc, char **argv) {
                 "--pool needs HOST:PORT, got '%s:%d'. An empty value in a "
                 "launcher script is the usual cause.\n",
                 opt.poolHost.c_str(), opt.poolPort);
+        return 1;
+    }
+
+    // Pearl has no pool and no solo path, so the gateway is not optional and
+    // there is nothing sensible to fall through to. Default it rather than
+    // making every launch repeat the same flag; 8337 is pearl-gateway's own
+    // default TCP port.
+    if (algoName == "pearl-pow" && opt.pearlHost.empty()) {
+        opt.pearlHost = "127.0.0.1";
+        opt.pearlPort = 8337;
+    }
+    if (opt.pearlPort == 0 && !opt.pearlHost.empty()) opt.pearlPort = 8337;
+    if (!opt.pearlHost.empty() && algoName != "pearl-pow") {
+        fprintf(stderr,
+                "--gateway is for --algo pearl-pow; '%s' mines to a pool or a "
+                "node instead\n",
+                algoName.c_str());
         return 1;
     }
 

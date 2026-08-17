@@ -59,7 +59,8 @@ CXXFLAGS = -O3 --std=c++17 -Isrc
 # PTX, which the driver JITs onto newer cards - that is what lets a build from
 # CUDA 12.4 (max sm_90) run on Blackwell at all. Measured: identical hashrate
 # (217.6 vs 217.5 MH/s on a 4090) and the same ~60 s build.
-CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu
+CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu \
+            src/algos/pearl-pow/algo.cu
 CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
             src/core/stratum.h src/core/blake2b.cuh \
@@ -67,7 +68,7 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
 
 VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/algo_vk.o $(BUILD)/spirv.o $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o
 
-.PHONY: all cuda vulkan clean test bench install dirs package
+.PHONY: all cuda vulkan clean test test-pearl bench install dirs package
 
 all: cuda vulkan
 
@@ -124,7 +125,11 @@ HIT_HEIGHT = 500012
 HIT_NONCE  = 1232002a7deb44c0
 HIT_EXPECT = 0000000000001fa822c756eef06389799c10c7c1d06868eb29c75214e0a7aab1
 
-test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan
+PEARL_VEC  = $(BUILD)/pearl_vectors.bin
+PEARL_VEC64 = $(BUILD)/pearl_vectors_r64.bin
+PEARL_JOBVEC = $(BUILD)/pearl_job_vectors.bin
+
+test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-pearl
 	@echo "--- python reference vs real mainnet blocks ---"
 	@python3 tests/reference.py
 	@echo "--- device dataset elements vs python reference ---"
@@ -137,6 +142,57 @@ test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan
 	@python3 tests/test_lithos.py
 	@echo "--- vulkan backend against the same pinned vector ---"
 	@./tests/test_vulkan $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
+
+# --- pearl-pow gates ------------------------------------------------------
+# Split out because Pearl needs its own vectors emitted first, and because the
+# end-to-end one needs a running pearl-gateway - which a build machine will not
+# have. `make test` runs everything that does not; test_pearl_algo is run by
+# hand against the regtest rig.
+$(PEARL_VEC): tests/pearl_reference.py | dirs
+	@python3 tests/pearl_reference.py --emit-vectors $@ 128
+
+$(PEARL_VEC64): tests/pearl_reference.py | dirs
+	@python3 tests/pearl_reference.py --emit-vectors $@ 64
+
+$(PEARL_JOBVEC): tests/pearl_job.py tests/pearl_reference.py | dirs
+	@python3 tests/pearl_job.py --emit-vectors $@
+
+test-pearl: tests/test_pearl tests/test_pearl_job tests/test_pearl_prepare \
+            $(PEARL_VEC) $(PEARL_VEC64) $(PEARL_JOBVEC)
+	@echo "--- pearl: the algorithm in numpy, mutation-tested ---"
+	@python3 tests/pearl_reference.py
+	@echo "--- pearl: the job pipeline, and the proof a node accepts ---"
+	@python3 tests/pearl_job.py
+	@echo "--- pearl: every CUDA kernel against the reference, rank 128 ---"
+	@./tests/test_pearl $(PEARL_VEC)
+	@echo "--- pearl: the same at rank 64 ---"
+	@./tests/test_pearl $(PEARL_VEC64)
+	@echo "--- pearl: the host commitment chain and proof encoding ---"
+	@./tests/test_pearl_job $(PEARL_JOBVEC)
+	@echo "--- pearl: the device prepare stage, and what it costs ---"
+	@./tests/test_pearl_prepare $(PEARL_JOBVEC)
+
+tests/test_pearl: tests/test_pearl.cu src/algos/pearl-pow/noisy_gemm.cuh
+	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
+
+tests/test_pearl_job: tests/test_pearl_job.cpp src/algos/pearl-pow/job.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_pearl_prepare: tests/test_pearl_prepare.cu \
+                          src/algos/pearl-pow/prepare.cuh \
+                          src/algos/pearl-pow/blake3.cuh \
+                          src/algos/pearl-pow/noisy_gemm.cuh \
+                          src/algos/pearl-pow/job.h
+	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
+
+# Needs a pearl-gateway on 127.0.0.1:8455 - see ~/pearl-regtest-gateway.sh.
+tests/test_pearl_algo: tests/test_pearl_algo.cu src/algos/pearl-pow/algo.cu \
+                       src/core/pearl_gateway.h src/core/algo.h
+	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/pearl-pow/algo.cu -o $@
+
+tests/test_pearl_gateway: tests/test_pearl_gateway.cpp src/core/pearl_gateway.h \
+                          src/algos/pearl-pow/job.h
+	$(CXX) $(CXXFLAGS) -Isrc $< -o $@
 
 # The Vulkan gate needs only the algorithm and the embedded SPIR-V, not the
 # miner's job/stratum plumbing.
@@ -164,7 +220,9 @@ install: $(BIN)
 
 clean:
 	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit \
-	       tests/test_algo tests/test_vulkan
+	       tests/test_algo tests/test_vulkan tests/test_pearl \
+	       tests/test_pearl_job tests/test_pearl_prepare \
+	       tests/test_pearl_algo tests/test_pearl_gateway
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
 VERSION ?= 0.1.2

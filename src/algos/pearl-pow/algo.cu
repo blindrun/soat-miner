@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "../../core/algo.h"
-#include "gateway.h"
+#include "../../core/pearl_gateway.h"
 #include "job.h"
 #include "noisy_gemm.cuh"
 #include "prepare.cuh"

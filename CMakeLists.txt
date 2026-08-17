@@ -118,6 +118,7 @@ set(SOAT_CUDA_SOURCES
   src/core/miner.cu
   src/core/registry.cu
   src/algos/autolykos2/algo.cu
+  src/algos/pearl-pow/algo.cu
   src/core/run.cpp
   src/core/stratum.cpp
 )
