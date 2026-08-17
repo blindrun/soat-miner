@@ -1,0 +1,517 @@
+// Pearl (pearl-pow) - the Algorithm implementation.
+//
+// Pearl does not fit the shape of every other PoW in this repo, and it is
+// worth saying how before reading the code.
+//
+// There is no nonce. The miner picks the matrices A (m x k) and B (k x n), and
+// their Merkle roots ARE the noise seeds and the PoW key, so choosing them is
+// the whole of the search. `nonceBase` here indexes a choice of A rather than
+// a value that gets hashed.
+//
+// One attempt is a whole GEMM and yields (m/16)*(n/16) transcripts, each an
+// independent candidate. So an attempt is milliseconds, not nanoseconds, and
+// `count` is read as "this many candidates" rather than "this many nonces" -
+// which keeps the core's hashrate figure honest, since it is candidates per
+// second either way.
+//
+// The one structural trick, measured rather than assumed (see the header of
+// prepare.cuh):
+//
+//   commitment_B = blake3(job_key || salted B^t root) does not depend on A.
+//   E_BL and E_BR come from it, so B_noised is bit-identical for every attempt
+//   in a job. Generating, hashing and noising B are per-JOB work. Doing it
+//   per attempt costs 48% overhead; doing it once costs 3%.
+//
+// A win is not a nonce either. It is a Merkle opening of the winning tile's
+// sixteen rows of A and sixteen columns of B, tens of kilobytes, which travels
+// in Solution::extra.
+
+#include <cstdio>
+#include <cstring>
+
+#include <string>
+#include <vector>
+
+#include "../../core/algo.h"
+#include "gateway.h"
+#include "job.h"
+#include "noisy_gemm.cuh"
+#include "prepare.cuh"
+
+namespace om {
+namespace {
+
+using namespace om::pearl;
+
+/**
+ * Shapes to mine at, largest first, chosen by measurement.
+ *
+ * Ranked on candidates per second, not on prepare overhead - those disagree,
+ * and overhead is the misleading one. On a 4090, 4096x65536 has the lowest
+ * overhead of anything measured and is the slowest, because B^t at 128 MB
+ * stops being servable from L2 and the GEMM falls from 67 to 45 TOPS.
+ *
+ * m and n must be powers of two so the padded matrices have a power-of-two
+ * chunk count and the device Merkle reduction is exactly blake3's tree, and
+ * multiples of the rank so the transcript index inverts cleanly.
+ */
+struct Shape {
+    uint32_t m, n;
+};
+
+const Shape kShapes[] = {
+    {4096, 32768},   // 62.1 M candidates/s on a 4090, ~180 MB
+    {2048, 32768},   // 60.9
+    {2048, 16384},   // 58.2
+    {1024, 16384},   // 54.4
+    {512, 8192},     // small cards and integrated parts
+    {256, 2048},
+};
+
+constexpr uint32_t kMaxHits = 64;
+constexpr int kTileSide = 16;
+
+class PearlPow : public Algorithm {
+   public:
+    PearlPow() { cudaStreamCreate(&stream_); }
+
+    ~PearlPow() override {
+        release();
+        if (stream_) cudaStreamDestroy(stream_);
+    }
+
+    const char *name() const override { return "pearl-pow"; }
+
+    size_t memoryBytes(const Job &job) const override {
+        (void)job;
+        return bytesFor(shape_);
+    }
+
+    /**
+     * Pick a shape that fits and allocate for it.
+     *
+     * Called once, because Pearl has no epoch: there is no dataset to rebuild
+     * when the height moves. What DOES have to be redone per job is the B
+     * side, and that is keyed on the header rather than on the epoch, so it
+     * lives in search().
+     */
+    bool prepare(const Job &job) override {
+        (void)job;
+        if (allocated_) return true;
+
+        size_t freeB = 0, totalB = 0;
+        if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) return false;
+
+        // Leave the driver and whatever is on screen a real margin. Pearl's
+        // working set is small enough that shrinking a step costs a few
+        // percent, so there is no reason to sail close.
+        const size_t headroom = 512ULL << 20;
+        for (const Shape &s : kShapes) {
+            if (bytesFor(s) + headroom <= freeB) {
+                shape_ = s;
+                break;
+            }
+        }
+        if (!allocate()) {
+            fprintf(stderr, "[pearl-pow] could not allocate %.0f MB\n",
+                    bytesFor(shape_) / 1e6);
+            return false;
+        }
+        allocated_ = true;
+        return true;
+    }
+
+    bool search(const Job &job, uint64_t nonceBase, uint64_t count,
+                std::vector<Solution> *out) override {
+        if (!allocated_) return false;
+
+        uint8_t header[76];
+        int cert = 0;
+        if (!unpackPearlExtra(job.extra, header, &cert)) {
+            fprintf(stderr, "[pearl-pow] job carries no Pearl header\n");
+            return false;
+        }
+
+        if (!beginJob(job, header, cert)) return false;
+
+        // `count` is a candidate budget, and one attempt yields a whole tile
+        // grid of them. Always at least one attempt, or a small batch setting
+        // would spin without doing any work.
+        const uint32_t perAttempt = tiles();
+        uint64_t attempts = count / perAttempt;
+        if (attempts == 0) attempts = 1;
+
+        for (uint64_t i = 0; i < attempts; i++) {
+            const uint64_t nonce = nonceBase + i;
+            if (!runAttempt(nonce)) return false;
+
+            uint32_t hits = 0;
+            if (cudaMemcpyAsync(&hits, dHitCount_, sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost, stream_) != cudaSuccess)
+                return false;
+            if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+                fprintf(stderr, "[pearl-pow] attempt failed: %s\n",
+                        cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            if (hits == 0) continue;
+            if (hits > kMaxHits) hits = kMaxHits;
+
+            // A and B are overwritten by the next attempt, so a win has to be
+            // opened now. Reading them back beats regenerating them: 72 MB
+            // over PCIe is milliseconds, and this happens once in a very long
+            // time anyway.
+            if (!openWin(job, nonce, hits, out)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Recompute the winning tile on the host and re-check it against the bound.
+     *
+     * This is the same arithmetic the node does from the opened rows and
+     * columns: sixteen by sixteen over k, half a million multiply-accumulates.
+     * A card overclocked into instability produces wrong accumulators, and
+     * there is no other way to tell that from a genuine win.
+     */
+    bool verify(const Job &job, const Solution &sol) const override {
+        (void)job;
+        for (const Win &w : wins_) {
+            if (w.nonce != sol.nonce) continue;
+            return w.verified;
+        }
+        return false;
+    }
+
+    void release() override {
+        for (void *p : owned_) cudaFree(p);
+        owned_.clear();
+        allocated_ = false;
+        haveJob_ = false;
+    }
+
+   private:
+    struct Win {
+        uint64_t nonce = 0;
+        bool verified = false;
+    };
+
+    uint32_t tiles() const {
+        return (shape_.m / kTileSide) * (shape_.n / kTileSide);
+    }
+
+    static size_t bytesFor(const Shape &s) {
+        const size_t k = 2048, rank = 128;
+        const size_t aBytes = (size_t)s.m * k, bBytes = (size_t)s.n * k;
+        const size_t chunks = (aBytes > bBytes ? aBytes : bBytes) / kChunkLen;
+        const size_t tileCount = (size_t)(s.m / kTileSide) * (s.n / kTileSide);
+        return aBytes * 2                       // A, A_noised
+               + bBytes * 2                     // B^t, B_noised
+               + (size_t)s.m * rank             // E_AL
+               + (size_t)s.n * rank * 2         // E_BR, flat and transposed
+               + k * 8                          // permutation index pairs
+               + chunks * 32 * 2                // merkle scratch
+               + tileCount * 16 * sizeof(uint32_t)   // transcripts
+               + kMaxHits * 36 + 4096;
+    }
+
+    template <typename T>
+    bool alloc(T **p, size_t bytes) {
+        if (cudaMalloc(p, bytes) != cudaSuccess) return false;
+        owned_.push_back(*p);
+        return true;
+    }
+
+    bool allocate() {
+        const size_t k = kK, rank = kRank;
+        const size_t aBytes = (size_t)shape_.m * k;
+        const size_t bBytes = (size_t)shape_.n * k;
+        const size_t chunks = (aBytes > bBytes ? aBytes : bBytes) / kChunkLen;
+        return alloc(&dA_, aBytes) && alloc(&dAn_, aBytes) &&
+               alloc(&dBt_, bBytes) && alloc(&dBn_, bBytes) &&
+               alloc(&dEAL_, (size_t)shape_.m * rank) &&
+               alloc(&dEBRflat_, (size_t)shape_.n * rank) &&
+               alloc(&dEBR_, (size_t)shape_.n * rank) &&
+               alloc(&dArF_, k * 2) && alloc(&dArS_, k * 2) &&
+               alloc(&dBlF_, k * 2) && alloc(&dBlS_, k * 2) &&
+               alloc(&dScratch_, chunks * 32 * 2) && alloc(&dRoots_, 64) &&
+               alloc(&dCommitA_, 32) && alloc(&dCommitB_, 32) &&
+               alloc(&dJobKey_, 32) && alloc(&dSaltA_, 32) &&
+               alloc(&dSaltB_, 32) && alloc(&dSeedA_, 32) &&
+               alloc(&dSeedB_, 32) && alloc(&dTarget_, 32) &&
+               alloc(&dTranscripts_, (size_t)tiles() * 16 * sizeof(uint32_t)) &&
+               alloc(&dHitIndex_, kMaxHits * 4) &&
+               alloc(&dHitDigest_, kMaxHits * 32) && alloc(&dHitCount_, 4);
+    }
+
+    /** Per-job work: everything that depends on the header but not on A. */
+    bool beginJob(const Job &job, const uint8_t header[76], int cert) {
+        if (haveJob_ && memcmp(header, header_, 76) == 0 && cert == cert_)
+            return true;
+
+        memcpy(header_, header, 76);
+        cert_ = cert;
+        cfg_.commonDim = kK;
+        cfg_.rank = kRank;
+
+        const std::string bad = cfg_.check(shape_.m, shape_.n);
+        if (!bad.empty()) {
+            fprintf(stderr, "[pearl-pow] illegal mining configuration: %s\n",
+                    bad.c_str());
+            return false;
+        }
+        if (!cfg_.penalizedTarget(U256::fromLimbs(job.target), &bound_)) {
+            fprintf(stderr,
+                    "[pearl-pow] this target does not scale into 256 bits for "
+                    "the chosen configuration\n");
+            return false;
+        }
+
+        jobKey(header_, cfg_, jobKey_);
+        // A's stream is mixed with the job so two jobs never mine the same A.
+        memcpy(&jobSalt_, jobKey_, sizeof(jobSalt_));
+
+        uint8_t seedA[32], seedB[32], targetBytes[32];
+        seedForA(seedA);
+        seedForB(seedB);
+        bound_.toBytesLE(targetBytes);
+
+        cudaMemcpyAsync(dJobKey_, jobKey_, 32, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(dSaltA_, seedSaltA(), 32, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(dSaltB_, seedSaltB(), 32, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(dSeedA_, seedA, 32, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(dSeedB_, seedB, 32, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(dTarget_, targetBytes, 32, cudaMemcpyHostToDevice, stream_);
+
+        // B, once. Roll a fresh one per job so a long run does not reuse the
+        // same columns forever.
+        btSeed_ = matrixSeed(jobSalt_, true);
+        const size_t bBytes = (size_t)shape_.n * kK;
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(dBt_, bBytes,
+                                                                 btSeed_);
+        merkleRoot((const uint8_t *)dBt_, (uint32_t)(bBytes / kChunkLen),
+                   dRoots_ + 32);
+        deriveCommitmentB<<<1, 1, 0, stream_>>>(dRoots_ + 32, dJobKey_, dSaltB_,
+                                                shape_.n, cert_ >= 3, dCommitB_);
+
+        const uint32_t brCount = shape_.n * kRank;
+        noiseUniform<<<((brCount + 31) / 32 + 255) / 256, 256, 0, stream_>>>(
+            dEBRflat_, brCount, dCommitB_, dSeedB_, kNoiseMask, kNoiseShift);
+        transposeNoiseB<<<(brCount + 255) / 256, 256, 0, stream_>>>(
+            dEBRflat_, dEBR_, shape_.n, kRank);
+        noisePerm<<<((kK + 7) / 8 + 255) / 256, 256, 0, stream_>>>(
+            dBlF_, dBlS_, kK, dCommitB_, dSeedB_, kRank);
+        applyNoiseB<<<(((size_t)kK * shape_.n) + 255) / 256, 256, 0, stream_>>>(
+            dBt_, dEBR_, dBlF_, dBlS_, dBn_, shape_.n, kK);
+
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            fprintf(stderr, "[pearl-pow] per-job setup failed: %s\n",
+                    cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        haveJob_ = true;
+        wins_.clear();
+        return true;
+    }
+
+    /** Per-attempt work: A's chain, the GEMM, and the PoW scan. */
+    bool runAttempt(uint64_t nonce) {
+        const size_t aBytes = (size_t)shape_.m * kK;
+        cudaMemsetAsync(dHitCount_, 0, sizeof(uint32_t), stream_);
+
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(
+            dA_, aBytes, matrixSeed(nonce ^ jobSalt_, false));
+        merkleRoot((const uint8_t *)dA_, (uint32_t)(aBytes / kChunkLen), dRoots_);
+        deriveCommitmentA<<<1, 1, 0, stream_>>>(dRoots_, dCommitB_, dSaltA_,
+                                                shape_.m, cert_ >= 3, dCommitA_);
+
+        const uint32_t alCount = shape_.m * kRank;
+        noiseUniform<<<((alCount + 31) / 32 + 255) / 256, 256, 0, stream_>>>(
+            dEAL_, alCount, dCommitA_, dSeedA_, kNoiseMask, kNoiseShift);
+        noisePerm<<<((kK + 7) / 8 + 255) / 256, 256, 0, stream_>>>(
+            dArF_, dArS_, kK, dCommitA_, dSeedA_, kRank);
+        applyNoiseA<<<(aBytes + 255) / 256, 256, 0, stream_>>>(
+            dA_, dEAL_, dArF_, dArS_, dAn_, shape_.m, kK, kRank);
+
+        const int warps = 8;
+        dim3 grid((shape_.n / kTileSide + warps - 1) / warps, shape_.m / kTileSide);
+        noisyGemmMmaStaged<<<grid, 256, 0, stream_>>>(
+            dAn_, dBn_, nullptr, dTranscripts_, (int)shape_.m, (int)shape_.n,
+            (int)kK, kRank, false);
+
+        powScan<<<(tiles() + 255) / 256, 256, 0, stream_>>>(
+            dTranscripts_, tiles(), dCommitA_, (const uint32_t *)dTarget_,
+            dHitIndex_, dHitDigest_, dHitCount_, kMaxHits);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    /**
+     * Invert the transcript index, open the tile, and build the submission.
+     *
+     * The transcript layout is not row-major over tiles: noisy_gemm.cuh writes
+     * them block-major over rank-sized blocks and then (hi, wi) inside each,
+     * to match what the Python reference emits. Getting this inversion wrong
+     * produces a proof that opens the wrong sixteen rows, which verifies
+     * locally against nothing and is rejected by the node.
+     */
+    bool openWin(const Job &job, uint64_t nonce, uint32_t hits,
+                 std::vector<Solution> *out) {
+        std::vector<uint32_t> index(hits);
+        std::vector<uint32_t> digest(hits * 8);
+        cudaMemcpyAsync(index.data(), dHitIndex_, hits * 4, cudaMemcpyDeviceToHost,
+                        stream_);
+        cudaMemcpyAsync(digest.data(), dHitDigest_, hits * 32,
+                        cudaMemcpyDeviceToHost, stream_);
+
+        const size_t aBytes = (size_t)shape_.m * kK;
+        const size_t bBytes = (size_t)shape_.n * kK;
+        std::vector<int8_t> A(aBytes), Bt(bBytes);
+        cudaMemcpyAsync(A.data(), dA_, aBytes, cudaMemcpyDeviceToHost, stream_);
+        cudaMemcpyAsync(Bt.data(), dBt_, bBytes, cudaMemcpyDeviceToHost, stream_);
+        uint8_t commitA[32], commitB[32];
+        cudaMemcpyAsync(commitA, dCommitA_, 32, cudaMemcpyDeviceToHost, stream_);
+        cudaMemcpyAsync(commitB, dCommitB_, 32, cudaMemcpyDeviceToHost, stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return false;
+
+        std::vector<uint8_t> aPad(aBytes, 0), btPad(bBytes, 0);
+        memcpy(aPad.data(), A.data(), aBytes);
+        memcpy(btPad.data(), Bt.data(), bBytes);
+
+        // Only the first win is submitted. A second tile from the same attempt
+        // is a second solution to the SAME block, so it can never be accepted
+        // once the first is, and building its proof would be wasted work.
+        const uint32_t flat = index[0];
+        const uint32_t tilesPerSide = kRank / kTileSide;
+        const uint32_t blocksPerRow = shape_.n / kRank;
+        const uint32_t wi = flat % tilesPerSide;
+        const uint32_t hi = (flat / tilesPerSide) % tilesPerSide;
+        const uint32_t block = flat / (tilesPerSide * tilesPerSide);
+        const uint32_t jIdx = block % blocksPerRow;
+        const uint32_t iIdx = block / blocksPerRow;
+        const uint32_t tRow = iIdx * kRank + hi * kTileSide;
+        const uint32_t tCol = jIdx * kRank + wi * kTileSide;
+
+        Win win;
+        win.nonce = nonce;
+        win.verified = recheck(A, Bt, commitA, commitB, tRow, tCol);
+        wins_.push_back(win);
+        if (wins_.size() > 32) wins_.erase(wins_.begin());
+        if (!win.verified) {
+            // Reported, not submitted: the core prints it as a host rejection.
+            Solution sol;
+            sol.nonce = nonce;
+            out->push_back(sol);
+            return true;
+        }
+
+        MerkleProof aProof, btProof;
+        if (!buildProof(aPad.data(), aPad.size(), jobKey_,
+                        leafIndicesFromRows(tRow, kTileSide, kK), &aProof) ||
+            !buildProof(btPad.data(), btPad.size(), jobKey_,
+                        leafIndicesFromRows(tCol, kTileSide, kK), &btProof))
+            return false;
+
+        Solution sol;
+        sol.nonce = nonce;
+        for (int i = 0; i < 4; i++)
+            sol.hit[i] = (uint64_t)digest[i * 2] | ((uint64_t)digest[i * 2 + 1] << 32);
+        sol.extra = base64(encodePlainProof(shape_.m, shape_.n, kK, kRank, aProof,
+                                            tRow, kTileSide, btProof, tCol,
+                                            kTileSide));
+        out->push_back(sol);
+        (void)job;
+        return true;
+    }
+
+    /** The node's own check, on the host, from the two matrices. */
+    bool recheck(const std::vector<int8_t> &A, const std::vector<int8_t> &Bt,
+                 const uint8_t commitA[32], const uint8_t commitB[32],
+                 uint32_t tRow, uint32_t tCol) const {
+        Noise noise;
+        noise.generate(commitA, commitB, shape_.m, shape_.n, kK, kRank);
+
+        // Only the winning strips, not the whole product: sixteen rows of
+        // A_noised and sixteen columns of B_noised.
+        std::vector<int8_t> aStrip((size_t)kTileSide * kK);
+        std::vector<int8_t> bStrip((size_t)kK * kTileSide);
+        for (int i = 0; i < kTileSide; i++)
+            for (size_t col = 0; col < kK; col++) {
+                const int32_t e =
+                    (int32_t)noise.eAL[(size_t)(tRow + i) * kRank + noise.ar.first[col]] -
+                    (int32_t)noise.eAL[(size_t)(tRow + i) * kRank + noise.ar.second[col]];
+                aStrip[(size_t)i * kK + col] =
+                    (int8_t)(A[(size_t)(tRow + i) * kK + col] + e);
+            }
+        for (size_t p = 0; p < kK; p++)
+            for (int j = 0; j < kTileSide; j++) {
+                const int32_t e =
+                    (int32_t)noise.eBR[(size_t)noise.bl.first[p] * shape_.n + tCol + j] -
+                    (int32_t)noise.eBR[(size_t)noise.bl.second[p] * shape_.n + tCol + j];
+                bStrip[p * kTileSide + j] =
+                    (int8_t)(Bt[(size_t)(tCol + j) * kK + p] + e);
+            }
+
+        uint32_t transcript[kTranscriptWords];
+        tileTranscript(aStrip.data(), bStrip.data(), kK, kTileSide, kRank, 0, 0,
+                       kTileSide, kTileSide, transcript);
+        uint8_t d[32];
+        powDigest(transcript, commitA, d);
+        return U256::fromBytesLE(d).le(bound_);
+    }
+
+    /** Chunk CVs, then as many tree levels per launch as a block can hold. */
+    void merkleRoot(const uint8_t *data, uint32_t chunks, uint8_t *root) {
+        chunkCvs<<<(chunks + 255) / 256, 256, 0, stream_>>>(
+            data, chunks, (const uint32_t *)dJobKey_, dScratch_);
+        uint32_t count = chunks;
+        const uint8_t *in = dScratch_;
+        uint8_t *outBuf = dScratch_ + (size_t)chunks * 32;
+        while (count > 2) {
+            uint32_t threads = 256;
+            while (threads > 1 && 2u * threads > count / 2) threads >>= 1;
+            const uint32_t blocks = count / (2 * threads);
+            const size_t shared = (size_t)threads * 2 * 8 * sizeof(uint32_t);
+            reduceTree<<<blocks, threads, shared, stream_>>>(
+                in, count, (const uint32_t *)dJobKey_, outBuf);
+            count = blocks;
+            const uint8_t *next = outBuf;
+            outBuf = const_cast<uint8_t *>(in);
+            in = next;
+        }
+        rootCv<<<1, 1, 0, stream_>>>(in, (const uint32_t *)dJobKey_, root);
+    }
+
+    static constexpr uint32_t kK = 2048;
+    static constexpr int kRank = 128;
+    static constexpr int kNoiseMask = 63, kNoiseShift = 32;
+
+    Shape shape_ = kShapes[sizeof(kShapes) / sizeof(kShapes[0]) - 1];
+    bool allocated_ = false;
+    bool haveJob_ = false;
+    uint8_t header_[76] = {};
+    int cert_ = 3;
+    MiningConfig cfg_;
+    U256 bound_;
+    uint8_t jobKey_[32] = {};
+    uint64_t jobSalt_ = 0, btSeed_ = 0;
+    std::vector<Win> wins_;
+
+    cudaStream_t stream_ = nullptr;
+    std::vector<void *> owned_;
+
+    int8_t *dA_ = nullptr, *dAn_ = nullptr, *dBt_ = nullptr, *dBn_ = nullptr;
+    int8_t *dEAL_ = nullptr, *dEBRflat_ = nullptr, *dEBR_ = nullptr;
+    uint16_t *dArF_ = nullptr, *dArS_ = nullptr, *dBlF_ = nullptr, *dBlS_ = nullptr;
+    uint8_t *dScratch_ = nullptr, *dRoots_ = nullptr;
+    uint8_t *dCommitA_ = nullptr, *dCommitB_ = nullptr, *dJobKey_ = nullptr;
+    uint8_t *dSaltA_ = nullptr, *dSaltB_ = nullptr;
+    uint8_t *dSeedA_ = nullptr, *dSeedB_ = nullptr, *dTarget_ = nullptr;
+    uint32_t *dTranscripts_ = nullptr, *dHitIndex_ = nullptr;
+    uint32_t *dHitDigest_ = nullptr, *dHitCount_ = nullptr;
+};
+
+}  // namespace
+
+Algorithm *makePearlPow() { return new PearlPow(); }
+
+}  // namespace om

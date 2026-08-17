@@ -197,6 +197,65 @@ __global__ void rootCv(const uint8_t *__restrict__ pair,
  * `salted` selects the V3 derivation. V1 and V2 skip it, and choosing wrong
  * yields a proof that looks well formed and is rejected by the node.
  */
+__device__ inline void bindRootDev(const uint8_t *root, uint32_t dim,
+                                   const uint8_t *salt, uint8_t *out) {
+    // root(32) || dim u32 LE(4) || zero padding(28) is exactly one blake3 block.
+    uint8_t msg[64];
+    uint32_t key[8], o[8];
+    for (int i = 0; i < 64; i++) msg[i] = 0;
+    for (int i = 0; i < 32; i++) msg[i] = root[i];
+    msg[32] = (uint8_t)dim;
+    msg[33] = (uint8_t)(dim >> 8);
+    msg[34] = (uint8_t)(dim >> 16);
+    msg[35] = (uint8_t)(dim >> 24);
+    b3d::loadCv(salt, key);
+    b3d::hashBlock64(key, msg, o);
+    b3d::storeCv(o, out);
+}
+
+/**
+ * commitment_B, which depends on B^t and the job and NOT on A.
+ *
+ * Split from commitment_A on purpose: this one is per-job work. E_BL and E_BR
+ * are drawn from it, so as long as only A varies between attempts, B_noised is
+ * bit-identical and none of the B side has to run again. That is the
+ * difference between a 48% prepare overhead and a 3% one.
+ */
+__global__ void deriveCommitmentB(const uint8_t *__restrict__ btRoot,
+                                  const uint8_t *__restrict__ jobKey,
+                                  const uint8_t *__restrict__ saltB, uint32_t n,
+                                  int salted, uint8_t *__restrict__ commitB) {
+    if (threadIdx.x || blockIdx.x) return;
+    uint8_t b[32], msg[64];
+    uint32_t out[8];
+    if (salted) bindRootDev(btRoot, n, saltB, b);
+    else for (int i = 0; i < 32; i++) b[i] = btRoot[i];
+
+    for (int i = 0; i < 32; i++) { msg[i] = jobKey[i]; msg[i + 32] = b[i]; }
+    b3d::hashBlock64Unkeyed(msg, out);
+    b3d::storeCv(out, commitB);
+}
+
+/**
+ * commitment_A, which is per-attempt: it is the A-noise seed AND the PoW key,
+ * so it is the value that makes every transcript depend on the matrices.
+ */
+__global__ void deriveCommitmentA(const uint8_t *__restrict__ aRoot,
+                                  const uint8_t *__restrict__ commitB,
+                                  const uint8_t *__restrict__ saltA, uint32_t m,
+                                  int salted, uint8_t *__restrict__ commitA) {
+    if (threadIdx.x || blockIdx.x) return;
+    uint8_t a[32], msg[64];
+    uint32_t out[8];
+    if (salted) bindRootDev(aRoot, m, saltA, a);
+    else for (int i = 0; i < 32; i++) a[i] = aRoot[i];
+
+    for (int i = 0; i < 32; i++) { msg[i] = commitB[i]; msg[i + 32] = a[i]; }
+    b3d::hashBlock64Unkeyed(msg, out);
+    b3d::storeCv(out, commitA);
+}
+
+/** Both, for tests and for the first attempt of a job. */
 __global__ void deriveCommitments(const uint8_t *__restrict__ aRoot,
                                   const uint8_t *__restrict__ btRoot,
                                   const uint8_t *__restrict__ jobKey,
@@ -208,25 +267,10 @@ __global__ void deriveCommitments(const uint8_t *__restrict__ aRoot,
     if (threadIdx.x || blockIdx.x) return;
 
     uint8_t a[32], b[32], msg[64];
-    uint32_t key[8], out[8];
-
+    uint32_t out[8];
     if (salted) {
-        // root(32) || dim u32 LE(4) || zero padding(28) is one blake3 block.
-        for (int i = 0; i < 64; i++) msg[i] = 0;
-        for (int i = 0; i < 32; i++) msg[i] = aRoot[i];
-        msg[32] = (uint8_t)m; msg[33] = (uint8_t)(m >> 8);
-        msg[34] = (uint8_t)(m >> 16); msg[35] = (uint8_t)(m >> 24);
-        b3d::loadCv(saltA, key);
-        b3d::hashBlock64(key, msg, out);
-        b3d::storeCv(out, a);
-
-        for (int i = 0; i < 64; i++) msg[i] = 0;
-        for (int i = 0; i < 32; i++) msg[i] = btRoot[i];
-        msg[32] = (uint8_t)n; msg[33] = (uint8_t)(n >> 8);
-        msg[34] = (uint8_t)(n >> 16); msg[35] = (uint8_t)(n >> 24);
-        b3d::loadCv(saltB, key);
-        b3d::hashBlock64(key, msg, out);
-        b3d::storeCv(out, b);
+        bindRootDev(aRoot, m, saltA, a);
+        bindRootDev(btRoot, n, saltB, b);
     } else {
         for (int i = 0; i < 32; i++) { a[i] = aRoot[i]; b[i] = btRoot[i]; }
     }
@@ -238,6 +282,56 @@ __global__ void deriveCommitments(const uint8_t *__restrict__ aRoot,
     for (int i = 0; i < 32; i++) { msg[i] = commitB[i]; msg[i + 32] = a[i]; }
     b3d::hashBlock64Unkeyed(msg, out);
     b3d::storeCv(out, commitA);
+}
+
+// -------------------------------------------------------------- pow search
+
+/**
+ * Hash every transcript and compact the winners into a short list.
+ *
+ * The alternative - a flag per transcript, scanned on the host - means reading
+ * back a megabyte per attempt to find the handful of ones that matter, or
+ * usually none at all. An atomic append costs nothing when nothing wins, which
+ * is the case for every attempt but one in a very long time.
+ *
+ * `target` is eight little-endian words, and the comparison walks from the
+ * most significant down, matching the reference's
+ * int.from_bytes(digest, "little") <= bound.
+ */
+__global__ void powScan(const uint32_t *__restrict__ transcripts, uint32_t count,
+                        const uint8_t *__restrict__ key,
+                        const uint32_t *__restrict__ target,
+                        uint32_t *__restrict__ hitIndex,
+                        uint32_t *__restrict__ hitDigest,
+                        uint32_t *__restrict__ hitCount, uint32_t maxHits) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+
+    uint32_t k[8], blk[16], out[8];
+    b3d::loadCv(key, k);
+#pragma unroll
+    for (int j = 0; j < 16; j++) blk[j] = transcripts[i * 16 + j];
+
+    uint32_t cv[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) cv[j] = k[j];
+    b3d::compress(cv, blk, 0, 64u,
+                  b3d::kKeyedHash | b3d::kChunkStart | b3d::kChunkEnd | b3d::kRoot);
+#pragma unroll
+    for (int j = 0; j < 8; j++) out[j] = cv[j];
+
+    bool win = true;
+    for (int j = 7; j >= 0; --j) {
+        if (out[j] < target[j]) break;
+        if (out[j] > target[j]) { win = false; break; }
+    }
+    if (!win) return;
+
+    const uint32_t slot = atomicAdd(hitCount, 1u);
+    if (slot >= maxHits) return;
+    hitIndex[slot] = i;
+#pragma unroll
+    for (int j = 0; j < 8; j++) hitDigest[slot * 8 + j] = out[j];
 }
 
 // ------------------------------------------------------------------ noise

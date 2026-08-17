@@ -13,3 +13,5 @@ soat-miner-*
 sm-*
 tests/test_pearl_job
 tests/test_pearl_gateway
+tests/test_pearl_prepare
+tests/test_pearl_algo
