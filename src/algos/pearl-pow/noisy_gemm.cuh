@@ -959,6 +959,12 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
         // into the stage nobody is reading now.
         if (step + kStages - 1 < totalSteps)
             OM_PEARL_ISSUE(step + kStages - 1, (step + kStages - 1) % kStages)
+        else
+            // Same drain bug the raw-mma kernel had, and with kStages=4 it can
+            // reach the last TWO folds rather than one. An empty commit group
+            // still counts as a group, so the constant wait stays correct all
+            // the way to the end without a branch.
+            OM_PEARL_COMMIT();
     }
 #undef OM_PEARL_ISSUE
 #undef OM_PEARL_CP
@@ -1160,6 +1166,24 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     int issueStage = (kStages - 1) % kStages;
     int sinceFold = 0;                   // counts up to stepsPerRank
     for (int step = 0; step < totalSteps; step++) {
+        // The pipeline DRAINS at the tail, and the steady-state wait is wrong
+        // there. No new commit is issued for the last kStages-1 steps, so by
+        // the final step the only commit still outstanding is the one holding
+        // that step's own data - and wait_prior(kStages-2) permits exactly
+        // that many to remain, so it returns without waiting for it.
+        //
+        // This cost 7% of found candidates: they failed the host re-check and
+        // were correctly not submitted, but the work was thrown away. Only
+        // transcript word 15 ever differed, because only the last fold reads
+        // the racing buffer. The reference vectors never caught it - their k
+        // is small enough that the copy has always landed - which is why the
+        // gate now includes a differential run at the k and rank we mine at.
+        //
+        // Fixed by keeping the pipeline DEPTH constant instead of varying the
+        // wait: the tail commits an empty group, which still counts as a
+        // group, so one compile-time-constant wait stays correct to the end.
+        // Branching on the wait instead pushed the kernel over the register
+        // budget and it stopped launching at 512 threads.
         __pipeline_wait_prior(kStages - 2);
         __syncthreads();
 
@@ -1227,6 +1251,8 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
 
         if (step + kStages - 1 < totalSteps)
             OM_PTX_ISSUE(step + kStages - 1, issueStage)
+        else
+            __pipeline_commit();   // empty group, purely to hold the depth
 
         if (++stage == kStages) stage = 0;
         if (++issueStage == kStages) issueStage = 0;

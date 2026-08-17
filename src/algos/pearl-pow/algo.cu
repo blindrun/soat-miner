@@ -370,6 +370,10 @@ class PearlPow : public Algorithm {
         uint64_t attempts = count / perAttempt;
         if (attempts == 0) attempts = 1;
 
+        // Only this call's wins matter to the verify() that follows it, and
+        // keeping older ones risks an old entry shadowing a repeated nonce.
+        wins_.clear();
+
         for (uint64_t i = 0; i < attempts; i++) {
             const uint64_t nonce = nonceBase + i;
             if (!runAttempt(nonce)) return false;
@@ -405,10 +409,10 @@ class PearlPow : public Algorithm {
      */
     bool verify(const Job &job, const Solution &sol) const override {
         (void)job;
-        for (const Win &w : wins_) {
-            if (w.nonce != sol.nonce) continue;
-            return w.verified;
-        }
+        // Newest first: if a nonce ever repeats, the current attempt's answer
+        // is the right one.
+        for (auto it = wins_.rbegin(); it != wins_.rend(); ++it)
+            if (it->nonce == sol.nonce) return it->verified;
         return false;
     }
 
@@ -626,9 +630,42 @@ class PearlPow : public Algorithm {
 
         Win win;
         win.nonce = nonce;
-        win.verified = recheck(A, Bt, commitA, commitB, tRow, tCol);
+        uint32_t hostTr[kTranscriptWords] = {};
+        win.verified = recheck(A, Bt, commitA, commitB, tRow, tCol, hostTr);
+        if (!win.verified && getenv("SOAT_PEARL_DEBUG")) {
+            // Is the GPU's transcript for this tile the same as the one the
+            // host just rebuilt from A, B and the noise? If they match, the
+            // disagreement is in the digest or the bound; if they differ, the
+            // strips or the tile index are wrong. Anything else is guessing.
+            uint32_t gpuTr[kTranscriptWords] = {};
+            cudaMemcpy(gpuTr, dTranscripts_ + (size_t)flat * kTranscriptWords,
+                       sizeof(gpuTr), cudaMemcpyDeviceToHost);
+            bool same = true;
+            for (int w = 0; w < (int)kTranscriptWords; w++)
+                if (gpuTr[w] != hostTr[w]) same = false;
+            fprintf(stderr,
+                    "[pearl-dbg] flat=%u tRow=%u tCol=%u shape=%ux%u "
+                    "transcript %s\n", flat, tRow, tCol, shape_.m, shape_.n,
+                    same ? "MATCHES (digest/bound differ)" : "DIFFERS");
+            if (!same) {
+                fprintf(stderr, "  gpu :");
+                for (int w = 0; w < (int)kTranscriptWords; w++)
+                    fprintf(stderr, " %08x", gpuTr[w]);
+                fprintf(stderr, "\n  host:");
+                for (int w = 0; w < (int)kTranscriptWords; w++)
+                    fprintf(stderr, " %08x", hostTr[w]);
+                fprintf(stderr, "\n");
+            }
+        }
+        // No cap. run.cpp calls verify() once per solution returned by THIS
+        // search(), so the list only has to cover this call - and search()
+        // clears it. Capping it at 32 while a call can run 64 attempts meant
+        // verify() could not find the nonce and reported a perfectly good
+        // solution as a host-verification failure, which then went
+        // unsubmitted. It scaled with hashrate, because a faster kernel gets
+        // more attempts into the same batch: 50% of solutions thrown away at
+        // 1024x16384, 8% at 4096x32768, none at all on the slowest kernel.
         wins_.push_back(win);
-        if (wins_.size() > 32) wins_.erase(wins_.begin());
         if (!win.verified) {
             // Reported, not submitted: the core prints it as a host rejection.
             Solution sol;
@@ -659,7 +696,8 @@ class PearlPow : public Algorithm {
     /** The node's own check, on the host, from the two matrices. */
     bool recheck(const std::vector<int8_t> &A, const std::vector<int8_t> &Bt,
                  const uint8_t commitA[32], const uint8_t commitB[32],
-                 uint32_t tRow, uint32_t tCol) const {
+                 uint32_t tRow, uint32_t tCol,
+                 uint32_t *trOut = nullptr) const {
         Noise noise;
         noise.generate(commitA, commitB, shape_.m, shape_.n, kK, kRank);
 
@@ -687,6 +725,8 @@ class PearlPow : public Algorithm {
         uint32_t transcript[kTranscriptWords];
         tileTranscript(aStrip.data(), bStrip.data(), kK, kTileSide, kRank, 0, 0,
                        kTileSide, kTileSide, transcript);
+        if (trOut)
+            for (uint32_t w = 0; w < kTranscriptWords; w++) trOut[w] = transcript[w];
         uint8_t d[32];
         powDigest(transcript, commitA, d);
         return U256::fromBytesLE(d).le(bound_);
