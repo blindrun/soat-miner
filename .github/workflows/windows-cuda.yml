@@ -1,0 +1,76 @@
+# Builds the Windows CUDA binary that the Linux cross-build cannot produce
+# (nvcc needs MSVC on a Windows host). The runner has no GPU, so this only
+# COMPILES and checks the imports - it never mines. Real hashrate numbers come
+# from running the binary on actual cards.
+#
+# The recipe here mirrors the one proven by hand on a real Windows box: a
+# multi-arch fat binary (Turing/Ampere/Ada native + PTX for Hopper/Blackwell)
+# with the CUDA runtime linked statically, so the .exe carries no cudart64 DLL.
+# The only non-system dependency left is the VC++ runtime, which is bundled.
+name: windows-cuda
+
+on:
+  workflow_dispatch: {}        # build on demand
+  push:
+    tags: ['v*']               # and attach to a version tag's release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+          # nvcc to compile, cudart for the static runtime lib, the VS
+          # integration so CMake's Visual Studio generator finds the toolset.
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build-rel -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;90-virtual" `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
+
+      - name: Build
+        run: cmake --build build-rel --config Release
+
+      - name: Bundle VC++ runtime and stage the package
+        shell: pwsh
+        run: |
+          $pkg = "cuda-pkg"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item build-rel\Release\soat-miner.exe $pkg\ -Force
+          foreach ($dll in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll') {
+            $src = Get-ChildItem "C:\Windows\System32\$dll" -EA SilentlyContinue | Select-Object -First 1
+            if ($src) { Copy-Item $src.FullName $pkg\ -Force } else { throw "missing $dll" }
+          }
+          # Fail loudly if cudart leaked back in as a dynamic dependency.
+          $imports = & dumpbin /dependents "$pkg\soat-miner.exe"
+          if ($imports -match 'cudart') { throw "cudart64 dynamically linked - static link failed" }
+          Get-ChildItem $pkg | Select-Object Name,Length | Format-Table -AutoSize
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soat-miner-win64-cuda
+          path: cuda-pkg/
+
+      # Only when a version tag pushed this run: attach the CUDA bits to that
+      # release so the download page has both backends.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          Compress-Archive -Path cuda-pkg\* -DestinationPath "soat-miner_${{ github.ref_name }}_Win64_CUDA.zip" -Force
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: soat-miner_${{ github.ref_name }}_Win64_CUDA.zip

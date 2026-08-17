@@ -219,6 +219,15 @@ windows: $(BUILD)/spirv.cpp $(WINDIR)/libvulkan-1.a
 windows-package: windows
 	@rm -rf $(BUILD)/$(WINPKG) && mkdir -p $(BUILD)/$(WINPKG)
 	cp $(WINDIR)/soat-miner-vk.exe $(BUILD)/$(WINPKG)/
+	@# Fold in the CUDA build if a Windows host staged it in build/win/cuda/.
+	@# nvcc needs MSVC so it cannot be built here; the windows-cuda CI job (or
+	@# a hand build) drops soat-miner.exe plus its VC++ runtime DLLs there.
+	@if [ -f $(WINDIR)/cuda/soat-miner.exe ]; then \
+	  cp $(WINDIR)/cuda/soat-miner.exe $(WINDIR)/cuda/*.dll $(BUILD)/$(WINPKG)/ && \
+	  echo "  + CUDA build folded in ($(WINDIR)/cuda/)"; \
+	else \
+	  echo "  (no CUDA build staged in $(WINDIR)/cuda/, shipping Vulkan only)"; \
+	fi
 	cp packaging/*.bat packaging/config.txt packaging/README-WINDOWS.txt README.md LICENSE $(BUILD)/$(WINPKG)/
 	cd $(BUILD) && zip -qr $(WINPKG).zip $(WINPKG)
 	@sha256sum $(BUILD)/$(WINPKG).zip | tee $(BUILD)/$(WINPKG).zip.sha256

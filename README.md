@@ -150,6 +150,9 @@ Measured at the current dataset size, 7.27GB.
 |---|---|---|
 | RTX 5080 | Vulkan | 267.6 |
 | RTX 4090 | CUDA | 217.5 |
+| RTX 4080 | CUDA | 125.3 |
+| RTX 4070 SUPER | CUDA | 97.9 |
+| RTX 4060 Ti | CUDA | 63.5 |
 | RX 7900 XT | Vulkan | 151.9 |
 | RX 6700 XT | Vulkan | 82.9 |
 
@@ -314,8 +317,9 @@ BE WARNED: RTX 50-series needs CUDA Toolkit 12.8 or newer to get native code.
 Older toolkits still work. They fall back to PTX and the driver compiles it at
 startup.
 
-CUDA cannot be cross compiled from Linux. nvcc needs MSVC on a Windows host.
-That is why the Windows download ships the Vulkan build only.
+CUDA cannot be cross compiled from Linux. nvcc needs MSVC on a Windows host, so
+the CUDA build is compiled on Windows in CI (`.github/workflows/windows-cuda.yml`).
+The Windows download ships both builds and soat-miner.bat picks the right one.
 
 ## Correctness
 

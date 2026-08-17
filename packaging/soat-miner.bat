@@ -42,15 +42,15 @@ if %CAPMAJOR% GEQ 12 (
 :backend_done
 if /i "%BACKEND%"=="cuda" ( set BIN=soat-miner.exe ) else ( set BIN=soat-miner-vk.exe )
 
-REM The Windows archive ships the Vulkan build only - CUDA cannot be
-REM cross-compiled from Linux (nvcc needs MSVC). Fall back rather than fail
-REM with a confusing "not found" on an NVIDIA machine.
+REM Both builds ship in the archive now. If the CUDA one is missing anyway
+REM (deleted, or an old Vulkan-only archive), fall back rather than fail with a
+REM confusing "not found" on an NVIDIA machine.
 if not exist "%BIN%" (
   if exist "soat-miner-vk.exe" (
     echo [!] %BIN% not present, using soat-miner-vk.exe ^(Vulkan^)
     echo [!] On Blackwell ^(RTX 50-series^) that is the faster backend anyway.
-    echo [!] On Ada and older, CUDA is about 34%% faster - build it from source
-    echo [!] with CMake if you want it.
+    echo [!] On Ada and older, CUDA is about 34%% faster - re-download the full
+    echo [!] archive, or build it from source with CMake.
     set BIN=soat-miner-vk.exe
   ) else (
     echo No miner binary found in this folder.
