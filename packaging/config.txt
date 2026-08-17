@@ -20,6 +20,8 @@ WORKER=rig1
 PASSWORD=x
 
 # --------------------------------------------------------------- LITHOS MODE
+# TEST NETWORK ONLY for now: tested end to end against a live Lithos client on
+# the Ergo testnet (shares accepted), but not yet validated on mainnet.
 # Lithos is a decentralised pool protocol, not a coin or an algorithm - the
 # proof of work is the same Autolykos v2. Its reference client runs a stratum
 # server on your own machine and settles rewards on-chain, so there is no pool

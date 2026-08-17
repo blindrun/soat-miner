@@ -158,7 +158,18 @@ class Autolykos2 : public Algorithm {
         }
 
         if (found == 0) return true;
-        if (found > kMaxSolutions) found = kMaxSolutions;
+        if (found > kMaxSolutions) {
+            // The GPU found more solutions in one batch than the buffer holds,
+            // so the excess were dropped. Harmless at real pool difficulty (a
+            // batch almost never finds this many), but a very low difficulty
+            // can trip it and silently lose valid shares - so make it visible
+            // rather than have it masquerade as flaky hardware.
+            fprintf(stderr,
+                    "[autolykos2] warning: %u solutions in one batch exceeds the "
+                    "%u-solution buffer; %u dropped. Difficulty may be too low.\n",
+                    found, kMaxSolutions, found - kMaxSolutions);
+            found = kMaxSolutions;
+        }
 
         std::vector<AlSolution> host(found);
         cudaMemcpyAsync(host.data(), dSol_, sizeof(AlSolution) * found,
@@ -214,7 +225,10 @@ class Autolykos2 : public Algorithm {
     }
 
    private:
-    static const uint32_t kMaxSolutions = 32;
+    // 256, not 32: one batch at a deliberately low difficulty (e.g. a Lithos
+    // test diff) can find well over 32 solutions, and anything past the buffer
+    // is silently lost. 256 is still tiny (10 KB) and covers realistic bursts.
+    static const uint32_t kMaxSolutions = 256;
 
     void releaseBuffer(uint4 **p, size_t *cap) {
         if (*p) cudaFree(*p);
