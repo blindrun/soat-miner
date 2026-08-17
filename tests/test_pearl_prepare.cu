@@ -33,12 +33,12 @@
 // it past the 48 KB static limit - so its shared memory is dynamic and every
 // launch site must size it and opt in. Getting this wrong is not subtle: the
 // kernel reads a zero-length allocation.
-template <int WM, int WN, int TM, int TN, int KKB>
+template <int WM, int WN, int TM, int TN, int KKB, int ST = 3>
 static inline int ptxSmem() {
-    constexpr int kStages = 3;
+    constexpr int kStages = ST;
     constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
     constexpr int smem = kStages * (blockM * (KKB + 16) + blockN * (KKB + 16));
-    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB>,
+    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB, ST>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     return smem;
 }
@@ -821,18 +821,21 @@ int main(int argc, char **argv) {
 
 // Same body, but reading the n-major copy of B. Kept as a separate macro
 // rather than a flag so a wrong-layout launch cannot happen by omission.
-#define SWEEP_PTX_K(WM, WN, TM, TN, KKB)                                              \
+#define SWEEP_PTX_K(WM, WN, TM, TN, KKB, ST)                                              \
         {                                                                      \
             constexpr int threads = (WM) * (WN) * 32;                          \
             constexpr int blockM = (WM) * (TM) * 16;                           \
             constexpr int blockN = (WN) * (TN) * 16;                           \
-            if (bm % blockM == 0 && bn % blockN == 0) {                         \
+            if ((bk / 32) % (KKB / 32)) {                                      \
+                printf("    ptx k%-3d s%d %dx%d/%dx%d  SKIPPED, %d does not"    \
+                       " divide k=%u\n", KKB, ST, WM, WN, TM, TN, KKB, bk);     \
+            } else if (bm % blockM == 0 && bn % blockN == 0) {                  \
                 dim3 g(bn / blockN, bm / blockM);                              \
                 double ms = 0;                                                 \
                 for (int rep = 0; rep < 4; rep++) {                            \
                     CHECK(cudaEventRecord(a, s));                              \
-                    noisyGemmPtx<WM, WN, TM, TN, KKB>\
-                        <<<g, threads, ptxSmem<WM, WN, TM, TN, KKB>(), s>>>(        \
+                    noisyGemmPtx<WM, WN, TM, TN, KKB, ST>\
+                        <<<g, threads, ptxSmem<WM, WN, TM, TN, KKB, ST>(), s>>>(        \
                         gAn, gBnT, nullptr, gTrans, (int)bm, (int)bn, (int)bk, \
                         (int)br, false);                                       \
                     CHECK(cudaEventRecord(b, s));                              \
@@ -848,20 +851,20 @@ int main(int argc, char **argv) {
                     if (rep) ms += d;                                          \
                 }                                                              \
                 if (ms < 0) {                                                  \
-                    printf("    ptx k%-3d %dx%d/%dx%d  block %3dx%3d  LAUNCH"  \
-                           " FAILED\n", KKB, WM, WN, TM, TN, blockM, blockN);   \
+                    printf("    ptx k%-3d s%d %dx%d/%dx%d  block %3dx%3d  LAUNCH"  \
+                           " FAILED\n", KKB, ST, WM, WN, TM, TN, blockM, blockN); \
                 } else {                                                       \
                 ms /= 3;                                                       \
                 const double mac = (double)bm * bn * bk;                       \
-                printf("    ptx k%-3d %dx%d/%dx%d  block %3dx%3d  %2d acc  " \
-                       "%7.3f ms  %6.1f TOPS\n", KKB, WM, WN, TM, TN, blockM, \
+                printf("    ptx k%-3d s%d %dx%d/%dx%d  block %3dx%3d  %2d acc  " \
+                       "%7.3f ms  %6.1f TOPS\n", KKB, ST, WM, WN, TM, TN, blockM, \
                        blockN, (TM) * (TN), ms, 2.0 * mac / (ms * 1e-3) / 1e12);\
                 if (ms < bestMs) {                                             \
                     secondMs = bestMs;                                         \
                     memcpy(secondName, bestName, sizeof(secondName));          \
                     bestMs = ms;                                               \
                     snprintf(bestName, sizeof(bestName),                       \
-                             "ptx k%d %dx%d/%dx%d", KKB, WM, WN, TM, TN);       \
+                             "ptx k%d s%d %dx%d/%dx%d", KKB, ST, WM, WN, TM, TN); \
                 }                                                              \
                 }                                                              \
             }                                                                  \
@@ -892,24 +895,31 @@ int main(int argc, char **argv) {
         SWEEP_AS(2, 4, 2, 4)
         SWEEP_AS(2, 4, 4, 4)
         SWEEP_AS(4, 4, 2, 2)
-        SWEEP_PTX_K(2, 4, 4, 4, 32)
-        SWEEP_PTX_K(4, 4, 2, 4, 32)
-        SWEEP_PTX_K(4, 4, 4, 2, 32)
-        SWEEP_PTX_K(2, 4, 4, 2, 32)
-        SWEEP_PTX_K(4, 4, 2, 2, 32)
-        SWEEP_PTX_K(4, 8, 2, 2, 32)
-        SWEEP_PTX_K(2, 4, 4, 4, 64)
-        SWEEP_PTX_K(4, 4, 2, 4, 64)
-        SWEEP_PTX_K(4, 4, 4, 2, 64)
-        SWEEP_PTX_K(2, 4, 4, 2, 64)
-        SWEEP_PTX_K(4, 4, 2, 2, 64)
-        SWEEP_PTX_K(4, 8, 2, 2, 64)
-        SWEEP_PTX_K(2, 4, 4, 4, 128)
-        SWEEP_PTX_K(4, 4, 2, 4, 128)
-        SWEEP_PTX_K(4, 4, 4, 2, 128)
-        SWEEP_PTX_K(2, 4, 4, 2, 128)
-        SWEEP_PTX_K(4, 4, 2, 2, 128)
-        SWEEP_PTX_K(4, 8, 2, 2, 128)
+        SWEEP_PTX_K(2, 4, 4, 4, 32, 3)
+        SWEEP_PTX_K(4, 4, 2, 4, 32, 3)
+        SWEEP_PTX_K(4, 4, 4, 2, 32, 3)
+        SWEEP_PTX_K(2, 4, 4, 2, 32, 3)
+        SWEEP_PTX_K(4, 4, 2, 2, 32, 3)
+        SWEEP_PTX_K(2, 4, 4, 4, 64, 3)
+        SWEEP_PTX_K(4, 4, 2, 4, 64, 3)
+        SWEEP_PTX_K(4, 4, 4, 2, 64, 3)
+        SWEEP_PTX_K(2, 4, 4, 2, 64, 3)
+        SWEEP_PTX_K(4, 4, 2, 2, 64, 3)
+        SWEEP_PTX_K(2, 4, 4, 4, 64, 2)
+        SWEEP_PTX_K(4, 4, 2, 4, 64, 2)
+        SWEEP_PTX_K(4, 4, 4, 2, 64, 2)
+        SWEEP_PTX_K(2, 4, 4, 2, 64, 2)
+        SWEEP_PTX_K(4, 4, 2, 2, 64, 2)
+        SWEEP_PTX_K(2, 4, 4, 4, 96, 2)
+        SWEEP_PTX_K(4, 4, 2, 4, 96, 2)
+        SWEEP_PTX_K(4, 4, 4, 2, 96, 2)
+        SWEEP_PTX_K(2, 4, 4, 2, 96, 2)
+        SWEEP_PTX_K(4, 4, 2, 2, 96, 2)
+        SWEEP_PTX_K(2, 4, 4, 4, 128, 2)
+        SWEEP_PTX_K(4, 4, 2, 4, 128, 2)
+        SWEEP_PTX_K(4, 4, 4, 2, 128, 2)
+        SWEEP_PTX_K(2, 4, 4, 2, 128, 2)
+        SWEEP_PTX_K(4, 4, 2, 2, 128, 2)
 #undef SWEEP_PTX_K
 #undef SWEEP_AS
 #undef SWEEP_DB

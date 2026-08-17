@@ -25,12 +25,12 @@
 // it past the 48 KB static limit - so its shared memory is dynamic and every
 // launch site must size it and opt in. Getting this wrong is not subtle: the
 // kernel reads a zero-length allocation.
-template <int WM, int WN, int TM, int TN, int KKB>
+template <int WM, int WN, int TM, int TN, int KKB, int ST = 3>
 static inline int ptxSmem() {
-    constexpr int kStages = 3;
+    constexpr int kStages = ST;
     constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
     constexpr int smem = kStages * (blockM * (KKB + 16) + blockN * (KKB + 16));
-    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB>,
+    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB, ST>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     return smem;
 }

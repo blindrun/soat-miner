@@ -1075,7 +1075,8 @@ __device__ __forceinline__ void mmaS8(uint32_t d[4], const uint32_t a[4],
  * Requires B in n-major order (applyNoiseBt). Launch with
  * kWarpsM*kWarpsN*32 threads and grid (n/kBlockN, m/kBlockM).
  */
-template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN, int kKBlock = 32>
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN, int kKBlock = 32,
+          int kStagesP = 3>
 // Dynamic shared costs address registers that a static array did not: this
 // went 110 -> 154 registers on the refactor, and 512 threads x 154 exceeds the
 // 65536-register file, so the 16-warp configurations simply stopped launching.
@@ -1091,7 +1092,13 @@ __global__ __launch_bounds__(kWarpsM *kWarpsN * 32, 1) void noisyGemmPtx(
     constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;
     constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
     constexpr int kThreads = kWarpsM * kWarpsN * 32;
-    constexpr int kStages = 3;
+    // Stages are a parameter because depth and stage count trade against one
+    // shared-memory budget: 128 of k will not fit three stages of padded
+    // shared, but it fits two. L2 throughput sits at ~91% while DRAM is 21%,
+    // and that metric saturates on TRANSACTIONS rather than bytes - which is
+    // why staging deeper keeps paying even though bytes per candidate are
+    // unchanged.
+    constexpr int kStages = kStagesP;
     // How much k one shared stage holds. Pearl's own reference GEMM uses a
     // k-block of 128; this kernel used 32, which is the mma's k and no more.
     // At 32 the loop takes a barrier every 32 of k, and each row's global read

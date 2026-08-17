@@ -71,10 +71,19 @@ const Shape kShapes[] = {
     // puts 4096x65536 top at 2.1% overhead against 4.1% for 4096x32768 -
     // and that shape was not in this list at all, so the tuner could not
     // reach it however hard it measured.
+    // The ranking MOVES whenever the kernel changes - staging 64 of k instead
+    // of 32 pushed a 4090 from 4096x32768 down to 2048x16384 - so this list is
+    // deliberately denser than the shapes that have ever won. A shape absent
+    // here cannot be measured however good the tuner is.
     {4096, 65536},   // ~340 MB of B in both layouts; needs a 16 GB card
+    {8192, 16384},
     {4096, 32768},
+    {4096, 16384},
+    {2048, 65536},
     {2048, 32768},
     {2048, 16384},
+    {2048, 8192},
+    {1024, 32768},
     {1024, 16384},
     {512, 8192},     // small cards and integrated parts
     {256, 2048},
@@ -118,6 +127,13 @@ struct TileConfig {
     // nothing at a spectacular rate. Skipping by capability is the fix; a
     // failed launch is not a reliable signal when the fallback succeeds.
     int minArch;
+    // How much k one shared stage holds. The kernel REFUSES to run when this
+    // does not divide the job's k evenly - it returns before the first mma -
+    // and a kernel that returns immediately looks infinitely fast to a timing
+    // sweep, so the tuner would select it and mine nothing at a spectacular
+    // rate. k96 does exactly this at k=2048 (64 steps, 3 does not divide it).
+    // Second time this exact trap has appeared; check it here, not downstream.
+    int blockK;
     void (*launch)(dim3, int, cudaStream_t, const int8_t *, const int8_t *,
                    uint32_t *, int, int, int, int);
 };
@@ -151,47 +167,47 @@ void launchTiledAsync(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
  * cudaFuncSetAttribute is idempotent and cheap; doing it on every launch
  * would not be, hence the flag.
  */
-template <int WM, int WN, int TM, int TN, int KKB>
+template <int WM, int WN, int TM, int TN, int KKB, int ST = 3>
 void launchPtx(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
                const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
-    constexpr int kStages = 3;
+    constexpr int kStages = ST;
     constexpr int aStride = KKB + 16, bStride = KKB + 16;
     constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
     constexpr int smem = kStages * (blockM * aStride + blockN * bStride);
     static bool optedIn = false;
     if (!optedIn) {
-        cudaFuncSetAttribute(noisyGemmPtx<WM, WN, TM, TN, KKB>,
+        cudaFuncSetAttribute(noisyGemmPtx<WM, WN, TM, TN, KKB, ST>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         optedIn = true;
     }
-    noisyGemmPtx<WM, WN, TM, TN, KKB>
+    noisyGemmPtx<WM, WN, TM, TN, KKB, ST>
         <<<grid, threads, smem, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
 const TileConfig kTileConfigs[] = {
-    {"single 2x4/2x2", 64, 128, 256, false, 70, &launchTiled<2, 4, 2, 2>},
-    {"single 2x4/4x2", 128, 128, 256, false, 70, &launchTiled<2, 4, 4, 2>},
-    {"single 2x4/2x4", 64, 256, 256, false, 70, &launchTiled<2, 4, 2, 4>},
-    {"single 2x4/4x4", 128, 256, 256, false, 70, &launchTiled<2, 4, 4, 4>},
-    {"single 4x2/2x2", 128, 64, 256, false, 70, &launchTiled<4, 2, 2, 2>},
-    {"single 4x4/2x2", 128, 128, 512, false, 70, &launchTiled<4, 4, 2, 2>},
+    {"single 2x4/2x2", 64, 128, 256, false, 70, 32, &launchTiled<2, 4, 2, 2>},
+    {"single 2x4/4x2", 128, 128, 256, false, 70, 32, &launchTiled<2, 4, 4, 2>},
+    {"single 2x4/2x4", 64, 256, 256, false, 70, 32, &launchTiled<2, 4, 2, 4>},
+    {"single 2x4/4x4", 128, 256, 256, false, 70, 32, &launchTiled<2, 4, 4, 4>},
+    {"single 4x2/2x2", 128, 64, 256, false, 70, 32, &launchTiled<4, 2, 2, 2>},
+    {"single 4x4/2x2", 128, 128, 512, false, 70, 32, &launchTiled<4, 4, 2, 2>},
     // Double-buffered: prefetch the next k-slice while the tensor cores chew
     // the current one. 1.6x the single-buffered kernel in isolation.
-    {"dbuf 2x4/2x2", 64, 128, 256, false, 70, &launchTiledDB<2, 4, 2, 2>},
-    {"dbuf 2x4/4x2", 128, 128, 256, false, 70, &launchTiledDB<2, 4, 4, 2>},
-    {"dbuf 2x4/2x4", 64, 256, 256, false, 70, &launchTiledDB<2, 4, 2, 4>},
-    {"dbuf 2x4/4x4", 128, 256, 256, false, 70, &launchTiledDB<2, 4, 4, 4>},
-    {"dbuf 4x2/2x2", 128, 64, 256, false, 70, &launchTiledDB<4, 2, 2, 2>},
-    {"dbuf 4x4/2x2", 128, 128, 512, false, 70, &launchTiledDB<4, 4, 2, 2>},
+    {"dbuf 2x4/2x2", 64, 128, 256, false, 70, 32, &launchTiledDB<2, 4, 2, 2>},
+    {"dbuf 2x4/4x2", 128, 128, 256, false, 70, 32, &launchTiledDB<2, 4, 4, 2>},
+    {"dbuf 2x4/2x4", 64, 256, 256, false, 70, 32, &launchTiledDB<2, 4, 2, 4>},
+    {"dbuf 2x4/4x4", 128, 256, 256, false, 70, 32, &launchTiledDB<2, 4, 4, 4>},
+    {"dbuf 4x2/2x2", 128, 64, 256, false, 70, 32, &launchTiledDB<4, 2, 2, 2>},
+    {"dbuf 4x4/2x2", 128, 128, 512, false, 70, 32, &launchTiledDB<4, 4, 2, 2>},
     // cp.async, three stages. Ampere and later only - on an older card the
     // launch fails with "invalid device function" and pickTileConfig() skips
     // it, which is exactly the behaviour wanted rather than a build-time split.
-    {"async 2x4/2x2", 64, 128, 256, false, 80, &launchTiledAsync<2, 4, 2, 2>},
-    {"async 2x4/4x2", 128, 128, 256, false, 80, &launchTiledAsync<2, 4, 4, 2>},
-    {"async 2x4/2x4", 64, 256, 256, false, 80, &launchTiledAsync<2, 4, 2, 4>},
-    {"async 2x4/4x4", 128, 256, 256, false, 80, &launchTiledAsync<2, 4, 4, 4>},
-    {"async 4x2/2x2", 128, 64, 256, false, 80, &launchTiledAsync<4, 2, 2, 2>},
-    {"async 4x4/2x2", 128, 128, 512, false, 80, &launchTiledAsync<4, 4, 2, 2>},
+    {"async 2x4/2x2", 64, 128, 256, false, 80, 32, &launchTiledAsync<2, 4, 2, 2>},
+    {"async 2x4/4x2", 128, 128, 256, false, 80, 32, &launchTiledAsync<2, 4, 4, 2>},
+    {"async 2x4/2x4", 64, 256, 256, false, 80, 32, &launchTiledAsync<2, 4, 2, 4>},
+    {"async 2x4/4x4", 128, 256, 256, false, 80, 32, &launchTiledAsync<2, 4, 4, 4>},
+    {"async 4x2/2x2", 128, 64, 256, false, 80, 32, &launchTiledAsync<4, 2, 2, 2>},
+    {"async 4x4/2x2", 128, 128, 512, false, 80, 32, &launchTiledAsync<4, 4, 2, 2>},
     // Raw mma.m16n8k32. WMMA's m16n16k16 needs two issues to cover the same
     // k that Ampere's native shape does in one, and the profiler had Tensor as
     // the busiest pipeline, so halving the issues is the point.
@@ -203,26 +219,26 @@ const TileConfig kTileConfigs[] = {
     // and 361 for the older static-shared kernel it replaced. 128 does not
     // fit three stages of padded shared, so it is not offered.
     // k32 is kept below it for cards where the deeper block will not fit.
-    {"ptx k64 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2, 64>},
-    {"ptx k64 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2, 64>},
-    {"ptx k64 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4, 64>},
-    {"ptx k64 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4, 64>},
-    {"ptx k64 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2, 64>},
-    {"ptx k64 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2, 64>},
-    {"ptx k64 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2, 64>},
-    {"ptx k64 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4, 64>},
-    {"ptx k64 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2, 64>},
-    {"ptx k64 4x8/2x2", 128, 256, 1024, true, 80, &launchPtx<4, 8, 2, 2, 64>},
-    {"ptx k32 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2, 32>},
-    {"ptx k32 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2, 32>},
-    {"ptx k32 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4, 32>},
-    {"ptx k32 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4, 32>},
-    {"ptx k32 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2, 32>},
-    {"ptx k32 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2, 32>},
-    {"ptx k32 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2, 32>},
-    {"ptx k32 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4, 32>},
-    {"ptx k32 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2, 32>},
-    {"ptx k32 4x8/2x2", 128, 256, 1024, true, 80, &launchPtx<4, 8, 2, 2, 32>},
+    {"ptx k64 2x4/2x2", 64, 128, 256, true, 80, 64, &launchPtx<2, 4, 2, 2, 64>},
+    {"ptx k64 2x4/4x2", 128, 128, 256, true, 80, 64, &launchPtx<2, 4, 4, 2, 64>},
+    {"ptx k64 2x4/2x4", 64, 256, 256, true, 80, 64, &launchPtx<2, 4, 2, 4, 64>},
+    {"ptx k64 2x4/4x4", 128, 256, 256, true, 80, 64, &launchPtx<2, 4, 4, 4, 64>},
+    {"ptx k64 4x2/2x2", 128, 64, 256, true, 80, 64, &launchPtx<4, 2, 2, 2, 64>},
+    {"ptx k64 4x4/2x2", 128, 128, 512, true, 80, 64, &launchPtx<4, 4, 2, 2, 64>},
+    {"ptx k64 4x4/4x2", 256, 128, 512, true, 80, 64, &launchPtx<4, 4, 4, 2, 64>},
+    {"ptx k64 4x4/2x4", 128, 256, 512, true, 80, 64, &launchPtx<4, 4, 2, 4, 64>},
+    {"ptx k64 8x2/2x2", 256, 64, 512, true, 80, 64, &launchPtx<8, 2, 2, 2, 64>},
+    {"ptx k64 4x8/2x2", 128, 256, 1024, true, 80, 64, &launchPtx<4, 8, 2, 2, 64>},
+    {"ptx k32 2x4/2x2", 64, 128, 256, true, 80, 32, &launchPtx<2, 4, 2, 2, 32>},
+    {"ptx k32 2x4/4x2", 128, 128, 256, true, 80, 32, &launchPtx<2, 4, 4, 2, 32>},
+    {"ptx k32 2x4/2x4", 64, 256, 256, true, 80, 32, &launchPtx<2, 4, 2, 4, 32>},
+    {"ptx k32 2x4/4x4", 128, 256, 256, true, 80, 32, &launchPtx<2, 4, 4, 4, 32>},
+    {"ptx k32 4x2/2x2", 128, 64, 256, true, 80, 32, &launchPtx<4, 2, 2, 2, 32>},
+    {"ptx k32 4x4/2x2", 128, 128, 512, true, 80, 32, &launchPtx<4, 4, 2, 2, 32>},
+    {"ptx k32 4x4/4x2", 256, 128, 512, true, 80, 32, &launchPtx<4, 4, 4, 2, 32>},
+    {"ptx k32 4x4/2x4", 128, 256, 512, true, 80, 32, &launchPtx<4, 4, 2, 4, 32>},
+    {"ptx k32 8x2/2x2", 256, 64, 512, true, 80, 32, &launchPtx<8, 2, 2, 2, 32>},
+    {"ptx k32 4x8/2x2", 128, 256, 1024, true, 80, 32, &launchPtx<4, 8, 2, 2, 32>},
 };
 
 class PearlPow : public Algorithm {
@@ -344,6 +360,7 @@ class PearlPow : public Algorithm {
         for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
             const TileConfig &tc = kTileConfigs[i];
             if (arch10_ && arch10_ < tc.minArch) continue;
+            if (tc.blockK <= 0 || (kK / 32) % (tc.blockK / 32)) continue;
             // Escape hatch for A/B work: SOAT_PEARL_TILE=ptx restricts the
             // sweep to configurations whose name starts with that string, so
             // "is the new kernel actually faster end to end" can be answered
