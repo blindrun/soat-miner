@@ -571,7 +571,13 @@ def _open(A, B_t, key, m, n, k, rank, t_rows, t_cols, tile_h, tile_w, digest):
         "plain_proof": encode_plain_proof(m, n, k, rank, a_proof, a_rows,
                                           bt_proof, b_cols),
         "a_proof": a_proof, "bt_proof": bt_proof, "key": key,
+        "A": A, "B_t": B_t,
     }
+
+
+def bits_to_target(bits):
+    """Bitcoin's compact difficulty encoding: one exponent byte, three mantissa."""
+    return (bits & 0xFFFFFF) << (8 * (((bits >> 24) & 0xFF) - 3))
 
 
 # ----------------------------------------------------------- gateway client
