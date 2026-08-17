@@ -144,11 +144,28 @@ void launchTiledAsync(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
         <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
-template <int WM, int WN, int TM, int TN>
+/**
+ * The raw-mma kernel now stages kKB of k at a time and pads BOTH shared
+ * strides, which puts it past the 48 KB static shared limit, so its shared
+ * memory is dynamic and the opt-in has to be requested once per kernel.
+ * cudaFuncSetAttribute is idempotent and cheap; doing it on every launch
+ * would not be, hence the flag.
+ */
+template <int WM, int WN, int TM, int TN, int KKB>
 void launchPtx(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
                const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
-    noisyGemmPtx<WM, WN, TM, TN>
-        <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
+    constexpr int kStages = 3;
+    constexpr int aStride = KKB + 16, bStride = KKB + 16;
+    constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
+    constexpr int smem = kStages * (blockM * aStride + blockN * bStride);
+    static bool optedIn = false;
+    if (!optedIn) {
+        cudaFuncSetAttribute(noisyGemmPtx<WM, WN, TM, TN, KKB>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        optedIn = true;
+    }
+    noisyGemmPtx<WM, WN, TM, TN, KKB>
+        <<<grid, threads, smem, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
 const TileConfig kTileConfigs[] = {
@@ -178,19 +195,34 @@ const TileConfig kTileConfigs[] = {
     // Raw mma.m16n8k32. WMMA's m16n16k16 needs two issues to cover the same
     // k that Ampere's native shape does in one, and the profiler had Tensor as
     // the busiest pipeline, so halving the issues is the point.
-    {"ptx 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2>},
-    {"ptx 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2>},
-    {"ptx 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4>},
-    {"ptx 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4>},
-    {"ptx 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2>},
-    {"ptx 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2>},
-    // Sixteen-warp geometries. These lost while the fragment loads were four
-    // scalar shared reads apiece - the extra warps had no issue slots to use.
-    // With ldmatrix collapsing each fragment to one instruction, 4x4/4x2 went
-    // from 323.5 to 363.2 TOPS and became the fastest thing on a 4090.
-    {"ptx 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2>},
-    {"ptx 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4>},
-    {"ptx 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2>},
+    // A DEEPER SHARED K-BLOCK IS THE SINGLE BIGGEST WIN IN THIS KERNEL.
+    // Pearl's own reference GEMM stages 128 of k at a time; this staged 32,
+    // which is the mma's k and no more. At 32 the loop takes a barrier every
+    // 32 of k and each row's global read is 32 contiguous bytes out of a
+    // 2048-byte row. At 64 it is 420 TOPS against 289 for the same geometry,
+    // and 361 for the older static-shared kernel it replaced. 128 does not
+    // fit three stages of padded shared, so it is not offered.
+    // k32 is kept below it for cards where the deeper block will not fit.
+    {"ptx k64 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2, 64>},
+    {"ptx k64 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2, 64>},
+    {"ptx k64 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4, 64>},
+    {"ptx k64 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4, 64>},
+    {"ptx k64 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2, 64>},
+    {"ptx k64 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2, 64>},
+    {"ptx k64 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2, 64>},
+    {"ptx k64 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4, 64>},
+    {"ptx k64 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2, 64>},
+    {"ptx k64 4x8/2x2", 128, 256, 1024, true, 80, &launchPtx<4, 8, 2, 2, 64>},
+    {"ptx k32 2x4/2x2", 64, 128, 256, true, 80, &launchPtx<2, 4, 2, 2, 32>},
+    {"ptx k32 2x4/4x2", 128, 128, 256, true, 80, &launchPtx<2, 4, 4, 2, 32>},
+    {"ptx k32 2x4/2x4", 64, 256, 256, true, 80, &launchPtx<2, 4, 2, 4, 32>},
+    {"ptx k32 2x4/4x4", 128, 256, 256, true, 80, &launchPtx<2, 4, 4, 4, 32>},
+    {"ptx k32 4x2/2x2", 128, 64, 256, true, 80, &launchPtx<4, 2, 2, 2, 32>},
+    {"ptx k32 4x4/2x2", 128, 128, 512, true, 80, &launchPtx<4, 4, 2, 2, 32>},
+    {"ptx k32 4x4/4x2", 256, 128, 512, true, 80, &launchPtx<4, 4, 4, 2, 32>},
+    {"ptx k32 4x4/2x4", 128, 256, 512, true, 80, &launchPtx<4, 4, 2, 4, 32>},
+    {"ptx k32 8x2/2x2", 256, 64, 512, true, 80, &launchPtx<8, 2, 2, 2, 32>},
+    {"ptx k32 4x8/2x2", 128, 256, 1024, true, 80, &launchPtx<4, 8, 2, 2, 32>},
 };
 
 class PearlPow : public Algorithm {

@@ -190,8 +190,9 @@ test-pearl: tests/test_pearl tests/test_pearl_job tests/test_pearl_prepare \
 	@echo "--- pearl: the device prepare stage, and what it costs ---"
 	@./tests/test_pearl_prepare $(PEARL_JOBVEC)
 	@echo "--- pearl: cp.async kernels vs dbuf at the real mining shape ---"
-	@./tests/test_pearl_mining_shape 1024 1024 2048 128 ptx
-	@./tests/test_pearl_mining_shape 4096 32768 2048 128 ptx
+	@./tests/test_pearl_mining_shape 1024 1024 2048 128 ptx 64
+	@./tests/test_pearl_mining_shape 4096 32768 2048 128 ptx 64
+	@./tests/test_pearl_mining_shape 4096 32768 2048 128 ptx 32
 	@./tests/test_pearl_mining_shape 4096 32768 2048 128 async
 
 tests/test_pearl: tests/test_pearl.cu src/algos/pearl-pow/noisy_gemm.cuh

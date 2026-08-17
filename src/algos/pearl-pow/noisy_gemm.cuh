@@ -1075,8 +1075,14 @@ __device__ __forceinline__ void mmaS8(uint32_t d[4], const uint32_t a[4],
  * Requires B in n-major order (applyNoiseBt). Launch with
  * kWarpsM*kWarpsN*32 threads and grid (n/kBlockN, m/kBlockM).
  */
-template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN>
-__global__ void noisyGemmPtx(const int8_t *__restrict__ A,
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN, int kKBlock = 32>
+// Dynamic shared costs address registers that a static array did not: this
+// went 110 -> 154 registers on the refactor, and 512 threads x 154 exceeds the
+// 65536-register file, so the 16-warp configurations simply stopped launching.
+// The bound tells ptxas to fit one block of this size per SM, which is the
+// occupancy these shapes get anyway.
+__global__ __launch_bounds__(kWarpsM *kWarpsN * 32, 1) void noisyGemmPtx(
+    const int8_t *__restrict__ A,
                              const int8_t *__restrict__ Bn,
                              int32_t *__restrict__ cNoised,
                              uint32_t *__restrict__ transcripts,
@@ -1086,8 +1092,17 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
     constexpr int kThreads = kWarpsM * kWarpsN * 32;
     constexpr int kStages = 3;
-    constexpr int kAStride = kK32;                 // 32 bytes per row
-    constexpr int kBStride = kK32 + 16;            // n-major, padded off a wrap
+    // How much k one shared stage holds. Pearl's own reference GEMM uses a
+    // k-block of 128; this kernel used 32, which is the mma's k and no more.
+    // At 32 the loop takes a barrier every 32 of k, and each row's global read
+    // is 32 contiguous bytes out of a 2048-byte row. Deeper stages mean fewer
+    // barriers and longer contiguous reads for the same total traffic.
+    constexpr int kSub = kKBlock / kK32;           // mma steps per stage
+    // BOTH strides are padded. B was, A was not, and A at stride 32 put
+    // ldmatrix's eight row addresses on banks 0,8,16,24,0,8,16,24 - a two-way
+    // conflict that had been there since the fragment loads were written.
+    constexpr int kAStride = kKBlock + 16;
+    constexpr int kBStride = kKBlock + 16;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -1122,40 +1137,49 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     const int colBase = bIdxN * kBlockN;
     if (rowBase >= m || colBase >= n) return;
 
-    __shared__ __align__(16) int8_t sA[kStages][kBlockM * kAStride];
-    __shared__ __align__(16) int8_t sB[kStages][kBlockN * kBStride];
+    // Dynamic, because a padded A stride at any useful depth already exceeds
+    // the 48 KB static limit. The launcher opts in via cudaFuncSetAttribute.
+    extern __shared__ __align__(16) int8_t smem[];
+    int8_t *const sAbase = smem;
+    int8_t *const sBbase = smem + kStages * kBlockM * kAStride;
+#define OM_SA(st) (sAbase + (st) * kBlockM * kAStride)
+#define OM_SB(st) (sBbase + (st) * kBlockN * kBStride)
 
     const int dotLen = k - k % rank;
     const int totalSteps = dotLen / kK32;
     const int stepsPerRank = rank / kK32;
     if (totalSteps <= 0 || stepsPerRank <= 0) return;
+    const int totalBlocks = totalSteps / kSub;     // whole stages of k
+    if (totalBlocks <= 0 || totalSteps % kSub) return;
 
     // Two accumulators per 16x16 tile: columns 0-7 and 8-15.
     uint32_t acc[kTilesM][kTilesN][2][4] = {};
     uint32_t slot[kTilesM][kTilesN] = {};
     int reduction = 0;
 
-#define OM_PTX_ISSUE(step, stage)                                              \
+// One 16-byte cp.async per chunk; kKBlock/16 chunks cover a row's slice.
+#define OM_PTX_ISSUE(blk, stage)                                               \
     {                                                                          \
-        const int kk_ = (step) * kK32;                                         \
-        for (int i = threadIdx.x; i < kBlockM * 2; i += kThreads) {            \
-            const int row = i >> 1;                                            \
-            const int half = (i & 1) * 16;                                     \
-            __pipeline_memcpy_async(&sA[stage][row * kAStride + half],         \
-                                    &A[(size_t)(rowBase + row) * k + kk_ + half], 16); \
+        constexpr int kChunks = kKBlock / 16;                                  \
+        const int kk_ = (blk) * kKBlock;                                       \
+        for (int i = threadIdx.x; i < kBlockM * kChunks; i += kThreads) {      \
+            const int row = i / kChunks;                                       \
+            const int off = (i % kChunks) * 16;                                \
+            __pipeline_memcpy_async(OM_SA(stage) + row * kAStride + off,       \
+                                    &A[(size_t)(rowBase + row) * k + kk_ + off], 16); \
         }                                                                      \
-        for (int i = threadIdx.x; i < kBlockN * 2; i += kThreads) {            \
-            const int col = i >> 1;                                            \
-            const int half = (i & 1) * 16;                                     \
-            __pipeline_memcpy_async(&sB[stage][col * kBStride + half],         \
-                                    &Bn[(size_t)(colBase + col) * k + kk_ + half], 16); \
+        for (int i = threadIdx.x; i < kBlockN * kChunks; i += kThreads) {      \
+            const int col = i / kChunks;                                       \
+            const int off = (i % kChunks) * 16;                                \
+            __pipeline_memcpy_async(OM_SB(stage) + col * kBStride + off,       \
+                                    &Bn[(size_t)(colBase + col) * k + kk_ + off], 16); \
         }                                                                      \
         __pipeline_commit();                                                   \
     }
 
 #pragma unroll
     for (int pre = 0; pre < kStages - 1; pre++)
-        if (pre < totalSteps) OM_PTX_ISSUE(pre, pre)
+        if (pre < totalBlocks) OM_PTX_ISSUE(pre, pre)
 
     // Counters, not modulo. stepsPerRank is a runtime value, so `step %
     // stepsPerRank` compiles to a full signed integer division - IMAD.HI,
@@ -1165,7 +1189,7 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     int stage = 0;                       // step % kStages
     int issueStage = (kStages - 1) % kStages;
     int sinceFold = 0;                   // counts up to stepsPerRank
-    for (int step = 0; step < totalSteps; step++) {
+    for (int blk = 0; blk < totalBlocks; blk++) {
         // The pipeline DRAINS at the tail, and the steady-state wait is wrong
         // there. No new commit is issued for the last kStages-1 steps, so by
         // the final step the only commit still outstanding is the one holding
@@ -1194,11 +1218,17 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
         const int ldRow = (lane & 7) + ((lane >> 3) & 1) * 8;
         const int ldOff = ((lane >> 3) >> 1) * 16;
 
+        // One shared stage now holds kSub of the mma's 32-deep k steps, so the
+        // barrier and the global copies happen once per kKBlock instead of
+        // once per 32. Everything inside is per-32 exactly as before.
+#pragma unroll
+        for (int sub = 0; sub < kSub; sub++) {
+        const int kOffSub = sub * kK32;
         uint32_t aReg[kTilesM][4], bReg[kTilesN][2][2];
 #pragma unroll
         for (int i = 0; i < kTilesM; i++) {
             const int row = (warpM * kTilesM + i) * kHashTile + ldRow;
-            ldmatrixX4(aReg[i], &sA[stage][row * kAStride + ldOff]);
+            ldmatrixX4(aReg[i], OM_SA(stage) + row * kAStride + kOffSub + ldOff);
         }
 #pragma unroll
         for (int j = 0; j < kTilesN; j++) {
@@ -1215,7 +1245,7 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
             // the operand order - three plausible readings were all wrong.
             const int col = (warpN * kTilesN + j) * kHashTile + ldRow;
             uint32_t t[4];
-            ldmatrixX4(t, &sB[stage][col * kBStride + ldOff]);
+            ldmatrixX4(t, OM_SB(stage) + col * kBStride + kOffSub + ldOff);
             bReg[j][0][0] = t[0];
             bReg[j][1][0] = t[1];
             bReg[j][0][1] = t[2];
@@ -1248,9 +1278,10 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
             }
             ++reduction;
         }
+        }   // sub
 
-        if (step + kStages - 1 < totalSteps)
-            OM_PTX_ISSUE(step + kStages - 1, issueStage)
+        if (blk + kStages - 1 < totalBlocks)
+            OM_PTX_ISSUE(blk + kStages - 1, issueStage)
         else
             __pipeline_commit();   // empty group, purely to hold the depth
 
@@ -1258,6 +1289,8 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
         if (++issueStage == kStages) issueStage = 0;
     }
 #undef OM_PTX_ISSUE
+#undef OM_SA
+#undef OM_SB
 
 #pragma unroll
     for (int i = 0; i < kTilesM; i++) {

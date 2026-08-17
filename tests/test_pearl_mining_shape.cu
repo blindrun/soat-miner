@@ -21,6 +21,20 @@
 #include "algos/pearl-pow/noisy_gemm.cuh"
 #include "algos/pearl-pow/prepare.cuh"
 
+// The raw-mma kernel stages a k-block and pads both shared strides, which puts
+// it past the 48 KB static limit - so its shared memory is dynamic and every
+// launch site must size it and opt in. Getting this wrong is not subtle: the
+// kernel reads a zero-length allocation.
+template <int WM, int WN, int TM, int TN, int KKB>
+static inline int ptxSmem() {
+    constexpr int kStages = 3;
+    constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
+    constexpr int smem = kStages * (blockM * (KKB + 16) + blockN * (KKB + 16));
+    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    return smem;
+}
+
 using namespace om::pearl;
 
 #define CK(x)                                                              \
@@ -74,12 +88,13 @@ int main(int argc, char **argv) {
 
     // Under test: selected by argv[5] - "ptx" (default) or "async".
     const char *which = argc > 5 ? argv[5] : "ptx";
+    const int kkb = argc > 6 ? atoi(argv[6]) : 64;
     if (which[0] == 'a') {
         dim3 g2(n / 256, m / 128);
         noisyGemmMmaTiledAsync<2, 4, 4, 4><<<g2, 256>>>(dA, dBk, nullptr, t2, m, n, k, rank, false);
     } else {
         dim3 g2(n / 128, m / 256);
-        noisyGemmPtx<4, 4, 4, 2><<<g2, 512>>>(dA, dBn, nullptr, t2, m, n, k, rank, false);
+        noisyGemmPtx<4, 4, 4, 2, 32><<<g2, 512, ptxSmem<4, 4, 4, 2, 32>()>>>(dA, dBn, nullptr, t2, m, n, k, rank, false);
     }
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());

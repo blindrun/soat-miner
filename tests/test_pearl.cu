@@ -18,6 +18,20 @@
 
 #include "../src/algos/pearl-pow/noisy_gemm.cuh"
 
+// The raw-mma kernel stages a k-block and pads both shared strides, which puts
+// it past the 48 KB static limit - so its shared memory is dynamic and every
+// launch site must size it and opt in. Getting this wrong is not subtle: the
+// kernel reads a zero-length allocation.
+template <int WM, int WN, int TM, int TN, int KKB>
+static inline int ptxSmem() {
+    constexpr int kStages = 3;
+    constexpr int blockM = WM * TM * 16, blockN = WN * TN * 16;
+    constexpr int smem = kStages * (blockM * (KKB + 16) + blockN * (KKB + 16));
+    cudaFuncSetAttribute(om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    return smem;
+}
+
 #define CHECK(x)                                                            \
     do {                                                                    \
         cudaError_t e = (x);                                                \
@@ -143,7 +157,7 @@ int main(int argc, char **argv) {
                 ++badT;
             }
         }
-        printf("  %-14s product %s (%d/%zu)   transcripts %s (%d/%zu)\n", what,
+        printf("  %-20s product %s (%d/%zu)   transcripts %s (%d/%zu)\n", what,
                badC ? "FAIL" : "ok", badC, cGot.size(), badT ? "FAIL" : "ok", badT, tGot.size());
         return badC == 0 && badT == 0;
     };
@@ -212,7 +226,7 @@ int main(int argc, char **argv) {
         char label[32];                                                        \
         snprintf(label, sizeof(label), "%s %dx%d/%dx%d:", TAG, WM, WN, TM, TN); \
         if (m % blockM || n % blockN) {                                        \
-            printf("  %-14s SKIPPED (needs m%%%d and n%%%d)\n", label, blockM,  \
+            printf("  %-20s SKIPPED (needs m%%%d and n%%%d)\n", label, blockM,  \
                    blockN);                                                    \
         } else {                                                               \
             dim3 g(n / blockN, m / blockM);                                    \
@@ -223,7 +237,7 @@ int main(int argc, char **argv) {
                                                    rank, true);                \
             cudaError_t e = cudaGetLastError();                                \
             if (e != cudaSuccess) {                                            \
-                printf("  %-14s SKIPPED (%s)\n", label, cudaGetErrorString(e)); \
+                printf("  %-20s SKIPPED (%s)\n", label, cudaGetErrorString(e)); \
             } else {                                                           \
                 CHECK(cudaDeviceSynchronize());                                \
                 CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t), \
@@ -286,25 +300,26 @@ int main(int argc, char **argv) {
         CHECK(cudaMalloc(&dBn, (size_t)n * k));
         CHECK(cudaMemcpy(dBn, bT.data(), (size_t)n * k, cudaMemcpyHostToDevice));
 
-#define CHECK_PTX(WM, WN, TM, TN)                                              \
+#define CHECK_PTX_K(WM, WN, TM, TN, KKB)                                              \
         {                                                                      \
             constexpr int threads = (WM) * (WN) * 32;                          \
             constexpr int blockM = (WM) * (TM) * 16;                           \
             constexpr int blockN = (WN) * (TN) * 16;                           \
             char label[32];                                                    \
-            snprintf(label, sizeof(label), "ptx %dx%d/%dx%d:", WM, WN, TM, TN); \
+            snprintf(label, sizeof(label), "ptx k%d %dx%d/%dx%d:", KKB, WM, WN, TM, TN); \
             if (m % blockM || n % blockN || k % 32) {                          \
-                printf("  %-14s SKIPPED\n", label);                            \
+                printf("  %-20s SKIPPED\n", label);                            \
             } else {                                                           \
                 dim3 g(n / blockN, m / blockM);                                \
                 CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));     \
                 CHECK(cudaMemset(dT, 0,                                        \
                                  (size_t)numTranscripts * 16 * sizeof(uint32_t))); \
-                om::pearl::noisyGemmPtx<WM, WN, TM, TN><<<g, threads>>>(       \
+                om::pearl::noisyGemmPtx<WM, WN, TM, TN, KKB>\
+        <<<g, threads, ptxSmem<WM, WN, TM, TN, KKB>()>>>(       \
                     dA, dBn, dC, dT, m, n, k, rank, true);                     \
                 cudaError_t e = cudaGetLastError();                            \
                 if (e != cudaSuccess) {                                        \
-                    printf("  %-14s SKIPPED (%s)\n", label,                    \
+                    printf("  %-20s SKIPPED (%s)\n", label,                    \
                            cudaGetErrorString(e));                             \
                 } else {                                                       \
                     CHECK(cudaDeviceSynchronize());                            \
@@ -319,19 +334,27 @@ int main(int argc, char **argv) {
             }                                                                  \
         }
 
-        CHECK_PTX(2, 4, 2, 2)
-        CHECK_PTX(2, 4, 4, 2)
-        CHECK_PTX(2, 4, 4, 4)
-        // Every geometry kTileConfigs can select has to be checked here. These
-        // two are the 16-warp shapes ldmatrix made worth shipping; without
-        // this they would be selectable on someone's card and never verified.
-        CHECK_PTX(4, 4, 4, 2)
-        CHECK_PTX(4, 4, 2, 4)
-        CHECK_PTX(4, 2, 2, 2)
-        CHECK_PTX(4, 4, 2, 2)
-        CHECK_PTX(2, 4, 2, 4)
-        CHECK_PTX(8, 2, 2, 2)
-#undef CHECK_PTX
+        CHECK_PTX_K(2, 4, 2, 2, 32)
+        CHECK_PTX_K(2, 4, 4, 2, 32)
+        CHECK_PTX_K(2, 4, 4, 4, 32)
+        CHECK_PTX_K(4, 4, 4, 2, 32)
+        CHECK_PTX_K(4, 4, 2, 4, 32)
+        CHECK_PTX_K(4, 2, 2, 2, 32)
+        CHECK_PTX_K(4, 4, 2, 2, 32)
+        CHECK_PTX_K(2, 4, 2, 4, 32)
+        CHECK_PTX_K(8, 2, 2, 2, 32)
+        CHECK_PTX_K(4, 8, 2, 2, 32)
+        CHECK_PTX_K(2, 4, 2, 2, 64)
+        CHECK_PTX_K(2, 4, 4, 2, 64)
+        CHECK_PTX_K(2, 4, 4, 4, 64)
+        CHECK_PTX_K(4, 4, 4, 2, 64)
+        CHECK_PTX_K(4, 4, 2, 4, 64)
+        CHECK_PTX_K(4, 2, 2, 2, 64)
+        CHECK_PTX_K(4, 4, 2, 2, 64)
+        CHECK_PTX_K(2, 4, 2, 4, 64)
+        CHECK_PTX_K(8, 2, 2, 2, 64)
+        CHECK_PTX_K(4, 8, 2, 2, 64)
+#undef CHECK_PTX_K
         CHECK(cudaFree(dBn));
     }
 
