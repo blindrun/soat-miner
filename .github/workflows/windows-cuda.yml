@@ -14,7 +14,10 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pinned, not windows-latest: latest now ships VS 2026 (MSVC 14.5x), newer
+    # than any host compiler CUDA 12.6's nvcc will accept. windows-2022 has
+    # VS 2022 (MSVC 14.4x), a supported pairing.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -24,27 +27,36 @@ jobs:
         with:
           cuda: '12.6.0'
           method: 'network'
-          # nvcc to compile, cudart for the static runtime lib, the VS
-          # integration so CMake's Visual Studio generator finds the toolset.
-          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          # nvcc to compile, cudart for the static runtime lib. No VS
+          # integration: the runner's default generator (VS 2026) has no CUDA
+          # toolset for 12.6, so we drive nvcc directly through Ninja instead.
+          sub-packages: '["nvcc", "cudart"]'
+
+      # Puts cl.exe / the MSVC toolchain on PATH so Ninja + nvcc can find the
+      # host compiler without the Visual Studio generator's .props integration.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Configure
         shell: pwsh
         run: |
-          cmake -B build-rel -S . `
+          cmake -B build-rel -S . -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;90-virtual" `
             -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
 
       - name: Build
-        run: cmake --build build-rel --config Release
+        run: cmake --build build-rel
 
       - name: Bundle VC++ runtime and stage the package
         shell: pwsh
         run: |
           $pkg = "cuda-pkg"
           New-Item -ItemType Directory -Force $pkg | Out-Null
-          Copy-Item build-rel\Release\soat-miner.exe $pkg\ -Force
+          # Ninja is single-config: the exe lands in build-rel, no Release subdir.
+          Copy-Item build-rel\soat-miner.exe $pkg\ -Force
           foreach ($dll in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll') {
             $src = Get-ChildItem "C:\Windows\System32\$dll" -EA SilentlyContinue | Select-Object -First 1
             if ($src) { Copy-Item $src.FullName $pkg\ -Force } else { throw "missing $dll" }
