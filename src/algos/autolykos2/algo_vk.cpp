@@ -70,6 +70,13 @@ struct Buffer {
 static const uint32_t kLocalSize = 256;
 
 /**
+ * Dataset elements per build dispatch. Sized to stay well inside Windows'
+ * 2-second GPU watchdog (TDR), which resets the device mid-build otherwise -
+ * see prepare(). ~130 ms per slice on an RTX 3070 Ti.
+ */
+static const uint32_t kBuildSlice = 1u << 22;
+
+/**
  * Wave/subgroup size. 0 lets the driver choose (wave64 on RDNA2).
  * Overridable with SOAT_SUBGROUP=32|64 for A/B testing: this workload is
  * memory-latency bound, and narrower waves can keep more independent memory
@@ -367,16 +374,28 @@ class Autolykos2VK : public Algorithm {
             writeDescriptors();
         }
 
+        // Built in slices, not one dispatch per chunk. A whole 2.15 GB chunk is
+        // about 2.1 s of GPU time, and Windows' display watchdog resets the
+        // device at 2 s: on an RTX 3070 Ti two runs in three died with
+        // VK_ERROR_DEVICE_LOST before the miner ever reached a job. The work and
+        // the result are identical; only the number of submissions changes, and
+        // at ~130 ms a slice the cost of the extra ones is not measurable
+        // against a build this long.
         for (uint32_t c = 0; c < chunks_; c++) {
-            Push p{};
-            p.mode = 0;
-            p.height = (uint32_t)job.epoch;
-            p.N = N;
-            p.chunkShift = chunkShift_;
-            p.buildChunk = c;
-            p.buildFirst = c * chunkElems_;
-            p.buildCount = (c == chunks_ - 1) ? (N - p.buildFirst) : chunkElems_;
-            if (!dispatch(p, (p.buildCount + kLocalSize - 1) / kLocalSize)) return false;
+            const uint32_t first = c * chunkElems_;
+            const uint32_t count = (c == chunks_ - 1) ? (N - first) : chunkElems_;
+            for (uint32_t done = 0; done < count; done += kBuildSlice) {
+                Push p{};
+                p.mode = 0;
+                p.height = (uint32_t)job.epoch;
+                p.N = N;
+                p.chunkShift = chunkShift_;
+                p.buildChunk = c;
+                p.buildFirst = first + done;
+                p.buildCount = std::min(kBuildSlice, count - done);
+                if (!dispatch(p, (p.buildCount + kLocalSize - 1) / kLocalSize))
+                    return false;
+            }
         }
         height_ = (uint32_t)job.epoch;
         return true;

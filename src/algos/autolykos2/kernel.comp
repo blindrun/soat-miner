@@ -252,13 +252,16 @@ void b2b256_short(inout uint8_t inb[72], uint len, out uint8_t outb[32]) {
             outb[i * 8 + j] = uint8_t((h[i] >> (8 * j)) & 0xFFUL);
 }
 
-/** M's little-endian message word at index w is bswap64(w). */
-uint64_t mWord(uint w) {
-    uint64_t v = uint64_t(w);
+uint64_t bswap64(uint64_t v) {
     return ((v & 0x00000000000000ffUL) << 56) | ((v & 0x000000000000ff00UL) << 40) |
            ((v & 0x0000000000ff0000UL) << 24) | ((v & 0x00000000ff000000UL) << 8) |
            ((v & 0x000000ff00000000UL) >> 8)  | ((v & 0x0000ff0000000000UL) >> 24) |
            ((v & 0x00ff000000000000UL) >> 40) | ((v & 0xff00000000000000UL) >> 56);
+}
+
+/** M's little-endian message word at index w is bswap64(w). */
+uint64_t mWord(uint w) {
+    return bswap64(uint64_t(w));
 }
 
 uint bswap32(uint v) {
@@ -292,21 +295,24 @@ void genElement(uint idx, uint height, out uint64_t limb[4]) {
     for (int j = 1; j < 16; j++) m[j] = 0UL;
     compressU(h, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15], 8200UL, true);
 
-    uint8_t d[32];
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 8; j++)
-            d[i * 8 + j] = uint8_t((h[i] >> (8 * j)) & 0xFFUL);
-
-    // d[1] is the most significant byte, d[31] the least.
-    for (int l = 0; l < 4; l++) {
-        int off = (3 - l) * 8;
-        uint64_t v = 0UL;
-        for (int j = 0; j < 8; j++) {
-            uint bv = (off + j == 0) ? 0u : uint(d[off + j]);
-            v = (v << 8) | uint64_t(bv);
-        }
-        limb[l] = v;
-    }
+    // The digest is h[0..3] written out as little-endian bytes, and the element
+    // is that byte string read back as a big-endian integer with the leading
+    // byte dropped. Reading a little-endian word back big-endian is exactly a
+    // byte swap, so the whole repack is four bswap64s and one mask.
+    //
+    // It used to stage through a `uint8_t d[32]` and rebuild each limb a byte
+    // at a time. That is what NVIDIA's shader compiler got wrong: limbs 0-2
+    // came back with their top two bytes replaced by a single repeated value
+    // while their low 48 bits and the whole of limb 3 were correct - so the
+    // blake2b above was fine and only the repack was destroying it. Every
+    // element was wrong, therefore every hit was wrong, and a pool saw nothing
+    // but low-difficulty shares from a miner whose own re-verification agreed
+    // with itself. Measured on an RTX 3070 Ti; AMD RDNA2, where this backend
+    // was developed, happens to compile it correctly.
+    limb[0] = bswap64(h[3]);
+    limb[1] = bswap64(h[2]);
+    limb[2] = bswap64(h[1]);
+    limb[3] = bswap64(h[0]) & 0x00ffffffffffffffUL;  // drops the leading byte
 }
 
 uvec4 packLo(uint64_t a, uint64_t b) {
@@ -439,8 +445,13 @@ void main() {
     if (pc.mode == 0u) {  // build dataset
         if (gid >= pc.buildCount) return;
         uint64_t limb[4];
-        genElement(pc.buildFirst + gid, pc.height, limb);
-        storeElement(pc.buildChunk, gid, limb);
+        uint idx = pc.buildFirst + gid;
+        genElement(idx, pc.height, limb);
+        // Slot from the element's own index rather than from gid, so the host
+        // is free to build a chunk in several dispatches. Same address either
+        // way when a chunk is built in one go, since buildFirst is then the
+        // chunk's base. loadElement uses this identical shift/mask.
+        storeElement(pc.buildChunk, idx & ((1u << pc.chunkShift) - 1u), limb);
         return;
     }
 
