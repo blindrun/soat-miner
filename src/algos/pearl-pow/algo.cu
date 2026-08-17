@@ -438,13 +438,24 @@ class PearlPow : public Algorithm {
         const size_t bBytes = (size_t)kK * s.n;
         const size_t tiles = (size_t)(s.m / kTileSide) * (s.n / kTileSide);
 
-        int8_t *tA = nullptr, *tB = nullptr;
+        int8_t *tA = nullptr, *tB = nullptr, *tBn = nullptr;
         uint32_t *tT = nullptr, *tFp = nullptr;
         if (cudaMalloc(&tA, aBytes) != cudaSuccess) return 0;
         if (cudaMalloc(&tB, bBytes) != cudaSuccess) { cudaFree(tA); return 0; }
         if (cudaMalloc(&tT, tiles * 16 * sizeof(uint32_t)) != cudaSuccess) {
             cudaFree(tA);
             cudaFree(tB);
+            return 0;
+        }
+        // The raw-mma family reads B n-major. Feed every candidate the layout
+        // it expects, or it computes a different product from the same bytes
+        // and the fingerprint check below throws it out - which is exactly
+        // what happened: every ptx configuration was rejected and the miner
+        // silently settled for async at 253 M candidates/s instead of 406.
+        if (cudaMalloc(&tBn, bBytes) != cudaSuccess) {
+            cudaFree(tA);
+            cudaFree(tB);
+            cudaFree(tT);
             return 0;
         }
         // Allocated here rather than in allocate(), which runs AFTER tuning.
@@ -456,6 +467,7 @@ class PearlPow : public Algorithm {
         }
         genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(tA, aBytes, 1);
         genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(tB, bBytes, 2);
+        transposeKtoN<<<(bBytes + 255) / 256, 256, 0, stream_>>>(tB, tBn, s.n, kK);
         cudaStreamSynchronize(stream_);
 
         cudaEvent_t evA, evB;
@@ -496,8 +508,8 @@ class PearlPow : public Algorithm {
             cudaMemsetAsync(tT, 0, tiles * 16 * sizeof(uint32_t), stream_);
             for (int rep = 0; rep < 4 && ok; rep++) {     // first pays warmup
                 cudaEventRecord(evA, stream_);
-                tc.launch(grid, tc.threads, stream_, tA, tB, tT, (int)s.m,
-                          (int)s.n, (int)kK, kRank);
+                tc.launch(grid, tc.threads, stream_, tA, tc.nMajorB ? tBn : tB,
+                          tT, (int)s.m, (int)s.n, (int)kK, kRank);
                 cudaEventRecord(evB, stream_);
                 if (cudaStreamSynchronize(stream_) != cudaSuccess ||
                     cudaGetLastError() != cudaSuccess) {
@@ -556,6 +568,7 @@ class PearlPow : public Algorithm {
         cudaFree(tA);
         cudaFree(tB);
         cudaFree(tT);
+        cudaFree(tBn);
         cudaFree(tFp);
         return best;
     }

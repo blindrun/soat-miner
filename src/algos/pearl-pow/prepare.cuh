@@ -512,6 +512,21 @@ __global__ void applyNoiseBt(const int8_t *__restrict__ Bt,
  * E_BR is drawn as n x rank and used as rank x n. Transposing it once here is
  * cheaper than striding over it for every element of B.
  */
+/**
+ * k-major (k x n) to n-major (n x k). Used by the tuner so every candidate
+ * kernel is fed the layout it actually wants; without it the raw-mma family
+ * computes a different product from the same buffer and the tuner's
+ * fingerprint check correctly rejects all of them.
+ */
+__global__ void transposeKtoN(const int8_t *__restrict__ in,
+                              int8_t *__restrict__ out, uint32_t n, uint32_t k) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n * k) return;
+    const uint32_t j = (uint32_t)(idx / k);      // column of B
+    const uint32_t p = (uint32_t)(idx % k);      // which k
+    out[idx] = in[(size_t)p * n + j];
+}
+
 __global__ void transposeNoiseB(const int8_t *__restrict__ in,
                                 int8_t *__restrict__ out, uint32_t n, int rank) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
