@@ -739,8 +739,61 @@ def main():
     return 1 if FAIL else 0
 
 
+# ----------------------------------------------------------------- vectors
+VECTOR_MAGIC = b"PRLJ0001"
+
+
+def synth_matrix(rows, cols, salt):
+    """A matrix any language can regenerate from three integers.
+
+    The vectors file stays a few hundred bytes this way instead of carrying
+    megabytes of int8, and the C++ side still checks against fixed expected
+    outputs rather than against its own recomputation.
+    """
+    idx = np.arange(rows * cols, dtype=np.int64)
+    return (((idx * 37 + salt) & 0x7F) - 64).astype(np.int8).reshape(rows, cols)
+
+
+def emit_vectors(path, m=64, n=48, k=2048, rank=128):
+    header = bytes((i * 7 + 3) & 0xFF for i in range(76))
+    cfg = MiningConfiguration.contiguous(k, rank)
+    key = job_key(header, cfg)
+
+    A = synth_matrix(m, k, 11)
+    B_t = synth_matrix(n, k, 91)
+    a_root = blake3_keyed(key, pad_to_chunk_boundary(A.tobytes()))
+    bt_root = blake3_keyed(key, pad_to_chunk_boundary(B_t.tobytes()))
+    ca, cb = commitments(a_root, bt_root, key, m, n)
+
+    # Row 16 onwards on both sides: not row 0, so an off-by-one in the leaf
+    # arithmetic shows up rather than landing on leaf 0 either way.
+    a_rows = list(range(16, 32))
+    b_cols = list(range(16, 32))
+    a_proof = MerkleTree(pad_to_chunk_boundary(A.tobytes()), key).multileaf_proof(
+        leaf_indices_from_rows(a_rows, k))
+    bt_proof = MerkleTree(pad_to_chunk_boundary(B_t.tobytes()), key).multileaf_proof(
+        leaf_indices_from_rows(b_cols, k))
+    blob = encode_plain_proof(m, n, k, rank, a_proof, a_rows, bt_proof, b_cols)
+
+    bound = cfg.penalized_target(2**232)
+    with open(path, "wb") as fh:
+        fh.write(VECTOR_MAGIC)
+        fh.write(np.array([m, n, k, rank], dtype=np.int32).tobytes())
+        fh.write(header)
+        fh.write(cfg.to_bytes())
+        fh.write(key)
+        fh.write(a_root + bt_root + ca + cb)
+        fh.write(bound.to_bytes(32, "little"))
+        fh.write(struct.pack("<I", len(blob)))
+        fh.write(blob)
+    print(f"wrote {path}: m={m} n={n} k={k} rank={rank}, "
+          f"proof {len(blob)} bytes")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--emit-vectors", metavar="PATH",
+                    help="write fixed vectors for the C++ side to check against")
     ap.add_argument("--mine", action="store_true",
                     help="mine against a running pearl-gateway")
     ap.add_argument("--host", default="127.0.0.1")
@@ -751,6 +804,10 @@ if __name__ == "__main__":
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--attempts", type=int, default=20)
     args = ap.parse_args()
+
+    if args.emit_vectors:
+        emit_vectors(args.emit_vectors)
+        sys.exit(0)
 
     if not args.mine:
         sys.exit(main())
