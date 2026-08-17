@@ -596,6 +596,9 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
     // Ceiling division: with an odd word count some threads carry one fewer.
     constexpr int kARegs = (kAWords + kThreads - 1) / kThreads;
     constexpr int kBRegs = (kBWords + kThreads - 1) / kThreads;
+    // Same bank-conflict padding as the cp.async kernel - see there for why a
+    // 128 or 256 byte row makes every row of a fragment load hit one bank set.
+    constexpr int kBStride = kBlockN + 16;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -607,7 +610,7 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
     if (rowBase >= m || colBase >= n) return;
 
     __shared__ int8_t sA[2][kBlockM * kMmaK];
-    __shared__ int8_t sB[2][kMmaK * kBlockN];
+    __shared__ int8_t sB[2][kMmaK * kBStride];
 
     int32_t regA[kARegs], regB[kBRegs];
 
@@ -656,7 +659,7 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
             if (idx < kBWords) {                                               \
                 const int row = idx / (kBlockN / 4);                           \
                 const int byte = (idx % (kBlockN / 4)) * 4;                    \
-                *(int32_t *)&sB[buf][row * kBlockN + byte] = regB[r];          \
+                *(int32_t *)&sB[buf][row * kBStride + byte] = regB[r];          \
             }                                                                  \
         }                                                                      \
     }
@@ -690,7 +693,7 @@ __global__ void noisyGemmMmaTiledDB(const int8_t *__restrict__ A,
 #pragma unroll
         for (int j = 0; j < kTilesN; j++) {
             const int c = (warpN * kTilesN + j) * kHashTile;
-            wmma::load_matrix_sync(bFrag[j], sB[buf] + c, kBlockN);
+            wmma::load_matrix_sync(bFrag[j], sB[buf] + c, kBStride);
         }
 #pragma unroll
         for (int i = 0; i < kTilesM; i++)
@@ -789,6 +792,20 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
     constexpr int kACopies = kBlockM;                  // one 16-byte row each
     constexpr int kBCopies = kMmaK * (kBlockN / 16);
 
+    // Pad B's row stride by one 16-byte group.
+    //
+    // Shared memory is 32 banks of 4 bytes, so a 128-byte row wraps the banks
+    // exactly once and a 256-byte row exactly twice. Either way every row of a
+    // fragment load lands on the SAME banks, and a 16-row load serialises into
+    // sixteen conflicting accesses. The profiler saw it as L1/TEX throughput
+    // at 71.6% with a 0.26% hit rate while DRAM sat at 3.4% - the kernel was
+    // starved by its own shared-memory layout, not by memory bandwidth.
+    //
+    // Sixteen bytes of padding rotates each row by four banks and costs a few
+    // hundred bytes of shared per stage.
+    constexpr int kBStride = kBlockN + 16;
+    constexpr int kAStride = kMmaK;
+
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int warpM = warp / kWarpsN;
@@ -798,8 +815,8 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
     const int colBase = blockIdx.x * kBlockN;
     if (rowBase >= m || colBase >= n) return;
 
-    __shared__ __align__(16) int8_t sA[kStages][kBlockM * kMmaK];
-    __shared__ __align__(16) int8_t sB[kStages][kMmaK * kBlockN];
+    __shared__ __align__(16) int8_t sA[kStages][kBlockM * kAStride];
+    __shared__ __align__(16) int8_t sB[kStages][kMmaK * kBStride];
 
     const int dotLen = k - k % rank;
     const int totalSteps = dotLen / kMmaK;
@@ -825,13 +842,13 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
     {                                                                          \
         const int kk_ = (step) * kMmaK;                                        \
         for (int i = threadIdx.x; i < kACopies; i += kThreads) {               \
-            OM_PEARL_CP(&sA[stage][i * kMmaK],                                 \
+            OM_PEARL_CP(&sA[stage][i * kAStride],                               \
                         &A[(size_t)(rowBase + i) * k + kk_]);                  \
         }                                                                      \
         for (int i = threadIdx.x; i < kBCopies; i += kThreads) {               \
             const int row = i / (kBlockN / 16);                                \
             const int col = (i % (kBlockN / 16)) * 16;                         \
-            OM_PEARL_CP(&sB[stage][row * kBlockN + col],                       \
+            OM_PEARL_CP(&sB[stage][row * kBStride + col],                       \
                         &B[(size_t)(kk_ + row) * n + colBase + col]);          \
         }                                                                      \
         OM_PEARL_COMMIT();                                                     \
@@ -872,12 +889,12 @@ __global__ void noisyGemmMmaTiledAsync(const int8_t *__restrict__ A,
 #pragma unroll
         for (int i = 0; i < kTilesM; i++) {
             const int r = (warpM * kTilesM + i) * kHashTile;
-            wmma::load_matrix_sync(aFrag[i], sA[stage] + r * kMmaK, kMmaK);
+            wmma::load_matrix_sync(aFrag[i], sA[stage] + r * kAStride, kAStride);
         }
 #pragma unroll
         for (int j = 0; j < kTilesN; j++) {
             const int c = (warpN * kTilesN + j) * kHashTile;
-            wmma::load_matrix_sync(bFrag[j], sB[stage] + c, kBlockN);
+            wmma::load_matrix_sync(bFrag[j], sB[stage] + c, kBStride);
         }
 #pragma unroll
         for (int i = 0; i < kTilesM; i++)
