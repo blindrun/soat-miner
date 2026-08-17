@@ -51,6 +51,28 @@ __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) {
  *
  * The fallback is the original butterfly, so pre-Ampere is unaffected.
  */
+/**
+ * XOR three values in one instruction.
+ *
+ * The fold reduces eight accumulator registers per tile, which is seven
+ * two-input XORs. The tensor pipeline tops out at 39% here and the arithmetic
+ * says why: eight mma against about eleven ALU ops per tile per rank step caps
+ * tensor utilisation near 8/19. LOP3 computes an arbitrary three-input boolean
+ * function in one op, so the same eight values fold in four instructions
+ * instead of seven, and the cap moves rather than the clock speed.
+ *
+ * 0x96 is the immLut for a ^ b ^ c.
+ */
+__device__ __forceinline__ uint32_t xor3(uint32_t a, uint32_t b, uint32_t c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500
+    uint32_t d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+#else
+    return a ^ b ^ c;
+#endif
+}
+
 __device__ __forceinline__ uint32_t warpXor(uint32_t v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     return __reduce_xor_sync(0xffffffffu, v);
@@ -1041,8 +1063,32 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     const int warpM = warp / kWarpsN;
     const int warpN = warp % kWarpsN;
 
-    const int rowBase = blockIdx.y * kBlockM;
-    const int colBase = blockIdx.x * kBlockN;
+    // Blocks are scheduled roughly in linear order, and the natural order is
+    // the wrong one here. With grid (n/kBlockN, m/kBlockM), consecutive blocks
+    // step along n, so a wave of concurrent blocks shares ONE A tile and pulls
+    // a DIFFERENT B tile each - and B is the bigger of the two (kBlockN vs
+    // kBlockM rows of k bytes). The profiler shows the cost: L2 throughput 88%
+    // at a 98% hit rate with DRAM at 4.7%, which is the same bytes being
+    // served out of L2 over and over.
+    //
+    // So walk down m in groups of kGroupM first. Within a group, kGroupM
+    // consecutive blocks share one B tile, and a wave's distinct footprint
+    // becomes one B tile plus kGroupM A tiles rather than the reverse.
+    constexpr int kGroupM = 8;
+    const int blocksN = gridDim.x, blocksM = gridDim.y;
+    const int linear = blockIdx.x + blockIdx.y * blocksN;
+    const int perGroup = kGroupM * blocksN;
+    const int mFirst = (linear / perGroup) * kGroupM;
+    const int inGroup = linear % perGroup;
+    // The last group is short whenever blocksM is not a multiple of kGroupM.
+    // Dividing by kGroupM there would alias two blocks onto one tile and leave
+    // another tile never computed - a wrong product, not a slow one.
+    const int groupRows = min(kGroupM, blocksM - mFirst);
+    const int bIdxM = mFirst + inGroup % groupRows;
+    const int bIdxN = inGroup / groupRows;
+
+    const int rowBase = bIdxM * kBlockM;
+    const int colBase = bIdxN * kBlockN;
     if (rowBase >= m || colBase >= n) return;
 
     __shared__ __align__(16) int8_t sA[kStages][kBlockM * kAStride];
@@ -1080,8 +1126,15 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
     for (int pre = 0; pre < kStages - 1; pre++)
         if (pre < totalSteps) OM_PTX_ISSUE(pre, pre)
 
+    // Counters, not modulo. stepsPerRank is a runtime value, so `step %
+    // stepsPerRank` compiles to a full signed integer division - IMAD.HI,
+    // IABS, SHF, ISETP, SEL, about twenty instructions - and it sat in the
+    // hot loop executing once per k-slice. The SASS mix was dominated by
+    // division sequences rather than by the fold or the mma.
+    int stage = 0;                       // step % kStages
+    int issueStage = (kStages - 1) % kStages;
+    int sinceFold = 0;                   // counts up to stepsPerRank
     for (int step = 0; step < totalSteps; step++) {
-        const int stage = step % kStages;
         __pipeline_wait_prior(kStages - 2);
         __syncthreads();
 
@@ -1125,17 +1178,19 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
                 for (int h = 0; h < 2; h++)
                     mmaS8(acc[i][j][h], aReg[i], bReg[j][h], acc[i][j][h]);
 
-        if ((step + 1) % stepsPerRank == 0) {
+        if (++sinceFold == stepsPerRank) {
+            sinceFold = 0;
 #pragma unroll
             for (int i = 0; i < kTilesM; i++) {
 #pragma unroll
                 for (int j = 0; j < kTilesN; j++) {
-                    uint32_t v = 0;
-#pragma unroll
-                    for (int h = 0; h < 2; h++)
-#pragma unroll
-                        for (int e = 0; e < 4; e++) v ^= acc[i][j][h][e];
-                    v = warpXor(v);
+                    // Four instructions, not seven. The shape is fixed - two
+                    // n-halves of four accumulator registers - so this is
+                    // written out rather than looped.
+                    uint32_t v = warpXor(
+                        xor3(xor3(acc[i][j][0][0], acc[i][j][0][1], acc[i][j][0][2]),
+                             xor3(acc[i][j][0][3], acc[i][j][1][0], acc[i][j][1][1]),
+                             acc[i][j][1][2] ^ acc[i][j][1][3]));
                     if (lane == reduction % kTranscriptU32)
                         slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
                 }
@@ -1144,7 +1199,10 @@ __global__ void noisyGemmPtx(const int8_t *__restrict__ A,
         }
 
         if (step + kStages - 1 < totalSteps)
-            OM_PTX_ISSUE(step + kStages - 1, (step + kStages - 1) % kStages)
+            OM_PTX_ISSUE(step + kStages - 1, issueStage)
+
+        if (++stage == kStages) stage = 0;
+        if (++issueStage == kStages) issueStage = 0;
     }
 #undef OM_PTX_ISSUE
 

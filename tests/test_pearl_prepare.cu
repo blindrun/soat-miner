@@ -741,10 +741,21 @@ int main(int argc, char **argv) {
                         (int)br, false);                                       \
                     CHECK(cudaEventRecord(b, s));                              \
                     CHECK(cudaStreamSynchronize(s));                           \
+                    /* A launch that never happened takes ~4 us and would win  \
+                       the sweep with an absurd number - 1024-thread configs   \
+                       exceed the register budget and fail exactly this way.   \
+                       Timing without checking is how a config that computes   \
+                       nothing gets shipped as the fastest. */                 \
+                    if (cudaGetLastError() != cudaSuccess) { ms = -1; break; } \
                     float d = 0;                                               \
                     CHECK(cudaEventElapsedTime(&d, a, b));                     \
                     if (rep) ms += d;                                          \
                 }                                                              \
+                if (ms < 0) {                                                  \
+                    printf("    %dx%d/%dx%d  block %3dx%3d  LAUNCH FAILED"     \
+                           " (registers or shared)\n", WM, WN, TM, TN,         \
+                           blockM, blockN);                                    \
+                } else {                                                       \
                 ms /= 3;                                                       \
                 const double mac = (double)bm * bn * bk;                       \
                 printf("    %s %dx%d/%dx%d  block %3dx%3d  %2d acc  "         \
@@ -765,6 +776,7 @@ int main(int argc, char **argv) {
                              TAG, WM, WN, TM, TN);                             \
                     int c[4] = {WM, WN, TM, TN};                               \
                     memcpy(secondCfg, c, sizeof(secondCfg));                   \
+                }                                                              \
                 }                                                              \
             }                                                                  \
         }
@@ -810,10 +822,21 @@ int main(int argc, char **argv) {
                         (int)br, false);                                       \
                     CHECK(cudaEventRecord(b, s));                              \
                     CHECK(cudaStreamSynchronize(s));                           \
+                    /* A launch that never happened takes ~4 us and would win  \
+                       the sweep with an absurd number - 1024-thread configs   \
+                       exceed the register budget and fail exactly this way.   \
+                       Timing without checking is how a config that computes   \
+                       nothing gets shipped as the fastest. */                 \
+                    if (cudaGetLastError() != cudaSuccess) { ms = -1; break; } \
                     float d = 0;                                               \
                     CHECK(cudaEventElapsedTime(&d, a, b));                     \
                     if (rep) ms += d;                                          \
                 }                                                              \
+                if (ms < 0) {                                                  \
+                    printf("    %dx%d/%dx%d  block %3dx%3d  LAUNCH FAILED"     \
+                           " (registers or shared)\n", WM, WN, TM, TN,         \
+                           blockM, blockN);                                    \
+                } else {                                                       \
                 ms /= 3;                                                       \
                 const double mac = (double)bm * bn * bk;                       \
                 printf("    ptx    %dx%d/%dx%d  block %3dx%3d  %2d acc  "      \
@@ -825,6 +848,7 @@ int main(int argc, char **argv) {
                     bestMs = ms;                                               \
                     snprintf(bestName, sizeof(bestName), "ptx   %dx%d/%dx%d",  \
                              WM, WN, TM, TN);                                  \
+                }                                                              \
                 }                                                              \
             }                                                                  \
         }
@@ -860,6 +884,16 @@ int main(int argc, char **argv) {
         SWEEP_PTX(2, 4, 2, 4)
         SWEEP_PTX(2, 4, 4, 4)
         SWEEP_PTX(4, 4, 2, 2)
+        // Same 128x256 block tile as 2x4/4x4, so the same L2 traffic, but
+        // spread over 16 and 32 warps instead of 8. 2x4/4x4 needs 188
+        // registers and 48 KB of shared, which pins it to one block per SM at
+        // 16.6% occupancy with nothing to hide latency behind.
+        SWEEP_PTX(4, 4, 2, 4)
+        SWEEP_PTX(4, 8, 2, 2)
+        SWEEP_PTX(8, 4, 2, 2)
+        SWEEP_PTX(4, 4, 4, 2)
+        SWEEP_PTX(2, 8, 2, 2)
+        SWEEP_PTX(8, 2, 2, 2)
 #undef SWEEP_PTX
 #undef SWEEP_AS
 #undef SWEEP_DB
