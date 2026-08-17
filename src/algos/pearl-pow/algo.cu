@@ -71,6 +71,49 @@ const Shape kShapes[] = {
 constexpr uint32_t kMaxHits = 64;
 constexpr int kTileSide = 16;
 
+/**
+ * The tile configurations worth trying, and the launcher for each.
+ *
+ * This is a runtime choice, not a constant, because **the right answer is not
+ * the same on two cards we own**. Measured at 4096x32768, k=2048:
+ *
+ *                      RTX 4090      RTX 5080
+ *     2x4 / 2x2         97.3          58.0
+ *     2x4 / 4x2        127.1 best     41.7 WORST
+ *     2x4 / 2x4        110.1          68.5 best
+ *     2x4 / 4x4        118.4          66.6
+ *
+ * Shipping the 4090's winner hardcoded would run a 5080 at 41.7 TOPS when that
+ * card does 68.5 - giving away 64% for no reason a user could ever diagnose.
+ * So prepare() times them on the actual device and picks.
+ *
+ * Every entry here is held to the reference in tests/test_pearl.cu. A
+ * configuration that can be selected but was never verified is a correctness
+ * bug waiting for someone else's GPU.
+ */
+struct TileConfig {
+    const char *name;
+    int blockM, blockN, threads;
+    void (*launch)(dim3, int, cudaStream_t, const int8_t *, const int8_t *,
+                   uint32_t *, int, int, int, int);
+};
+
+template <int WM, int WN, int TM, int TN>
+void launchTiled(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
+                 const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
+    noisyGemmMmaTiled<WM, WN, TM, TN>
+        <<<grid, threads, 0, s>>>(a, b, nullptr, t, m, n, k, rank, false);
+}
+
+const TileConfig kTileConfigs[] = {
+    {"2x4/2x2", 64, 128, 256, &launchTiled<2, 4, 2, 2>},
+    {"2x4/4x2", 128, 128, 256, &launchTiled<2, 4, 4, 2>},
+    {"2x4/2x4", 64, 256, 256, &launchTiled<2, 4, 2, 4>},
+    {"2x4/4x4", 128, 256, 256, &launchTiled<2, 4, 4, 4>},
+    {"4x2/2x2", 128, 64, 256, &launchTiled<4, 2, 2, 2>},
+    {"4x4/2x2", 128, 128, 512, &launchTiled<4, 4, 2, 2>},
+};
+
 class PearlPow : public Algorithm {
    public:
     PearlPow() { cudaStreamCreate(&stream_); }
@@ -118,7 +161,72 @@ class PearlPow : public Algorithm {
             return false;
         }
         allocated_ = true;
+        tile_ = pickTileConfig();
         return true;
+    }
+
+    /**
+     * Time every eligible tile configuration on this device and keep the best.
+     *
+     * A few hundred milliseconds, once, against a 64% throughput difference
+     * between the best and worst choice on a 5080 - and the wrong choice is
+     * invisible, because a slow miner looks exactly like a slow GPU.
+     *
+     * Timed on real data: the buffers are filled first, because a GEMM reading
+     * pages that were never written is not measuring the same thing as one
+     * reading real data, which cost an hour to work out once already.
+     */
+    size_t pickTileConfig() {
+        const size_t aBytes = (size_t)shape_.m * kK;
+        const size_t bBytes = (size_t)kK * shape_.n;
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(dAn_, aBytes, 1);
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(dBn_, bBytes, 2);
+        cudaStreamSynchronize(stream_);
+
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+
+        size_t best = 0;
+        float bestMs = 0.0f;
+        bool haveBest = false;
+        for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
+            const TileConfig &tc = kTileConfigs[i];
+            if (shape_.m % tc.blockM || shape_.n % tc.blockN) continue;
+            dim3 grid(shape_.n / tc.blockN, shape_.m / tc.blockM);
+
+            float ms = 0.0f;
+            bool ok = true;
+            for (int rep = 0; rep < 2 && ok; rep++) {     // first pays warmup
+                cudaEventRecord(a, stream_);
+                tc.launch(grid, tc.threads, stream_, dAn_, dBn_, dTranscripts_,
+                          (int)shape_.m, (int)shape_.n, (int)kK, kRank);
+                cudaEventRecord(b, stream_);
+                if (cudaStreamSynchronize(stream_) != cudaSuccess ||
+                    cudaGetLastError() != cudaSuccess) {
+                    ok = false;
+                    break;
+                }
+                cudaEventElapsedTime(&ms, a, b);
+            }
+            if (!ok) continue;
+            if (!haveBest || ms < bestMs) {
+                bestMs = ms;
+                best = i;
+                haveBest = true;
+            }
+        }
+        cudaEventDestroy(a);
+        cudaEventDestroy(b);
+
+        if (haveBest) {
+            const double mac = (double)shape_.m * shape_.n * kK;
+            fprintf(stderr,
+                    "[pearl-pow] tile %s at %ux%u: %.2f ms, %.1f TOPS int8\n",
+                    kTileConfigs[best].name, shape_.m, shape_.n, bestMs,
+                    2.0 * mac / (bestMs * 1e-3) / 1e12);
+        }
+        return best;
     }
 
     bool search(const Job &job, uint64_t nonceBase, uint64_t count,
@@ -333,24 +441,12 @@ class PearlPow : public Algorithm {
         applyNoiseA<<<(aBytes + 255) / 256, 256, 0, stream_>>>(
             dA_, dEAL_, dArF_, dArS_, dAn_, shape_.m, kK, kRank);
 
-        // The register-tiled kernel, at the configuration that measured
-        // fastest on a 4090: 8 warps as 2x4, each owning 4x2 output tiles, so
-        // a block covers 128x128 and every warp holds eight accumulator
-        // fragments. 4.39 ms against 5.65 for 2x2 tiles inside a live attempt,
-        // 125.2 TOPS int8 against 97.3.
-        //
-        // Section 8 of tests/test_pearl_prepare.cu sweeps eight configurations
-        // and section 9 re-runs the top two INTERLEAVED inside real attempts,
-        // because an isolated kernel benchmark and a pipeline are not the same
-        // measurement. tests/test_pearl.cu verifies all six configurations the
-        // miner could pick - one that is benchmarked but never checked is a
-        // trap waiting for a different card to select it.
-        //
-        // Every shape in kShapes is a multiple of 128 on both sides.
-        dim3 grid(shape_.n / 128, shape_.m / 128);
-        noisyGemmMmaTiled<2, 4, 4, 2><<<grid, 256, 0, stream_>>>(
-            dAn_, dBn_, nullptr, dTranscripts_, (int)shape_.m, (int)shape_.n,
-            (int)kK, kRank, false);
+        // Whichever tile configuration prepare() measured fastest on this
+        // card. See kTileConfigs for why that is not a constant.
+        const TileConfig &tc = kTileConfigs[tile_];
+        dim3 grid(shape_.n / tc.blockN, shape_.m / tc.blockM);
+        tc.launch(grid, tc.threads, stream_, dAn_, dBn_, dTranscripts_,
+                  (int)shape_.m, (int)shape_.n, (int)kK, kRank);
 
         powScan<<<(tiles() + 255) / 256, 256, 0, stream_>>>(
             dTranscripts_, tiles(), dCommitA_, (const uint32_t *)dTarget_,
@@ -499,6 +595,7 @@ class PearlPow : public Algorithm {
     static constexpr int kNoiseMask = 63, kNoiseShift = 32;
 
     Shape shape_ = kShapes[sizeof(kShapes) / sizeof(kShapes[0]) - 1];
+    size_t tile_ = 0;          // index into kTileConfigs, chosen by measurement
     bool allocated_ = false;
     bool haveJob_ = false;
     uint8_t header_[76] = {};

@@ -113,9 +113,49 @@ int merkleRoot(const uint8_t *dData, uint32_t chunks, const uint32_t *dKey,
     return 0;
 }
 
+/**
+ * Launch a tile configuration chosen at RUNTIME.
+ *
+ * Needed because the fastest configuration is not the same on every card - a
+ * 4090 wants 4x2 tiles per warp and a 5080 wants 2x4, and the 4090's winner is
+ * the 5080's worst. So the test cannot hardcode which two to compare any more
+ * than the miner can hardcode which one to run.
+ */
+struct TileCfg {
+    const char *name;
+    int wm, wn, tm, tn, blockM, blockN, threads;
+    void (*launch)(dim3, int, cudaStream_t, const int8_t *, const int8_t *,
+                   uint32_t *, int, int, int, int);
+};
+
+template <int WM, int WN, int TM, int TN>
+void launchCfg(dim3 g, int thr, cudaStream_t s, const int8_t *a, const int8_t *b,
+               uint32_t *t, int m, int n, int k, int rank) {
+    noisyGemmMmaTiled<WM, WN, TM, TN><<<g, thr, 0, s>>>(a, b, nullptr, t, m, n,
+                                                        k, rank, false);
+}
+
+const TileCfg kCfgs[] = {
+    {"2x4/2x2", 2, 4, 2, 2, 64, 128, 256, &launchCfg<2, 4, 2, 2>},
+    {"2x4/4x2", 2, 4, 4, 2, 128, 128, 256, &launchCfg<2, 4, 4, 2>},
+    {"2x4/2x4", 2, 4, 2, 4, 64, 256, 256, &launchCfg<2, 4, 2, 4>},
+    {"2x4/4x4", 2, 4, 4, 4, 128, 256, 256, &launchCfg<2, 4, 4, 4>},
+    {"4x2/2x2", 4, 2, 2, 2, 128, 64, 256, &launchCfg<4, 2, 2, 2>},
+    {"4x4/2x2", 4, 4, 2, 2, 128, 128, 512, &launchCfg<4, 4, 2, 2>},
+};
+
+const TileCfg *findCfg(const int c[4]) {
+    for (const TileCfg &t : kCfgs)
+        if (t.wm == c[0] && t.wn == c[1] && t.tm == c[2] && t.tn == c[3])
+            return &t;
+    return &kCfgs[0];
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    int bestCfg[4] = {2, 4, 4, 2}, secondCfg[4] = {2, 4, 2, 2};
+    char bestName[32] = "2x4/4x2", secondName[32] = "2x4/2x2";
     if (argc < 2) {
         fprintf(stderr, "usage: %s <pearl_job_vectors.bin>\n", argv[0]);
         return 2;
@@ -650,8 +690,10 @@ int main(int argc, char **argv) {
         CHECK(cudaEventCreate(&a));
         CHECK(cudaEventCreate(&b));
 
-        double bestMs = 1e9;
-        char bestName[32] = "";
+        // Recorded so section 9 can re-test the top two on THIS card rather
+        // than on the two that happened to win on the machine this was written
+        // on. The ranking is not the same across architectures - see below.
+        double bestMs = 1e9, secondMs = 1e9;
 
 #define SWEEP(WM, WN, TM, TN)                                                  \
         {                                                                      \
@@ -678,9 +720,20 @@ int main(int argc, char **argv) {
                        "%7.3f ms  %6.1f TOPS\n", WM, WN, TM, TN, blockM,       \
                        blockN, (TM) * (TN), ms, 2.0 * mac / (ms * 1e-3) / 1e12);\
                 if (ms < bestMs) {                                             \
+                    secondMs = bestMs;                                         \
+                    memcpy(secondName, bestName, sizeof(secondName));          \
+                    memcpy(secondCfg, bestCfg, sizeof(secondCfg));             \
                     bestMs = ms;                                               \
                     snprintf(bestName, sizeof(bestName), "%dx%d/%dx%d", WM, WN,\
                              TM, TN);                                          \
+                    int c[4] = {WM, WN, TM, TN};                               \
+                    memcpy(bestCfg, c, sizeof(bestCfg));                       \
+                } else if (ms < secondMs) {                                    \
+                    secondMs = ms;                                             \
+                    snprintf(secondName, sizeof(secondName), "%dx%d/%dx%d",    \
+                             WM, WN, TM, TN);                                  \
+                    int c[4] = {WM, WN, TM, TN};                               \
+                    memcpy(secondCfg, c, sizeof(secondCfg));                   \
                 }                                                              \
             }                                                                  \
         }
@@ -794,18 +847,12 @@ int main(int argc, char **argv) {
                                                                  dSeedA, (int)br);
             applyNoiseA<<<(aBytes + 255) / 256, 256, 0, s>>>(gA, gEAL, gArF, gArS,
                                                              gAn, bm, bk, (int)br);
+            const TileCfg *tc = (which == 0) ? findCfg(secondCfg)
+                                             : findCfg(bestCfg);
+            dim3 g(bn / tc->blockN, bm / tc->blockM);
             CHECK(cudaEventRecord(a, s));
-            if (which == 0) {
-                dim3 g(bn / 128, bm / 64);
-                noisyGemmMmaTiled<2, 4, 2, 2><<<g, 256, 0, s>>>(
-                    gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
-                    false);
-            } else {
-                dim3 g(bn / 128, bm / 128);
-                noisyGemmMmaTiled<2, 4, 4, 2><<<g, 256, 0, s>>>(
-                    gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
-                    false);
-            }
+            tc->launch(g, tc->threads, s, gAn, gBn, gTrans, (int)bm, (int)bn,
+                       (int)bk, (int)br);
             CHECK(cudaEventRecord(b, s));
             CHECK(cudaStreamSynchronize(s));
             float d = 0;
@@ -814,16 +861,22 @@ int main(int argc, char **argv) {
         }
         const double mac = (double)bm * bn * bk;
         for (int i = 0; i < 2; i++) ms[i] /= reps[i];
-        printf("    2x4/2x2 in a live attempt: %.3f ms  %.1f TOPS\n", ms[0],
-               2.0 * mac / (ms[0] * 1e-3) / 1e12);
-        printf("    2x4/4x2 in a live attempt: %.3f ms  %.1f TOPS\n", ms[1],
-               2.0 * mac / (ms[1] * 1e-3) / 1e12);
-        printf("    isolated, section 8 said 5.64 and 4.29 - a 24%% gap\n");
-        printf("    here the gap is %.1f%%\n", 100.0 * (ms[0] - ms[1]) / ms[0]);
+        printf("    %s (2nd in section 8) live: %.3f ms  %.1f TOPS\n",
+               secondName, ms[0], 2.0 * mac / (ms[0] * 1e-3) / 1e12);
+        printf("    %s (1st in section 8) live: %.3f ms  %.1f TOPS\n",
+               bestName, ms[1], 2.0 * mac / (ms[1] * 1e-3) / 1e12);
+        printf("    gap here %.1f%%\n", 100.0 * (ms[0] - ms[1]) / ms[0]);
 
-        check("the faster kernel is still faster inside a real attempt",
-              ms[1] < ms[0],
-              std::to_string(ms[0]) + " vs " + std::to_string(ms[1]));
+        // The claim under test is that an ISOLATED kernel benchmark predicts
+        // the pipeline, not that any particular configuration wins - which one
+        // does is a property of the card. On a 4090 the answer is 4x2 tiles
+        // per warp; on a 5080 that same configuration is the WORST of the six
+        // and 2x4 wins. Hardcoding either would have made this test lie on the
+        // other machine.
+        check("section 8's winner is still the winner inside a real attempt",
+              ms[1] <= ms[0],
+              std::string(bestName) + " " + std::to_string(ms[1]) + " vs " +
+                  secondName + " " + std::to_string(ms[0]));
 
         CHECK(cudaFree(gA)); CHECK(cudaFree(gBt)); CHECK(cudaFree(gAn));
         CHECK(cudaFree(gBn)); CHECK(cudaFree(gEAL)); CHECK(cudaFree(gEBRf));
