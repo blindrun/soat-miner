@@ -112,14 +112,23 @@ risk. Bad memory produces bad hashes. This miner re-checks every solution on
 the GPU before sending it, so you will see them rejected rather than sent, but
 do not go hunting for numbers you cannot verify.
 
-On AMD there is no P2 downclock to undo, but the memory can go past stock, and
-command ./soat-miner --mem-oc raises it a conservative amount chosen by GPU
-generation (memory is the same across a generation). It needs amdgpu overdrive
-enabled - add `amdgpu.ppfeaturemask=0xffffffff` to the kernel command line,
-reboot, and run as root - and it prints how to if it is off. A 7900 XT goes to
-1325 MHz, worth about 5%, and the clock is put back when the miner stops. It is
-off by default and only touches generations proven on real hardware; on NVIDIA
-it points you at --mclk-offset instead.
+Command ./soat-miner --mem-oc does the safe thing for your card automatically,
+chosen by memory type (the memory is the same across a type). It is off by
+default and only touches memory it has been proven safe on. **Linux only** - the
+clock control it uses does not exist on Windows.
+
+On **AMD GDDR6** there is no downclock to undo, but the memory can go past stock:
+it raises the clock a conservative amount over stock through amdgpu overdrive. A
+7900 XT goes to 1325 MHz, worth about 5%. This needs overdrive enabled - add
+`amdgpu.ppfeaturemask=0xffffffff` to the kernel command line, reboot, and run as
+root - and it prints how to if it is off.
+
+On **NVIDIA GDDR6X** (4090/4080/4070-family, 3090/3080/3070 Ti) it restores the
+P2 downclock back to the rated speed, worth about 2.5%. That is undoing a
+downclock, not an overclock. GDDR6 and GDDR7 NVIDIA cards have no such downclock,
+so they are left alone; use --mclk-offset by hand if you know your card.
+
+Either way the clock is put back when the miner stops.
 
 ## Multiple GPUs
 

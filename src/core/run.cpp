@@ -30,8 +30,29 @@ static int conservativeAmdMemBumpMhz(const char *gpuName) {
     return 0;
 }
 
-// Opt-in conservative memory overclock (--mem-oc). AMD raises the memory clock a
-// generation-safe amount via overdrive sysfs; NVIDIA is pointed at --mclk-offset.
+// A conservative memory-clock offset (MHz of transfer rate, applied via NVML)
+// for --mem-oc on NVIDIA, keyed by MEMORY TYPE. GDDR6X cards force performance
+// state P2 under load, which runs the memory below its rated speed; +500
+// restores rated on a 4090 (validated, ~+2.6%) and the P2 downclock is the same
+// across GDDR6X, so this is a restore-to-spec, not a real overclock. GDDR6 and
+// GDDR7 have no such downclock, so they get nothing - a +offset there would be a
+// genuine overclock. NVML clock control is Linux + root only (fails on Windows).
+static int conservativeNvidiaMemOffsetMhz(const char *gpuName) {
+    std::string n;
+    for (const char *p = gpuName ? gpuName : ""; *p; ++p)
+        n += (*p >= 'A' && *p <= 'Z') ? (char)(*p + 32) : *p;
+    auto has = [&](const char *s) { return n.find(s) != std::string::npos; };
+    // GDDR6X: Ada 4090/4080/4070-family, Ampere 3090/3080 and the 3070 Ti.
+    // NOT 4060/4060 Ti, NOT the bare 3070/3060 (GDDR6), NOT 50-series (GDDR7).
+    if (has("4090") || has("4080") || has("4070") || has("3090") ||
+        has("3080") || has("3070 ti"))
+        return 500;
+    return 0;
+}
+
+// Opt-in conservative memory overclock (--mem-oc), keyed by memory type. AMD
+// GDDR6 raises the clock over stock via overdrive sysfs; NVIDIA GDDR6X restores
+// its P2 downclock via NVML. Both are Linux-only.
 static void applyMemOc(GpuMonitor &gpu, const char *gpuName) {
     if (gpu.isAmd()) {
         const int bump = conservativeAmdMemBumpMhz(gpuName);
@@ -56,9 +77,23 @@ static void applyMemOc(GpuMonitor &gpu, const char *gpuName) {
             fprintf(stderr, "mem-oc: memory %d -> %d MHz (+%d, conservative)\n",
                     stock, got, got - stock);
     } else if (gpu.isNvidia()) {
-        fprintf(stderr,
-                "--mem-oc: on NVIDIA use --mclk-offset N to undo the P2 downclock "
-                "(e.g. 500 on GDDR6X). Needs root on Linux.\n");
+        const int off = conservativeNvidiaMemOffsetMhz(gpuName);
+        if (off == 0) {
+            fprintf(stderr,
+                    "--mem-oc: no conservative profile for this NVIDIA GPU (only "
+                    "GDDR6X cards have a P2 downclock to restore). Use --mclk-offset "
+                    "N by hand if you know your card.\n");
+            return;
+        }
+        const int got = gpu.applyMemOffsetMhz(off);
+        if (got < 0)
+            fprintf(stderr,
+                    "--mem-oc: could not set the memory clock offset - NVML clock "
+                    "control needs Linux and root, and is unavailable on Windows.\n");
+        else
+            fprintf(stderr,
+                    "mem-oc: memory clock offset +%d (GDDR6X, restore P2 to rated)\n",
+                    off);
     }
 }
 
