@@ -68,6 +68,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
         else if (a == "--mclk-offset") opt.memOffsetMhz = atoi(next().c_str());
+        else if (a == "--mem-oc") opt.memOc = true;
         // No --cache-dag here. Building ahead was measured on this backend and
         // it loses: see the README. Accepting the flag and ignoring it would be
         // worse than not having it.
@@ -104,6 +105,9 @@ int main(int argc, char **argv) {
                 "                    which runs memory under its rated speed;\n"
                 "                    500 restores a 4090 to stock for +2.3%%.\n"
                 "                    Needs root on Linux. 0 leaves it alone\n"
+                "  --mem-oc          conservative per-generation memory OC\n"
+                "                    (AMD: needs overdrive+root; NVIDIA: use\n"
+                "                    --mclk-offset instead)\n"
                 "  --bench           benchmark, no node required\n"
                 "  --bench-height H  height to benchmark at\n");
             return 0;

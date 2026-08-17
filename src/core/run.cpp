@@ -8,6 +8,60 @@
 
 namespace om {
 
+// A validated-conservative memory bump (MHz over stock) for --mem-oc, keyed by
+// GPU generation since a generation shares one memory spec. Only generations
+// proven on real hardware get a value; anything else returns 0 and the card is
+// left alone. RDNA3 measured stable at +100 on a 7900 XT (1350 MHz,
+// correctness-verified) and crashes at +150, so ship +75. RDNA2 is the same
+// GDDR6 class but untested here, so a smaller +50.
+static int conservativeAmdMemBumpMhz(const char *gpuName) {
+    std::string n;
+    for (const char *p = gpuName ? gpuName : ""; *p; ++p)
+        n += (*p >= 'A' && *p <= 'Z') ? (char)(*p + 32) : *p;
+    auto has = [&](const char *s) { return n.find(s) != std::string::npos; };
+    if (has("navi 3") || has("navi3") || has("rx 79") || has("rx 78") ||
+        has("rx 77") || has("rx 76") || has("7900") || has("7800") ||
+        has("7700") || has("7600"))
+        return 75;  // RDNA3
+    if (has("navi 2") || has("navi2") || has("rx 69") || has("rx 68") ||
+        has("rx 67") || has("rx 66") || has("6900") || has("6800") ||
+        has("6700") || has("6600"))
+        return 50;  // RDNA2
+    return 0;
+}
+
+// Opt-in conservative memory overclock (--mem-oc). AMD raises the memory clock a
+// generation-safe amount via overdrive sysfs; NVIDIA is pointed at --mclk-offset.
+static void applyMemOc(GpuMonitor &gpu, const char *gpuName) {
+    if (gpu.isAmd()) {
+        const int bump = conservativeAmdMemBumpMhz(gpuName);
+        if (bump == 0) {
+            fprintf(stderr,
+                    "--mem-oc: no conservative profile for this GPU, memory clock "
+                    "left alone.\n");
+            return;
+        }
+        int stock = 0;
+        const int got = gpu.amdApplyMemBump(bump, &stock);
+        if (stock <= 0) {
+            fprintf(stderr,
+                    "--mem-oc: AMD overdrive unavailable. Add "
+                    "amdgpu.ppfeaturemask=0xffffffff to the kernel command line, "
+                    "reboot, and run as root.\n");
+            return;
+        }
+        if (got <= 0)
+            fprintf(stderr, "--mem-oc: could not set the memory clock (need root).\n");
+        else
+            fprintf(stderr, "mem-oc: memory %d -> %d MHz (+%d, conservative)\n",
+                    stock, got, got - stock);
+    } else if (gpu.isNvidia()) {
+        fprintf(stderr,
+                "--mem-oc: on NVIDIA use --mclk-offset N to undo the P2 downclock "
+                "(e.g. 500 on GDDR6X). Needs root on Linux.\n");
+    }
+}
+
 int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
              double gpuMemGB, const char *archLabel, volatile sig_atomic_t *stop) {
     GpuMonitor gpu;
@@ -22,6 +76,9 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     "could not set the memory clock offset. Needs an NVIDIA "
                     "card, a recent driver, and root on Linux.\n");
     }
+
+    // Opt-in conservative memory OC (reset on exit via gpu.close()).
+    if (opt.memOc) applyMemOc(gpu, gpuName);
 
     const bool tty = stdoutIsTty() && !opt.plain;
 

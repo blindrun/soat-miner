@@ -264,7 +264,51 @@ class AmdSysfs {
         return t;
     }
 
-    void close() { ok_ = false; }
+    void close() { resetMemClock(); ok_ = false; }
+
+#if !defined(_WIN32)
+    // --- memory overclock via the amdgpu overdrive sysfs table ------------
+    // Only usable when amdgpu.ppfeaturemask has enabled overdrive (otherwise
+    // the OD table is empty) and the process is root. Clocks are MHz.
+
+    // Stock top memory state (OD_MCLK level 1); 0 if overdrive is unavailable.
+    int odMemTopMhz() const { return odLevel("OD_MCLK", 1); }
+    // Highest memory clock the driver will accept (OD_RANGE MCLK upper bound).
+    int odMemMaxMhz() const { return odRangeHi("MCLK"); }
+
+    // Raise the top memory state to (true stock + bump). Resets the OD table to
+    // defaults FIRST so a bump never compounds on a clock that was already
+    // raised (e.g. by a prior run or a persistent OC service). Clamps to the
+    // OD_RANGE max. Returns the clock written, or 0 on failure (no overdrive /
+    // not root). `stockOut` (if non-null) receives the true stock clock.
+    int applyMemBumpMhz(int bump, int *stockOut = nullptr) {
+        writeOd("r");   // back to defaults so we read TRUE stock, not a prior OC
+        writeOd("c");
+        const int stock = odMemTopMhz();
+        if (stockOut) *stockOut = stock;
+        if (stock <= 0) return 0;      // overdrive off / not root
+        odStock_ = stock;              // mark that reset() should run on close
+        int target = stock + bump;
+        const int mx = odMemMaxMhz();
+        if (mx > 0 && target > mx) target = mx;
+        if (target < stock) target = stock;
+        if (!writeOd("m 1 " + std::to_string(target))) return 0;
+        if (!writeOd("c")) return 0;
+        return target;
+    }
+
+    // Restore the memory clock to the driver defaults. Safe to call anytime.
+    void resetMemClock() {
+        if (odStock_ == 0) return;
+        writeOd("r");
+        writeOd("c");
+        odStock_ = 0;
+    }
+#else
+    int odMemTopMhz() const { return 0; }
+    int applyMemBumpMhz(int, int *stockOut = nullptr) { if (stockOut) *stockOut = 0; return 0; }
+    void resetMemClock() {}
+#endif
 
    private:
     static std::string readStr(const std::string &p) {
@@ -287,6 +331,60 @@ class AmdSysfs {
         errno = 0;
         return strtoull(s.c_str(), nullptr, 10);
     }
+
+#if !defined(_WIN32)
+    // Every integer on a line, in order (so "1: 1250MHz" -> {1,1250} and
+    // "MCLK:  97Mhz  1500Mhz" -> {97,1500}), tolerating the Mhz/MHz spelling mix.
+    static std::vector<int> ints(const std::string &s) {
+        std::vector<int> v;
+        for (size_t i = 0; i < s.size();) {
+            if (s[i] >= '0' && s[i] <= '9') {
+                v.push_back((int)strtol(s.c_str() + i, nullptr, 10));
+                while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+            } else {
+                i++;
+            }
+        }
+        return v;
+    }
+    bool writeOd(const std::string &cmd) {
+        std::ofstream f(device_ + "/pp_od_clk_voltage");
+        if (!f) return false;
+        f << cmd << "\n";
+        f.flush();
+        return f.good();
+    }
+    // Clock for `level` under an "OD_SCLK:"/"OD_MCLK:" section.
+    int odLevel(const std::string &section, int level) const {
+        std::ifstream f(device_ + "/pp_od_clk_voltage");
+        std::string line;
+        bool in = false;
+        while (std::getline(f, line)) {
+            if (line.rfind("OD_", 0) == 0) { in = line.rfind(section + ":", 0) == 0; continue; }
+            if (!in) continue;
+            std::vector<int> v = ints(line);
+            if (v.size() >= 2 && v[0] == level) return v[1];
+        }
+        return 0;
+    }
+    // Upper bound for `field` (e.g. "MCLK") under the "OD_RANGE:" section.
+    int odRangeHi(const std::string &field) const {
+        std::ifstream f(device_ + "/pp_od_clk_voltage");
+        std::string line;
+        bool in = false;
+        while (std::getline(f, line)) {
+            if (line.rfind("OD_RANGE:", 0) == 0) { in = true; continue; }
+            if (line.rfind("OD_", 0) == 0) { in = false; continue; }
+            if (!in) continue;
+            if (line.rfind(field + ":", 0) == 0) {
+                std::vector<int> v = ints(line);
+                if (v.size() >= 2) return v.back();
+            }
+        }
+        return 0;
+    }
+    int odStock_ = 0;
+#endif
 
     std::string hwmon_, device_;
     bool ok_ = false;
@@ -326,6 +424,15 @@ class GpuMonitor {
         return got;
     }
     bool canSetMemOffset() const { return which_ == Nv && nvml_.canSetMemOffset(); }
+
+    bool isAmd() const { return which_ == Amd; }
+    bool isNvidia() const { return which_ == Nv; }
+    // AMD memory-overclock pass-throughs (Linux amdgpu overdrive sysfs).
+    int amdMemTopMhz() { return which_ == Amd ? amd_.odMemTopMhz() : 0; }
+    int amdApplyMemBump(int bump, int *stockOut = nullptr) {
+        return which_ == Amd ? amd_.applyMemBumpMhz(bump, stockOut) : 0;
+    }
+    void amdResetMemClock() { if (which_ == Amd) amd_.resetMemClock(); }
 
    private:
     enum Which { None, Nv, Amd };

@@ -112,6 +112,30 @@ risk. Bad memory produces bad hashes. This miner re-checks every solution on
 the GPU before sending it, so you will see them rejected rather than sent, but
 do not go hunting for numbers you cannot verify.
 
+On AMD there is no P2 downclock to undo, but the memory can go past stock, and
+command ./soat-miner --mem-oc raises it a conservative amount chosen by GPU
+generation (memory is the same across a generation). It needs amdgpu overdrive
+enabled - add `amdgpu.ppfeaturemask=0xffffffff` to the kernel command line,
+reboot, and run as root - and it prints how to if it is off. A 7900 XT goes to
+1325 MHz, worth about 5%, and the clock is put back when the miner stops. It is
+off by default and only touches generations proven on real hardware; on NVIDIA
+it points you at --mclk-offset instead.
+
+## Multiple GPUs
+
+Pick the GPU with command ./soat-miner --device N, numbered as in --list-devices.
+
+Run one process per GPU. Each gets its own --device and its own --mem-oc, which
+is also how each card is tuned independently:
+
+```
+./soat-miner --device 0 --mem-oc --pool ... &
+./soat-miner --device 1 --mem-oc --pool ... &
+```
+
+One process per card keeps a hung overclock on one GPU from taking the others
+down with it. A single process that drives every GPU at once is not built yet.
+
 ## Building the next block ahead
 
 The lookup table depends on the block height. Every new block means a new table.

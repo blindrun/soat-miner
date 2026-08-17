@@ -108,6 +108,13 @@ struct RunOptions {
     // is what puts it back. 0 leaves the card alone.
     int memOffsetMhz = 0;
 
+    // Opt-in conservative memory overclock chosen by GPU generation. On AMD it
+    // raises the memory clock a validated-safe amount over stock via the amdgpu
+    // overdrive sysfs table (needs root and amdgpu.ppfeaturemask enabled); on
+    // NVIDIA it points at --mclk-offset instead. Off by default - an auto OC on
+    // an unknown card is how you crash someone's rig.
+    bool memOc = false;
+
     // Benchmark only: pretend a new block arrives this often, so the cost of
     // an epoch change is included in the average. 0 means the height is fixed.
     int benchEpochSeconds = 0;

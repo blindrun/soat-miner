@@ -31,6 +31,7 @@ int main(int argc, char **argv) {
     std::string algoName = "autolykos2";
     RunOptions opt;
     opt.backendLabel = "CUDA";
+    int deviceIndex = 0;  // which CUDA GPU; one process per GPU for a rig
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -38,6 +39,7 @@ int main(int argc, char **argv) {
             return (i + 1 < argc) ? argv[++i] : std::string();
         };
         if (a == "--algo") algoName = next();
+        else if (a == "--device") deviceIndex = atoi(next().c_str());
                 else if (a == "--pool") {
             std::string v = next();
             const size_t c = v.rfind(':');
@@ -60,6 +62,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench-height") opt.benchEpoch = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--bench-epoch-secs") opt.benchEpochSeconds = atoi(next().c_str());
         else if (a == "--mclk-offset") opt.memOffsetMhz = atoi(next().c_str());
+        else if (a == "--mem-oc") opt.memOc = true;
         else if (a == "--cache-dag") {
             const std::string v = next();
             opt.prefetch = (v == "on" || v == "1") ? 1
@@ -95,6 +98,7 @@ int main(int argc, char **argv) {
                 "  --algo NAME       algorithm (default autolykos2)\n"
                 "  --list-algos      list compiled-in algorithms\n"
                 "  --list-devices    list CUDA GPUs and exit\n"
+                "  --device N        GPU index (default 0; one process per GPU)\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
@@ -119,6 +123,9 @@ int main(int argc, char **argv) {
                 "                    which runs memory under its rated speed;\n"
                 "                    500 restores a 4090 to stock for +2.3%%.\n"
                 "                    Needs root on Linux. 0 leaves it alone\n"
+                "  --mem-oc          conservative per-generation memory OC\n"
+                "                    (AMD: needs overdrive+root; NVIDIA: use\n"
+                "                    --mclk-offset instead)\n"
                 "  --bench           benchmark, no node required\n"
                 "  --bench-height H  height to benchmark at\n"
                 "  --bench-epoch-secs N  benchmark: change height every N s,\n"
@@ -159,6 +166,21 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 #endif
 
+    // Pick the GPU before anything allocates on it. Run one process per GPU
+    // (each with its own --device and --mem-oc) to drive a multi-GPU rig.
+    int devCount = 0;
+    cudaGetDeviceCount(&devCount);
+    if (devCount == 0) {
+        fprintf(stderr, "no CUDA device found\n");
+        return 1;
+    }
+    if (deviceIndex < 0 || deviceIndex >= devCount) {
+        fprintf(stderr, "--device %d out of range (%d CUDA GPU%s, 0-%d)\n",
+                deviceIndex, devCount, devCount == 1 ? "" : "s", devCount - 1);
+        return 1;
+    }
+    cudaSetDevice(deviceIndex);
+
     std::unique_ptr<Algorithm> algo(createAlgorithm(algoName));
     if (!algo) {
         fprintf(stderr, "unknown algorithm '%s' (try --list-algos)\n", algoName.c_str());
@@ -166,7 +188,7 @@ int main(int argc, char **argv) {
     }
 
     cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+    if (cudaGetDeviceProperties(&prop, deviceIndex) != cudaSuccess) {
         fprintf(stderr, "no CUDA device found\n");
         return 1;
     }
