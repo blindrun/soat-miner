@@ -60,10 +60,10 @@ struct Shape {
 };
 
 const Shape kShapes[] = {
-    {4096, 32768},   // 62.1 M candidates/s on a 4090, ~180 MB
-    {2048, 32768},   // 60.9
-    {2048, 16384},   // 58.2
-    {1024, 16384},   // 54.4
+    {4096, 32768},   // ~114 M candidates/s on a 4090, ~180 MB
+    {2048, 32768},   // 102.9
+    {2048, 16384},   //  97.4
+    {1024, 16384},   //  87.4
     {512, 8192},     // small cards and integrated parts
     {256, 2048},
 };
@@ -333,13 +333,22 @@ class PearlPow : public Algorithm {
         applyNoiseA<<<(aBytes + 255) / 256, 256, 0, stream_>>>(
             dA_, dEAL_, dArF_, dArS_, dAn_, shape_.m, kK, kRank);
 
-        // The register-tiled kernel: 1.74x the staged one on a 4090 (4.75 ms
-        // against 8.23 at 4096x32768, 115.8 TOPS against 65.8), because both
-        // operands come from shared memory and one pair of fragment loads
-        // feeds four mma instructions. Every shape in kShapes satisfies its
-        // m % 64 and n % 128 requirement.
-        dim3 grid(shape_.n / 128, shape_.m / 64);
-        noisyGemmMmaTiled<<<grid, 256, 0, stream_>>>(
+        // The register-tiled kernel, at the configuration that measured
+        // fastest on a 4090: 8 warps as 2x4, each owning 4x2 output tiles, so
+        // a block covers 128x128 and every warp holds eight accumulator
+        // fragments. 4.39 ms against 5.65 for 2x2 tiles inside a live attempt,
+        // 125.2 TOPS int8 against 97.3.
+        //
+        // Section 8 of tests/test_pearl_prepare.cu sweeps eight configurations
+        // and section 9 re-runs the top two INTERLEAVED inside real attempts,
+        // because an isolated kernel benchmark and a pipeline are not the same
+        // measurement. tests/test_pearl.cu verifies all six configurations the
+        // miner could pick - one that is benchmarked but never checked is a
+        // trap waiting for a different card to select it.
+        //
+        // Every shape in kShapes is a multiple of 128 on both sides.
+        dim3 grid(shape_.n / 128, shape_.m / 128);
+        noisyGemmMmaTiled<2, 4, 4, 2><<<grid, 256, 0, stream_>>>(
             dAn_, dBn_, nullptr, dTranscripts_, (int)shape_.m, (int)shape_.n,
             (int)kK, kRank, false);
 

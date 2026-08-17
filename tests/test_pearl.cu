@@ -199,32 +199,50 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Register-tiled variant: 2x2 tiles per warp, both operands from shared.
-    // The fastest of the three and therefore the one most worth distrusting -
-    // it is held to the identical reference, transcripts included.
+    // Register-tiled variants. Every configuration the miner might select is
+    // checked, not just the one it ships, because the choice is made by
+    // measurement on whatever card is present - so a config that is only ever
+    // benchmarked and never verified is a trap waiting for a faster GPU.
     bool tiledOk = true;
-    {
-        if (m % 64 || n % 128) {
-            printf("  tiled:         SKIPPED (needs m%%64 and n%%128)\n");
-        } else {
-            dim3 gridT(n / 128, m / 64);
-            CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));
-            CHECK(cudaMemset(dT, 0, (size_t)numTranscripts * 16 * sizeof(uint32_t)));
-            om::pearl::noisyGemmMmaTiled<<<gridT, 256>>>(dA, dB, dC, dT, m, n, k,
-                                                         rank, true);
-            cudaError_t e = cudaGetLastError();
-            if (e != cudaSuccess) {
-                printf("  tiled:         SKIPPED (%s)\n", cudaGetErrorString(e));
-            } else {
-                CHECK(cudaDeviceSynchronize());
-                CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t),
-                                 cudaMemcpyDeviceToHost));
-                CHECK(cudaMemcpy(tGot.data(), dT, tGot.size() * sizeof(uint32_t),
-                                 cudaMemcpyDeviceToHost));
-                tiledOk = compare("tiled:");
-            }
-        }
+#define CHECK_TILED(WM, WN, TM, TN)                                            \
+    {                                                                          \
+        constexpr int threads = (WM) * (WN) * 32;                              \
+        constexpr int blockM = (WM) * (TM) * 16;                               \
+        constexpr int blockN = (WN) * (TN) * 16;                               \
+        char label[32];                                                        \
+        snprintf(label, sizeof(label), "tiled %dx%d/%dx%d:", WM, WN, TM, TN);   \
+        if (m % blockM || n % blockN) {                                        \
+            printf("  %-14s SKIPPED (needs m%%%d and n%%%d)\n", label, blockM,  \
+                   blockN);                                                    \
+        } else {                                                               \
+            dim3 g(n / blockN, m / blockM);                                    \
+            CHECK(cudaMemset(dC, 0, (size_t)m * n * sizeof(int32_t)));         \
+            CHECK(cudaMemset(dT, 0,                                            \
+                             (size_t)numTranscripts * 16 * sizeof(uint32_t))); \
+            om::pearl::noisyGemmMmaTiled<WM, WN, TM, TN><<<g, threads>>>(      \
+                dA, dB, dC, dT, m, n, k, rank, true);                          \
+            cudaError_t e = cudaGetLastError();                                \
+            if (e != cudaSuccess) {                                            \
+                printf("  %-14s SKIPPED (%s)\n", label, cudaGetErrorString(e)); \
+            } else {                                                           \
+                CHECK(cudaDeviceSynchronize());                                \
+                CHECK(cudaMemcpy(cGot.data(), dC, cGot.size() * sizeof(int32_t), \
+                                 cudaMemcpyDeviceToHost));                     \
+                CHECK(cudaMemcpy(tGot.data(), dT,                              \
+                                 tGot.size() * sizeof(uint32_t),               \
+                                 cudaMemcpyDeviceToHost));                     \
+                if (!compare(label)) tiledOk = false;                          \
+            }                                                                  \
+        }                                                                      \
     }
+
+    CHECK_TILED(2, 4, 2, 2)
+    CHECK_TILED(2, 4, 4, 2)
+    CHECK_TILED(2, 4, 2, 4)
+    CHECK_TILED(2, 4, 4, 4)
+    CHECK_TILED(4, 2, 2, 2)
+    CHECK_TILED(4, 4, 2, 2)
+#undef CHECK_TILED
 
     int badC = naiveOk && mmaOk && stagedOk && tiledOk ? 0 : 1;
     int badT = 0;

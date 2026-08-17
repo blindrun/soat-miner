@@ -488,8 +488,8 @@ int main(int argc, char **argv) {
             {2048, 32768}, {4096, 32768}, {4096, 65536}};
         const uint32_t bk = 2048, br = 128;
 
-        printf("    %-14s %8s %8s %8s %8s %8s  %s\n", "shape", "attempt",
-               "staged", "tiled", "over%", "Mcand/s", "TOPS");
+        printf("    %-14s %8s %8s %8s %8s  %s\n", "shape", "attempt", "GEMM",
+               "over%", "Mcand/s", "TOPS");
         // Rank by candidates per second, not by overhead. They disagree, and
         // overhead is the misleading one: the widest shape has the lowest
         // overhead and is not the fastest, because B stops fitting in L2 and
@@ -524,26 +524,40 @@ int main(int argc, char **argv) {
             CHECK(cudaMalloc(&gCB, 32));
             CHECK(cudaMalloc(&gTrans, (size_t)tiles * 16 * sizeof(uint32_t)));
 
-            // Per-job work, done once and then left alone.
+            // Per-job work, done once and then left alone. All of it, not
+            // just the hashing: leaving B_noised as untouched cudaMalloc'd
+            // memory made the GEMM here disagree with section 8 by 8% on the
+            // identical kernel, because a GEMM reading pages that were never
+            // written is not measuring the same thing as one reading real
+            // data. Measure the pipeline that runs, not a piece of it.
             genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, s>>>(gBt, bBytes,
                                                                matrixSeed(7, true));
             merkleRoot((const uint8_t *)gBt, bCh, dKey, gScratch, gRoots + 32, s);
+            deriveCommitmentB<<<1, 1, 0, s>>>(gRoots + 32, dJobKey, dSaltB, bn, 1,
+                                              gCB);
+            noiseUniform<<<((bn * br + 31) / 32 + 255) / 256, 256, 0, s>>>(
+                gEBRf, bn * br, gCB, dSeedB, 63, 32);
+            transposeNoiseB<<<(bn * br + 255) / 256, 256, 0, s>>>(gEBRf, gEBR, bn,
+                                                                  (int)br);
+            noisePerm<<<((bk + 7) / 8 + 255) / 256, 256, 0, s>>>(gBlF, gBlS, bk, gCB,
+                                                                 dSeedB, (int)br);
+            applyNoiseB<<<(((size_t)bk * bn) + 255) / 256, 256, 0, s>>>(
+                gBt, gEBR, gBlF, gBlS, gBn, bn, bk);
+            CHECK(cudaStreamSynchronize(s));
 
-            cudaEvent_t e0, e1, e2, e3;
+            cudaEvent_t e0, e1, e2;
             CHECK(cudaEventCreate(&e0));
             CHECK(cudaEventCreate(&e1));
             CHECK(cudaEventCreate(&e2));
-            CHECK(cudaEventCreate(&e3));
 
-            double prepMs = 0, gemmMs = 0, tiledMs = 0;
+            double prepMs = 0, gemmMs = 0;
             const int kReps = 6;
             for (int rep = 0; rep < kReps; rep++) {
                 CHECK(cudaEventRecord(e0, s));
                 genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, s>>>(
                     gA, aBytes, matrixSeed(rep, false));
                 merkleRoot((const uint8_t *)gA, aCh, dKey, gScratch, gRoots, s);
-                deriveCommitments<<<1, 1, 0, s>>>(gRoots, gRoots + 32, dJobKey,
-                                                  dSaltA, dSaltB, bm, bn, 1, gCA, gCB);
+                deriveCommitmentA<<<1, 1, 0, s>>>(gRoots, gCB, dSaltA, bm, 1, gCA);
                 noiseUniform<<<((bm * br + 31) / 32 + 255) / 256, 256, 0, s>>>(
                     gEAL, bm * br, gCA, dSeedA, 63, 32);
                 noisePerm<<<((bk + 7) / 8 + 255) / 256, 256, 0, s>>>(
@@ -552,43 +566,34 @@ int main(int argc, char **argv) {
                     gA, gEAL, gArF, gArS, gAn, bm, bk, (int)br);
                 CHECK(cudaEventRecord(e1, s));
 
-                const int warps = 8;
-                dim3 grid((bn / 16 + warps - 1) / warps, bm / 16);
-                noisyGemmMmaStaged<<<grid, 256, 0, s>>>(gAn, gBn, nullptr, gTrans,
-                                                        (int)bm, (int)bn, (int)bk,
-                                                        (int)br, false);
+                // Only the kernel that ships. An earlier version timed the
+                // staged one in the same rep loop and the tiled number came
+                // out 8% slower than section 8 measured for the identical
+                // kernel - 8.2 ms of heavy work immediately before it evicts
+                // L2 and heats the card. Kernels get compared in section 8,
+                // one at a time; this section is about the shape.
+                dim3 gridT(bn / 128, bm / 128);
+                noisyGemmMmaTiled<2, 4, 4, 2><<<gridT, 256, 0, s>>>(
+                    gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
+                    false);
                 CHECK(cudaEventRecord(e2, s));
-
-                // The register-tiled kernel over the identical inputs. Both
-                // are held to the same reference in tests/test_pearl.cu, so
-                // this is purely which one is faster.
-                if (bm % 64 == 0 && bn % 128 == 0) {
-                    dim3 gridT(bn / 128, bm / 64);
-                    noisyGemmMmaTiled<<<gridT, 256, 0, s>>>(gAn, gBn, nullptr,
-                                                            gTrans, (int)bm, (int)bn,
-                                                            (int)bk, (int)br, false);
-                }
-                CHECK(cudaEventRecord(e3, s));
                 CHECK(cudaStreamSynchronize(s));
 
-                float a = 0, b = 0, c = 0;
+                float a = 0, b = 0;
                 CHECK(cudaEventElapsedTime(&a, e0, e1));
                 CHECK(cudaEventElapsedTime(&b, e1, e2));
-                CHECK(cudaEventElapsedTime(&c, e2, e3));
-                if (rep) { prepMs += a; gemmMs += b; tiledMs += c; }
+                if (rep) { prepMs += a; gemmMs += b; }
             }
             prepMs /= (kReps - 1);
             gemmMs /= (kReps - 1);
-            tiledMs /= (kReps - 1);
 
-            const double best = (tiledMs > 0 && tiledMs < gemmMs) ? tiledMs : gemmMs;
+            const double best = gemmMs;
             const double mac = (double)bm * bn * bk;
             const double over = 100.0 * prepMs / best;
             char shape[32];
             snprintf(shape, sizeof(shape), "%ux%u", bm, bn);
-            printf("    %-14s %7.3f %8.3f %8.3f %7.1f%% %8.1f  %.1f\n", shape,
-                   prepMs, gemmMs, tiledMs, over,
-                   tiles / ((prepMs + best) * 1e-3) / 1e6,
+            printf("    %-14s %7.3f %8.3f %7.1f%% %8.1f  %.1f\n", shape, prepMs,
+                   gemmMs, over, tiles / ((prepMs + best) * 1e-3) / 1e6,
                    2.0 * mac / (best * 1e-3) / 1e12);
             const double rate = tiles / ((prepMs + best) * 1e-3) / 1e6;
             if (rate > bestRate) {
@@ -605,7 +610,7 @@ int main(int argc, char **argv) {
             CHECK(cudaFree(gRoots)); CHECK(cudaFree(gCA)); CHECK(cudaFree(gCB));
             CHECK(cudaFree(gTrans));
             CHECK(cudaEventDestroy(e0)); CHECK(cudaEventDestroy(e1));
-            CHECK(cudaEventDestroy(e2)); CHECK(cudaEventDestroy(e3));
+            CHECK(cudaEventDestroy(e2));
         }
         printf("    fastest is %ux%u at %.1f M candidates/s (%.1f%% overhead)\n",
                bestM, bestN, bestRate, bestOver);
@@ -618,6 +623,216 @@ int main(int argc, char **argv) {
               std::to_string(bestM) + "x" + std::to_string(bestN));
     }
 
+
+    // ------------------------------------------------------------------
+    printf("8. GEMM tile configurations, at the shape that won\n");
+    {
+        // The tiled kernel trades arithmetic intensity against register
+        // pressure, and where that balance lands is a property of the card
+        // rather than of the algorithm - so it is swept, not guessed. Each
+        // warp holds kTilesM*kTilesN accumulator fragments of eight int32, so
+        // 4x4 is 128 registers of accumulator alone and may well spill.
+        const uint32_t bm = 4096, bn = 32768, bk = 2048, br = 128;
+        const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
+        const uint32_t tiles = (bm / 16) * (bn / 16);
+
+        int8_t *gAn, *gBn;
+        uint32_t *gTrans;
+        CHECK(cudaMalloc(&gAn, aBytes));
+        CHECK(cudaMalloc(&gBn, bBytes));
+        CHECK(cudaMalloc(&gTrans, (size_t)tiles * 16 * sizeof(uint32_t)));
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, s>>>((int8_t *)gAn, aBytes,
+                                                           matrixSeed(8, false));
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, s>>>((int8_t *)gBn, bBytes,
+                                                           matrixSeed(8, true));
+
+        cudaEvent_t a, b;
+        CHECK(cudaEventCreate(&a));
+        CHECK(cudaEventCreate(&b));
+
+        double bestMs = 1e9;
+        char bestName[32] = "";
+
+#define SWEEP(WM, WN, TM, TN)                                                  \
+        {                                                                      \
+            constexpr int threads = (WM) * (WN) * 32;                          \
+            constexpr int blockM = (WM) * (TM) * 16;                           \
+            constexpr int blockN = (WN) * (TN) * 16;                           \
+            if (bm % blockM == 0 && bn % blockN == 0) {                         \
+                dim3 g(bn / blockN, bm / blockM);                              \
+                double ms = 0;                                                 \
+                for (int rep = 0; rep < 4; rep++) {                            \
+                    CHECK(cudaEventRecord(a, s));                              \
+                    noisyGemmMmaTiled<WM, WN, TM, TN><<<g, threads, 0, s>>>(   \
+                        gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk,  \
+                        (int)br, false);                                       \
+                    CHECK(cudaEventRecord(b, s));                              \
+                    CHECK(cudaStreamSynchronize(s));                           \
+                    float d = 0;                                               \
+                    CHECK(cudaEventElapsedTime(&d, a, b));                     \
+                    if (rep) ms += d;                                          \
+                }                                                              \
+                ms /= 3;                                                       \
+                const double mac = (double)bm * bn * bk;                       \
+                printf("    warps %dx%d tiles %dx%d  block %3dx%3d  %2d acc  " \
+                       "%7.3f ms  %6.1f TOPS\n", WM, WN, TM, TN, blockM,       \
+                       blockN, (TM) * (TN), ms, 2.0 * mac / (ms * 1e-3) / 1e12);\
+                if (ms < bestMs) {                                             \
+                    bestMs = ms;                                               \
+                    snprintf(bestName, sizeof(bestName), "%dx%d/%dx%d", WM, WN,\
+                             TM, TN);                                          \
+                }                                                              \
+            }                                                                  \
+        }
+
+        {
+            // The kernel this replaced, as a baseline - measured here rather
+            // than in section 7 so it is timed the same way as everything it
+            // is compared against: alone, not chained behind another GEMM.
+            const int warps = 8;
+            dim3 g((bn / 16 + warps - 1) / warps, bm / 16);
+            double ms = 0;
+            for (int rep = 0; rep < 4; rep++) {
+                CHECK(cudaEventRecord(a, s));
+                noisyGemmMmaStaged<<<g, 256, 0, s>>>(gAn, gBn, nullptr, gTrans,
+                                                     (int)bm, (int)bn, (int)bk,
+                                                     (int)br, false);
+                CHECK(cudaEventRecord(b, s));
+                CHECK(cudaStreamSynchronize(s));
+                float d = 0;
+                CHECK(cudaEventElapsedTime(&d, a, b));
+                if (rep) ms += d;
+            }
+            ms /= 3;
+            printf("    staged (one tile per warp, B from global)   "
+                   "%7.3f ms  %6.1f TOPS\n", ms,
+                   2.0 * (double)bm * bn * bk / (ms * 1e-3) / 1e12);
+        }
+
+        SWEEP(2, 4, 2, 2)
+        SWEEP(4, 2, 2, 2)
+        SWEEP(2, 4, 4, 2)
+        SWEEP(2, 4, 2, 4)
+        SWEEP(2, 4, 4, 4)
+        SWEEP(4, 4, 2, 2)
+        SWEEP(2, 8, 2, 2)
+        SWEEP(4, 4, 2, 4)
+#undef SWEEP
+
+        printf("    fastest: %s at %.3f ms (%.1f TOPS), %.1f M candidates/s\n",
+               bestName, bestMs,
+               2.0 * (double)bm * bn * bk / (bestMs * 1e-3) / 1e12,
+               tiles / ((bestMs + 0.22) * 1e-3) / 1e6);
+
+        CHECK(cudaFree(gAn));
+        CHECK(cudaFree(gBn));
+        CHECK(cudaFree(gTrans));
+        CHECK(cudaEventDestroy(a));
+        CHECK(cudaEventDestroy(b));
+    }
+
+    // ------------------------------------------------------------------
+    printf("9. does the kernel win survive the pipeline?\n");
+    {
+        // Section 8 says 2x4/4x2 beats 2x4/2x2 by 24% with nothing else
+        // running. Section 7 says the whole attempt barely moved. Both cannot
+        // be the number that matters, so this settles it the way this repo
+        // learned to: A and B INTERLEAVED, not one after the other, because
+        // sequential runs drift with clocks and cache state.
+        //
+        // Each rep runs a real attempt - A's chain, then the GEMM - and
+        // alternates which kernel finishes it.
+        const uint32_t bm = 4096, bn = 32768, bk = 2048, br = 128;
+        const size_t aBytes = (size_t)bm * bk, bBytes = (size_t)bn * bk;
+        const uint32_t aCh = (uint32_t)(aBytes / kChunkLen);
+        const uint32_t bCh = (uint32_t)(bBytes / kChunkLen);
+        const uint32_t tiles = (bm / 16) * (bn / 16);
+
+        int8_t *gA, *gBt, *gAn, *gBn, *gEAL, *gEBRf, *gEBR;
+        uint16_t *gArF, *gArS, *gBlF, *gBlS;
+        uint8_t *gScratch, *gRoots, *gCA, *gCB;
+        uint32_t *gTrans;
+        CHECK(cudaMalloc(&gA, aBytes));       CHECK(cudaMalloc(&gBt, bBytes));
+        CHECK(cudaMalloc(&gAn, aBytes));      CHECK(cudaMalloc(&gBn, bBytes));
+        CHECK(cudaMalloc(&gEAL, (size_t)bm * br));
+        CHECK(cudaMalloc(&gEBRf, (size_t)bn * br));
+        CHECK(cudaMalloc(&gEBR, (size_t)bn * br));
+        CHECK(cudaMalloc(&gArF, bk * 2));     CHECK(cudaMalloc(&gArS, bk * 2));
+        CHECK(cudaMalloc(&gBlF, bk * 2));     CHECK(cudaMalloc(&gBlS, bk * 2));
+        CHECK(cudaMalloc(&gScratch, (size_t)(aCh > bCh ? aCh : bCh) * 32 * 2));
+        CHECK(cudaMalloc(&gRoots, 64));       CHECK(cudaMalloc(&gCA, 32));
+        CHECK(cudaMalloc(&gCB, 32));
+        CHECK(cudaMalloc(&gTrans, (size_t)tiles * 16 * sizeof(uint32_t)));
+
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, s>>>(gBt, bBytes,
+                                                           matrixSeed(9, true));
+        merkleRoot((const uint8_t *)gBt, bCh, dKey, gScratch, gRoots + 32, s);
+        deriveCommitmentB<<<1, 1, 0, s>>>(gRoots + 32, dJobKey, dSaltB, bn, 1, gCB);
+        noiseUniform<<<((bn * br + 31) / 32 + 255) / 256, 256, 0, s>>>(
+            gEBRf, bn * br, gCB, dSeedB, 63, 32);
+        transposeNoiseB<<<(bn * br + 255) / 256, 256, 0, s>>>(gEBRf, gEBR, bn, (int)br);
+        noisePerm<<<((bk + 7) / 8 + 255) / 256, 256, 0, s>>>(gBlF, gBlS, bk, gCB,
+                                                             dSeedB, (int)br);
+        applyNoiseB<<<(((size_t)bk * bn) + 255) / 256, 256, 0, s>>>(
+            gBt, gEBR, gBlF, gBlS, gBn, bn, bk);
+        CHECK(cudaStreamSynchronize(s));
+
+        cudaEvent_t a, b;
+        CHECK(cudaEventCreate(&a));
+        CHECK(cudaEventCreate(&b));
+        double ms[2] = {0, 0};
+        int reps[2] = {0, 0};
+        for (int rep = 0; rep < 12; rep++) {
+            const int which = rep & 1;
+            genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, s>>>(
+                gA, aBytes, matrixSeed(rep, false));
+            merkleRoot((const uint8_t *)gA, aCh, dKey, gScratch, gRoots, s);
+            deriveCommitmentA<<<1, 1, 0, s>>>(gRoots, gCB, dSaltA, bm, 1, gCA);
+            noiseUniform<<<((bm * br + 31) / 32 + 255) / 256, 256, 0, s>>>(
+                gEAL, bm * br, gCA, dSeedA, 63, 32);
+            noisePerm<<<((bk + 7) / 8 + 255) / 256, 256, 0, s>>>(gArF, gArS, bk, gCA,
+                                                                 dSeedA, (int)br);
+            applyNoiseA<<<(aBytes + 255) / 256, 256, 0, s>>>(gA, gEAL, gArF, gArS,
+                                                             gAn, bm, bk, (int)br);
+            CHECK(cudaEventRecord(a, s));
+            if (which == 0) {
+                dim3 g(bn / 128, bm / 64);
+                noisyGemmMmaTiled<2, 4, 2, 2><<<g, 256, 0, s>>>(
+                    gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
+                    false);
+            } else {
+                dim3 g(bn / 128, bm / 128);
+                noisyGemmMmaTiled<2, 4, 4, 2><<<g, 256, 0, s>>>(
+                    gAn, gBn, nullptr, gTrans, (int)bm, (int)bn, (int)bk, (int)br,
+                    false);
+            }
+            CHECK(cudaEventRecord(b, s));
+            CHECK(cudaStreamSynchronize(s));
+            float d = 0;
+            CHECK(cudaEventElapsedTime(&d, a, b));
+            if (rep >= 2) { ms[which] += d; reps[which]++; }
+        }
+        const double mac = (double)bm * bn * bk;
+        for (int i = 0; i < 2; i++) ms[i] /= reps[i];
+        printf("    2x4/2x2 in a live attempt: %.3f ms  %.1f TOPS\n", ms[0],
+               2.0 * mac / (ms[0] * 1e-3) / 1e12);
+        printf("    2x4/4x2 in a live attempt: %.3f ms  %.1f TOPS\n", ms[1],
+               2.0 * mac / (ms[1] * 1e-3) / 1e12);
+        printf("    isolated, section 8 said 5.64 and 4.29 - a 24%% gap\n");
+        printf("    here the gap is %.1f%%\n", 100.0 * (ms[0] - ms[1]) / ms[0]);
+
+        check("the faster kernel is still faster inside a real attempt",
+              ms[1] < ms[0],
+              std::to_string(ms[0]) + " vs " + std::to_string(ms[1]));
+
+        CHECK(cudaFree(gA)); CHECK(cudaFree(gBt)); CHECK(cudaFree(gAn));
+        CHECK(cudaFree(gBn)); CHECK(cudaFree(gEAL)); CHECK(cudaFree(gEBRf));
+        CHECK(cudaFree(gEBR)); CHECK(cudaFree(gArF)); CHECK(cudaFree(gArS));
+        CHECK(cudaFree(gBlF)); CHECK(cudaFree(gBlS)); CHECK(cudaFree(gScratch));
+        CHECK(cudaFree(gRoots)); CHECK(cudaFree(gCA)); CHECK(cudaFree(gCB));
+        CHECK(cudaFree(gTrans));
+        CHECK(cudaEventDestroy(a)); CHECK(cudaEventDestroy(b));
+    }
 
     printf("\n%d passed, %d failed\n", gPass, gFail);
     return gFail ? 1 : 0;

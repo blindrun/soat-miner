@@ -435,18 +435,20 @@ __global__ void noisyGemmMmaStaged(const int8_t *__restrict__ A,
  * on an unrolled loop rather than by the reduction counter, so they stay in
  * registers. Indexing by the counter is what spilled before.
  *
- * Requires m % 64 == 0, n % 128 == 0, and k and rank multiples of 16.
- * Launch with 256 threads and grid (n/128, m/64).
+ * Templated on the warp grid and the per-warp tile count so the shape can be
+ * swept rather than guessed - the right answer trades arithmetic intensity
+ * against register pressure and is a property of the card, not of the
+ * algorithm. Launch with kWarpsM*kWarpsN*32 threads and grid
+ * (n / (kWarpsN*kTilesN*16), m / (kWarpsM*kTilesM*16)).
  */
+template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN>
 __global__ void noisyGemmMmaTiled(const int8_t *__restrict__ A,
                                   const int8_t *__restrict__ B,
                                   int32_t *__restrict__ cNoised,
                                   uint32_t *__restrict__ transcripts,
                                   int m, int n, int k, int rank, bool writeC) {
-    constexpr int kWarpsM = 2, kWarpsN = 4;   // warp grid inside the block
-    constexpr int kTilesM = 2, kTilesN = 2;   // tiles each warp owns
-    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;   // 64 rows
-    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;   // 128 cols
+    constexpr int kBlockM = kWarpsM * kTilesM * kHashTile;
+    constexpr int kBlockN = kWarpsN * kTilesN * kHashTile;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -473,23 +475,22 @@ __global__ void noisyGemmMmaTiled(const int8_t *__restrict__ A,
         if (k - p < rank) break;                 // partial tiles do not fold
         for (int kk = p; kk < p + rank; kk += kMmaK) {
             __syncthreads();
-            // 64x16 bytes as 256 int32, one per thread: each row of 16 bytes
-            // is one four-lane group, so a warp covers eight rows per issue.
-            {
-                const int t = threadIdx.x;
-                const int row = t >> 2;
-                const int byte = (t & 3) << 2;
+            // Both stages move four bytes per thread per step. Consecutive
+            // threads take consecutive four-byte groups of the same row, so a
+            // row of the stage is one coalesced transaction.
+            constexpr int kAWords = kBlockM * kMmaK / 4;
+            constexpr int kBWords = kMmaK * kBlockN / 4;
+#pragma unroll
+            for (int idx = threadIdx.x; idx < kAWords; idx += kWarpsM * kWarpsN * 32) {
+                const int row = idx / (kMmaK / 4);
+                const int byte = (idx % (kMmaK / 4)) * 4;
                 *(int32_t *)&sA[row * kMmaK + byte] =
                     *(const int32_t *)&A[(size_t)(rowBase + row) * k + kk + byte];
             }
-            // 16x128 bytes as 512 int32, two per thread. Consecutive threads
-            // take consecutive four-byte groups of the same row, so each row
-            // is one fully coalesced 128-byte transaction.
 #pragma unroll
-            for (int rep = 0; rep < 2; rep++) {
-                const int t = threadIdx.x + rep * 256;
-                const int row = t >> 5;
-                const int byte = (t & 31) << 2;
+            for (int idx = threadIdx.x; idx < kBWords; idx += kWarpsM * kWarpsN * 32) {
+                const int row = idx / (kBlockN / 4);
+                const int byte = (idx % (kBlockN / 4)) * 4;
                 *(int32_t *)&sB[row * kBlockN + byte] =
                     *(const int32_t *)&B[(size_t)(kk + row) * n + colBase + byte];
             }

@@ -38,19 +38,20 @@
 //
 // Shape then matters, and the obvious metric picks the wrong one. Hashing A
 // grows as m*k and the GEMM as m*n*k, so overhead falls monotonically as the
-// shape widens - but candidates per second does not:
+// shape widens - but candidates per second does not (measured with the
+// register-tiled kernel, section 7 of tests/test_pearl_prepare.cu):
 //
-//     4096x4096    18.6% overhead   52.7 M/s   65.5 TOPS
-//     1024x16384   14.7%            54.4       65.5
-//     2048x32768    4.3%            60.9       66.6
-//     4096x32768    2.6%            62.1       66.8
-//     4096x65536    0.9%            42.8       45.3
+//     4096x4096    32.1% overhead    83.5 M/s   115.7 TOPS
+//     1024x16384   26.3%             87.4       115.8
+//     2048x32768    7.5%            102.9       115.9
+//     4096x32768    4.5%            106.6       116.8
+//     4096x65536    1.9%             91.5        97.8
 //
 // The last row has the lowest overhead and is the slowest, because B^t at
-// 128 MB stops being servable from L2 and the GEMM itself drops from 67 to 45
-// TOPS. So the shape is chosen on candidates per second, and 4096x32768 is the
-// default here: about 180 MB of device memory, and past the point where more
-// amortisation is worth anything.
+// 128 MB stops being servable from L2 and the GEMM itself drops. So the shape
+// is chosen on candidates per second, and 4096x32768 is the default here:
+// about 180 MB of device memory, and past the point where more amortisation is
+// worth anything.
 //
 // The one constraint all this imposes: the padded matrices must have a POWER
 // OF TWO number of 1024-byte chunks, so the Merkle tree is perfectly balanced
