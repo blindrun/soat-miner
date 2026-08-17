@@ -149,12 +149,20 @@ Measured at the current dataset size, 7.27GB.
 | GPU | Backend | MH/s |
 |---|---|---|
 | RTX 5080 | Vulkan | 267.6 |
-| RTX 4090 | CUDA | 217.5 |
-| RTX 4080 | CUDA | 125.3 |
-| RTX 4070 SUPER | CUDA | 97.9 |
-| RTX 4060 Ti | CUDA | 63.5 |
+| RTX 4090 | CUDA | 235.5 |
+| RTX 4080 | CUDA | 140.0 |
+| RTX 4070 SUPER | CUDA | 117.6 |
+| RTX 4060 Ti | CUDA | 76.9 |
 | RX 7900 XT | Vulkan | 151.9 |
 | RX 6700 XT | Vulkan | 82.9 |
+
+The CUDA numbers went up 8-21% in v0.2.2 from a one-line change: the dataset
+reads use streaming loads (`__ldcs`), not the read-only data cache (`__ldg`).
+The dataset is 7.27GB and a read is reused about 0.5% of the time, so caching
+every element only evicts others and starves the random reads that are the whole
+bottleneck. Telling the hardware the data will not be reused takes the 4090 from
+217.5 to 235.5, and it helps more on smaller cards where the cache is smaller
+relative to the dataset. Vulkan is unchanged - GLSL has no clean equivalent.
 
 The only like for like comparison here is SRBMiner 3.5.5 on the same 4090 at
 the same 7.27GB. It does 237.7 gross and takes 1%, so it delivers 235.4 against
