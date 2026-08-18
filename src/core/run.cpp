@@ -283,6 +283,15 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (!gotJob && !st->loginRejected()) {
+            // A zero-target first job (Lithos client with no tau yet) records a
+            // specific reason. Surface it here instead of the generic timeout,
+            // which the startup path used to skip because it only read the
+            // warning inside the mining loop it never reached.
+            const std::string jw = st->takeJobWarning();
+            if (!jw.empty()) {
+                logLine(tty, "warn", jw);
+                return 1;
+            }
             logLine(tty, "error",
                     "connected to the pool but it sent no job in 20s. The "
                     "socket is open, so this is not a firewall - the pool "
@@ -362,6 +371,18 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                                 : "check --wallet is a real Ergo address "
                                   "(starts with 9, ~51 chars).");
                     return 1;
+                }
+                // A zero-target notify mid-session (a Lithos client that lost
+                // its tau) clears the job, so fetch() returns false here. Surface
+                // that specific reason rather than a generic "cannot reach": the
+                // socket is fine, the pool just has no target to hand out.
+                if (st) {
+                    const std::string jw = st->takeJobWarning();
+                    if (!jw.empty()) {
+                        logLine(tty, "warn", jw + " - waiting");
+                        sleepSeconds(5);
+                        continue;
+                    }
                 }
                 logLine(tty, "warn", std::string("cannot reach ") +
                                          source->describe() + " - retrying in 5s");

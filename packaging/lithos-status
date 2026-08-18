@@ -9,7 +9,7 @@
 # get paid.
 #
 #   node   http://127.0.0.1:9052/info    (testnet; mainnet is 9053)
-#   client http://127.0.0.1:9053/mining  (StratumInfo: diff, tau, superSharesPerHour)
+#   client http://127.0.0.1:9000/mining  (StratumInfo: diff, tau, superSharesPerHour)
 #
 # The one number that matters is superSharesPerHour. Payout needs at least
 # 10 super shares in the 12-hour window before a block, i.e. ~0.83/hour. This
@@ -24,8 +24,8 @@
 # Config (env or /etc/lithos-quickstart.conf, all optional):
 #   NETWORK=testnet|mainnet          default testnet
 #   NODE_HOST=127.0.0.1  NODE_PORT=  default 9052 testnet / 9053 mainnet
-#   CLIENT_HOST=127.0.0.1  CLIENT_PORT=9053
-#   NODE_API_KEY=hello               only needed if your node locks /info
+#   CLIENT_HOST=127.0.0.1  CLIENT_PORT=9000 testnet / 9001 mainnet
+#   NODE_API_KEY=<key>               optional; only needed if your node locks /info
 
 set -u
 
@@ -35,8 +35,10 @@ NETWORK="${NETWORK:-testnet}"
 NODE_HOST="${NODE_HOST:-127.0.0.1}"
 if [ "$NETWORK" = "mainnet" ]; then NODE_PORT="${NODE_PORT:-9053}"; else NODE_PORT="${NODE_PORT:-9052}"; fi
 CLIENT_HOST="${CLIENT_HOST:-127.0.0.1}"
-CLIENT_PORT="${CLIENT_PORT:-9053}"
-NODE_API_KEY="${NODE_API_KEY:-hello}"
+# Quickstart writes a per-network Play API port, avoiding a collision when both
+# clients run on one host. These defaults cover a hand-run without that file.
+if [ "$NETWORK" = "mainnet" ]; then CLIENT_PORT="${CLIENT_PORT:-9001}"; else CLIENT_PORT="${CLIENT_PORT:-9000}"; fi
+NODE_API_KEY="${NODE_API_KEY:-}"
 
 # Payout bar: 10 super shares per 12h window = 0.8333/hour.
 TARGET_SSPH="0.83"
