@@ -1289,6 +1289,17 @@ __global__ __launch_bounds__(kWarpsM *kWarpsN * 32, 1) void noisyGemmPtx(
                         xor3(xor3(acc[i][j][0][0], acc[i][j][0][1], acc[i][j][0][2]),
                              xor3(acc[i][j][0][3], acc[i][j][1][0], acc[i][j][1][1]),
                              acc[i][j][1][2] ^ acc[i][j][1][3]));
+                    // The rotate and XOR here are algebraically DEAD when the
+                    // fold count does not exceed the sixteen lane slots: each
+                    // lane is then written exactly once with slot still zero,
+                    // so rotl32(0,13) ^ v is just v. k=2048 at rank 128 is
+                    // exactly 16 folds. TRIED AND REVERTED - expressing the
+                    // special case as a ternary cost 128 MORE SASS
+                    // instructions (+4.7%) and introduced local-memory spills,
+                    // because it forces both paths to be materialised inside a
+                    // fully unrolled double loop. ptxas already handles the
+                    // general form better than the "optimised" one. Left as
+                    // the general expression on purpose.
                     if (lane == reduction % kTranscriptU32)
                         slot[i][j] = rotl32(slot[i][j], kRotation) ^ v;
                 }
