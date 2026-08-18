@@ -6,6 +6,19 @@
 // pipeline, host-visible buffers, no staging. Correctness first.
 //
 // usage: test_pearl_vk <vectors.bin> <shader.spv> [device_index]
+//
+// NOT WIRED INTO `make test`, AND CANNOT BE UNTIL THERE IS A SHADER. There is
+// no Vulkan Pearl kernel yet, so there is no .spv to hand it. It compiles and
+// it is kept deliberately: the day someone writes the shader, the gate that
+// proves it byte-identical to CUDA already exists. Build it on its own with
+// `make tests/test_pearl_vk`.
+//
+// Feasibility for that shader was measured 2026-08-18 on an RX 6700 XT and is
+// written up in ~/RESUME-pearl-pow-miner.md: RDNA2 has no matrix cores, so the
+// path is dotPacked4x8AccSatEXT (hardware V_DOT4_I32_I8), and a tuned probe
+// reached 3.06 T MAC/s against WildRig's 8.1. Every AMD card loses money on
+// Pearl at 11.4 c/kWh even at the field's best rate, so this is a
+// parity feature and never an economic one.
 
 #include <vulkan/vulkan.h>
 

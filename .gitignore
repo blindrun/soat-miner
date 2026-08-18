@@ -20,3 +20,4 @@ build13
 soat-miner-13
 tests/test_pearl_mining_shape
 tests/measure_launch_gap
+tests/test_pearl_vk
