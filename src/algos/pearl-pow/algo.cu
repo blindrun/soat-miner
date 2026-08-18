@@ -167,7 +167,7 @@ void launchTiledAsync(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
  * cudaFuncSetAttribute is idempotent and cheap; doing it on every launch
  * would not be, hence the flag.
  */
-template <int WM, int WN, int TM, int TN, int KKB, int ST = 3>
+template <int WM, int WN, int TM, int TN, int KKB, int ST = 3, int GM = 8>
 void launchPtx(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
                const int8_t *b, uint32_t *t, int m, int n, int k, int rank) {
     constexpr int kStages = ST;
@@ -176,11 +176,11 @@ void launchPtx(dim3 grid, int threads, cudaStream_t s, const int8_t *a,
     constexpr int smem = kStages * (blockM * aStride + blockN * bStride);
     static bool optedIn = false;
     if (!optedIn) {
-        cudaFuncSetAttribute(noisyGemmPtx<WM, WN, TM, TN, KKB, ST>,
+        cudaFuncSetAttribute(noisyGemmPtx<WM, WN, TM, TN, KKB, ST, GM>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         optedIn = true;
     }
-    noisyGemmPtx<WM, WN, TM, TN, KKB, ST>
+    noisyGemmPtx<WM, WN, TM, TN, KKB, ST, GM>
         <<<grid, threads, smem, s>>>(a, b, nullptr, t, m, n, k, rank, false);
 }
 
@@ -239,6 +239,16 @@ const TileConfig kTileConfigs[] = {
     {"ptx k32 4x4/2x4", 128, 256, 512, true, 80, 32, &launchPtx<4, 4, 2, 4, 32>},
     {"ptx k32 8x2/2x2", 256, 64, 512, true, 80, 32, &launchPtx<8, 2, 2, 2, 32>},
     {"ptx k32 4x8/2x2", 128, 256, 1024, true, 80, 32, &launchPtx<4, 8, 2, 2, 32>},
+    // Measured and REJECTED, so not carried as candidates (each one costs
+    // tuning time on every start). All judged end to end, on both a 4090 and
+    // a 5080, by adding them here and seeing whether the tuner ever chose one:
+    //   k128 at 2 stages (2x4/4x2, 4x4/2x2) - never chosen. Only fits a
+    //     128x128 block, and the smaller block costs more than the depth pays.
+    //   k64 at 2 stages (three geometries)  - never chosen. The third stage is
+    //     worth more than the shared memory it frees.
+    //   swizzle group 2, 4, 16, 32          - never chosen; the default 8 won
+    //     on both cards despite their different L2 sizes.
+    // kStagesP and kGroupMP stay template parameters so this is re-testable.
 };
 
 class PearlPow : public Algorithm {
@@ -601,6 +611,12 @@ class PearlPow : public Algorithm {
             const uint64_t nonce = nonceBase + i;
             if (!runAttempt(nonce)) return false;
 
+            // Measured, not assumed: removing this host round trip entirely
+            // is worth nothing (409.3 vs 410.3 M candidates/s). A ~1.3 ms GEMM
+            // amortises a memcpy and a stream sync completely, so batching
+            // attempts to avoid it would add real complexity - deterministic A
+            // regeneration for a hit - to buy noise. Do not re-propose it
+            // without a shorter kernel to justify it.
             uint32_t hits = 0;
             if (cudaMemcpyAsync(&hits, dHitCount_, sizeof(uint32_t),
                                 cudaMemcpyDeviceToHost, stream_) != cudaSuccess)
@@ -684,7 +700,10 @@ class PearlPow : public Algorithm {
         const size_t bBytes = (size_t)shape_.n * k;
         const size_t chunks = (aBytes > bBytes ? aBytes : bBytes) / kChunkLen;
         return alloc(&dA_, aBytes) && alloc(&dAn_, aBytes) &&
-               alloc(&dBt_, bBytes) && alloc(&dBn_, bBytes) && alloc(&dBnT_, bBytes) &&
+               alloc(&dBt_, bBytes) &&
+               // One layout, not both: whichever the tuner settled on.
+               (kTileConfigs[tile_].nMajorB ? alloc(&dBnT_, bBytes)
+                                            : alloc(&dBn_, bBytes)) &&
                alloc(&dEAL_, (size_t)shape_.m * rank) &&
                alloc(&dEBRflat_, (size_t)shape_.n * rank) &&
                alloc(&dEBR_, (size_t)shape_.n * rank) &&
@@ -757,10 +776,18 @@ class PearlPow : public Algorithm {
             dEBRflat_, dEBR_, shape_.n, kRank);
         noisePerm<<<((kK + 7) / 8 + 255) / 256, 256, 0, stream_>>>(
             dBlF_, dBlS_, kK, dCommitB_, dSeedB_, kRank);
-        applyNoiseB<<<(((size_t)kK * shape_.n) + 255) / 256, 256, 0, stream_>>>(
-            dBt_, dEBR_, dBlF_, dBlS_, dBn_, shape_.n, kK);
-        applyNoiseBt<<<(((size_t)kK * shape_.n) + 255) / 256, 256, 0, stream_>>>(
-            dBt_, dEBR_, dBlF_, dBlS_, dBnT_, shape_.n, kK);
+        // Only the layout the SELECTED kernel reads. tile_ is known by now -
+        // prepare() tunes before any job arrives - and building both cost a
+        // whole extra noising pass and a second full-size buffer (128 MB at
+        // the mining shape) that nothing would ever read. Per job, so this is
+        // job-switch latency and memory headroom, not steady hashrate.
+        const size_t bElems = (size_t)kK * shape_.n;
+        if (kTileConfigs[tile_].nMajorB)
+            applyNoiseBt<<<(bElems + 255) / 256, 256, 0, stream_>>>(
+                dBt_, dEBR_, dBlF_, dBlS_, dBnT_, shape_.n, kK);
+        else
+            applyNoiseB<<<(bElems + 255) / 256, 256, 0, stream_>>>(
+                dBt_, dEBR_, dBlF_, dBlS_, dBn_, shape_.n, kK);
 
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
             fprintf(stderr, "[pearl-pow] per-job setup failed: %s\n",

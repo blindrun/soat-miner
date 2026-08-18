@@ -1076,7 +1076,7 @@ __device__ __forceinline__ void mmaS8(uint32_t d[4], const uint32_t a[4],
  * kWarpsM*kWarpsN*32 threads and grid (n/kBlockN, m/kBlockM).
  */
 template <int kWarpsM, int kWarpsN, int kTilesM, int kTilesN, int kKBlock = 32,
-          int kStagesP = 3>
+          int kStagesP = 3, int kGroupMP = 8>
 // Dynamic shared costs address registers that a static array did not: this
 // went 110 -> 154 registers on the refactor, and 512 threads x 154 exceeds the
 // 65536-register file, so the 16-warp configurations simply stopped launching.
@@ -1127,7 +1127,10 @@ __global__ __launch_bounds__(kWarpsM *kWarpsN * 32, 1) void noisyGemmPtx(
     // So walk down m in groups of kGroupM first. Within a group, kGroupM
     // consecutive blocks share one B tile, and a wave's distinct footprint
     // becomes one B tile plus kGroupM A tiles rather than the reverse.
-    constexpr int kGroupM = 8;
+    // Parameterised so the tuner can measure it: the right L2 reuse balance
+    // depends on blockM, blockN, the mining shape and the card's L2 size, none
+    // of which are fixed, so 8 was only ever a guess.
+    constexpr int kGroupM = kGroupMP;
     const int blocksN = gridDim.x, blocksM = gridDim.y;
     const int linear = blockIdx.x + blockIdx.y * blocksN;
     const int perGroup = kGroupM * blocksN;
