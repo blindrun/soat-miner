@@ -82,7 +82,25 @@ int main(int argc, char **argv) {
         else if (a == "--plain") opt.plain = true;
         else if (a == "--ascii") om::g_asciiOnly = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
-        else if (a == "--algo") { /* only autolykos2 for now */ (void)next(); }
+        else if (a == "--algo") {
+            // Swallowing an unknown algorithm here meant `--algo pearl-pow`
+            // silently mined Ergo instead: the launcher picks Vulkan on
+            // Blackwell, this binary ignored the flag, and the user got
+            // "'prl1...' is not a valid Ergo address" with no clue why.
+            // Refuse instead. This build has one algorithm.
+            const std::string want = next();
+            if (want != "autolykos2") {
+                fprintf(stderr,
+                        "this is the Vulkan build and it only has autolykos2, "
+                        "not '%s'.\n", want.c_str());
+                if (want == "pearl-pow")
+                    fprintf(stderr,
+                            "Pearl is CUDA only. Run ./soat-miner (or set "
+                            "BACKEND=cuda in config.txt) instead of the Vulkan "
+                            "binary.\n");
+                return 1;
+            }
+        }
         else if (a == "--device") deviceIndex = atoi(next().c_str());
         else if (a == "--list-devices") { vkListDevices(); return 0; }
         else if (a == "--list-algos") { printf("autolykos2\n"); return 0; }

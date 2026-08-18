@@ -31,6 +31,25 @@ done
 # against a natively compiled sm_120 CUDA 219.6, so this is not a JIT artifact.
 # Blackwell therefore wants Vulkan even though it is an NVIDIA card.
 BACKEND="${BACKEND:-auto}"
+
+# Pearl is CUDA only. Without this the Blackwell rule below sends it to the
+# Vulkan binary, which has no pearl-pow, and the run fails as a bad ERGO
+# address - which is a baffling thing to be told when you asked for Pearl.
+# Non-NVIDIA hits the same path, so this is not only a Blackwell problem.
+WANT_PEARL=0
+for a in "$@"; do [[ "$a" == "pearl-pow" ]] && WANT_PEARL=1; done
+if [[ "$WANT_PEARL" == "1" ]]; then
+  if [[ ! -x ./soat-miner ]]; then
+    echo "Pearl needs the CUDA binary (./soat-miner) and it is not here."
+    echo "  Pearl is NVIDIA only. There is no Vulkan or AMD build of it yet."
+    exit 1
+  fi
+  if [[ "$BACKEND" == "vulkan" ]]; then
+    echo "note: Pearl is CUDA only, using the CUDA binary despite BACKEND=vulkan"
+  fi
+  BACKEND=cuda
+fi
+
 if [[ "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     # Largest VRAM wins, which is the same rule the binaries use to pick a
