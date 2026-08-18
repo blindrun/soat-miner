@@ -317,26 +317,48 @@ class PearlPow : public Algorithm {
             }
         }
 
-        double bestRate = 0;
-        bool found = false;
+        // The GEMM sweep is a good filter and a bad judge. It compares
+        // configurations at one shape honestly, because they do identical
+        // work, and it compares shapes against each other not at all. So it
+        // picks the configuration here and the shape is settled below, by
+        // running the real thing.
+        struct Cand { Shape s; size_t cfg; };
+        Cand cands[sizeof(kShapes) / sizeof(kShapes[0])];
+        int nCand = 0;
         for (const Shape &cand : kShapes) {
             if (pinM && (cand.m != pinM || cand.n != pinN)) continue;
             if (bytesFor(cand) + headroom > freeB) continue;
             size_t cfg = 0;
-            const double rate = tuneShape(cand, &cfg);
-            if (rate > bestRate) {
-                bestRate = rate;
-                shape_ = cand;
-                tile_ = cfg;
-                found = true;
-            }
+            if (tuneShape(cand, &cfg) > 0) cands[nCand++] = Cand{cand, cfg};
         }
-        if (!found) {
+        if (!nCand) {
             fprintf(stderr,
                     "[pearl-pow] no shape fits in %.0f MB of free device "
                     "memory\n", freeB / 1e6);
             return false;
         }
+
+        double bestRate = 0;
+        bool found = false;
+        int bestIdx = 0;
+        for (int i = 0; i < nCand; i++) {
+            const double eff = measureAttempt(cands[i].s, cands[i].cfg);
+            if (eff > bestRate) {
+                bestRate = eff;
+                bestIdx = i;
+                found = true;
+            }
+        }
+        // Every real attempt failing means something is wrong with the card,
+        // not with the ranking. Take the first shape that at least built a
+        // working GEMM and let selfCheck() below have the final say.
+        if (!found) {
+            fprintf(stderr, "[pearl-pow] no shape completed a timed attempt, "
+                            "falling back to %ux%u\n",
+                    cands[0].s.m, cands[0].s.n);
+        }
+        shape_ = cands[bestIdx].s;
+        tile_ = cands[bestIdx].cfg;
 
         if (!allocate()) {
             fprintf(stderr, "[pearl-pow] could not allocate %.0f MB\n",
@@ -344,8 +366,14 @@ class PearlPow : public Algorithm {
             return false;
         }
         allocated_ = true;
+        // Say what this number IS, because the one that used to print here
+        // was the GEMM alone, read 15-20% high, and got quoted as hashrate in
+        // a public README. This one times a whole attempt but still runs them
+        // back to back with no job handling, so it lands about 9% above what
+        // the miner then reports. Quote the miner's own counter, never this.
         fprintf(stderr,
-                "[pearl-pow] %ux%u with %s: %.1f M candidates/s, %.0f MB\n",
+                "[pearl-pow] %ux%u with %s: %.1f M candidates/s "
+                "(device, no job overhead - not hashrate), %.0f MB\n",
                 shape_.m, shape_.n, kTileConfigs[tile_].name, bestRate,
                 bytesFor(shape_) / 1e6);
 
@@ -737,6 +765,71 @@ class PearlPow : public Algorithm {
         if (cudaMalloc(p, bytes) != cudaSuccess) return false;
         owned_.push_back(*p);
         return true;
+    }
+
+    /**
+     * Time a REAL attempt at this shape: prepare, GEMM and powScan, the whole
+     * chain search() runs. Returns millions of candidates per second, or 0 if
+     * the shape could not be set up.
+     *
+     * This exists because ranking shapes on the GEMM alone picks the wrong
+     * one. The work beside it goes as m*k while candidates go as m*n, so the
+     * overhead per candidate falls as 1/n and the widest shape that fits tends
+     * to win. The GEMM timing cannot see any of that. Measured on a 4090, the
+     * GEMM-only ranking chose 8192x16384 at 320 M candidates/s end to end
+     * while 4096x65536 does 337, and it picked a DIFFERENT shape on one run in
+     * four because it was ranking near-identical GEMM rates as noise.
+     *
+     * Buffers are filled before timing, and the target is zeroed so powScan
+     * finds nothing and scans the lot either way. Its cost does not depend on
+     * the data, but reading pages that were never written is not measuring the
+     * same thing as reading real ones.
+     */
+    double measureAttempt(const Shape &s, size_t cfg) {
+        shape_ = s;
+        tile_ = cfg;
+        if (!allocate()) {
+            release();
+            return 0;
+        }
+
+        const size_t aBytes = (size_t)s.m * kK, bBytes = (size_t)s.n * kK;
+        int8_t *bSrc = kTileConfigs[cfg].nMajorB ? dBt_ : dBn_;
+        genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(dA_, aBytes, 1);
+        genMatrix<<<(bBytes / 8 + 255) / 256, 256, 0, stream_>>>(bSrc, bBytes, 2);
+        if (kTileConfigs[cfg].nMajorB)
+            transposeKtoN<<<(bBytes + 255) / 256, 256, 0, stream_>>>(
+                dBt_, dBnT_, s.n, kK);
+        cudaMemsetAsync(dTarget_, 0, 32, stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            release();
+            return 0;
+        }
+
+        cudaEvent_t evA, evB;
+        cudaEventCreate(&evA);
+        cudaEventCreate(&evB);
+        double best = 0;
+        for (int rep = 0; rep < 3; rep++) {          // the first pays warmup
+            cudaEventRecord(evA, stream_);
+            const bool ok = runAttempt(0x51ED0000ull + rep);
+            cudaEventRecord(evB, stream_);
+            if (!ok || cudaStreamSynchronize(stream_) != cudaSuccess ||
+                cudaGetLastError() != cudaSuccess) {
+                best = 0;
+                break;
+            }
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, evA, evB);
+            if (rep && ms > 0.0f) {
+                const double r = (double)tiles() / (ms * 1e3);
+                if (r > best) best = r;
+            }
+        }
+        cudaEventDestroy(evA);
+        cudaEventDestroy(evB);
+        release();
+        return best;
     }
 
     bool allocate() {
