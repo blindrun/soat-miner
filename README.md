@@ -337,6 +337,77 @@ own Scala source, including the check that matters most: Lithos validates
 slices `extraNonce2` wrongly the server proof-checks a different nonce than the
 one your GPU solved and every share dies as "low difficulty".
 
+## Pearl (testing)
+
+Mines Pearl on NVIDIA. CUDA only. There is no Vulkan backend for it yet.
+
+Call this testing. It mines and the blocks get accepted, but it has only run on
+Ada and Blackwell cards so far. See below if you have an Ampere or a Turing.
+
+You will need pearl-gateway running before you can mine anything.
+Pearl has no pool and no solo path.
+Every block needs a zero knowledge certificate and the gateway is what builds it.
+
+Get the gateway from the Pearl repo.
+
+https://github.com/pearl-research-labs/pearl
+
+Start the miner with command ./soat-miner --algo pearl-pow --gateway 127.0.0.1:8455
+
+There is no wallet flag. The gateway holds the address.
+
+An 8GB card is enough. A 16GB card lets it pick a wider shape and go a bit faster.
+
+## Pearl speeds
+
+| GPU | Th/s | of the field |
+|---|---|---|
+| RTX 4090 | 214.4 | no published figure to compare to |
+| RTX 5080 | 165.4 | 88% |
+| RTX 4080 | 129.6 | 81% |
+| RTX 4070 SUPER | 92.4 | 81% |
+
+Th/s means tera multiply accumulates per second.
+That is the unit hashrate.no reports, so these compare straight across.
+
+hashrate.no lists 187.8 for a 5080, 159.3 for a 4080 and 114.1 for a 4070 Super.
+They have no 4090 entry, so ignore anyone who quotes you one.
+
+Do not compare watts against their table. We draw more than they list on the
+same card and the same coin, and the same gap shows up on Ergo, so it is their
+bench and not your card.
+
+The miner times every shape and tile configuration on your gpu at startup and
+keeps the fastest. A 4090 and a 5080 do not pick the same one. Hardcoding
+either costs the other about 15%.
+
+## Send me Ampere and Turing numbers
+
+I do not have a 3000 series or a 2000 series card in the house right now.
+So Pearl has never run on one.
+
+If you have one, run it with command ./soat-miner --algo pearl-pow --bench
+and open an issue with the line it prints.
+
+https://github.com/blindrun/soat-miner/issues
+
+What I want to know is whether it picks a sane configuration and what it gets.
+Turing does not have the instruction the fast kernel uses, so it falls back to
+a slower one. That path is tested for correctness but nobody has ever timed it.
+
+## Pearl checks itself before it mines
+
+The miner runs a small matrix multiply on your gpu at startup.
+Then it runs the same one on your cpu and compares them.
+If they disagree it refuses to mine and tells you why.
+
+BE WARNED: a gpu or driver that computes this wrong does not look broken. It
+mines happily and every share gets rejected. NVIDIA's Vulkan compiler was
+caught doing exactly this to the Ergo kernel in August 2026, and it took an
+outside contributor mining into a live pool to find it. That is why the check
+is there, and it is why I am comfortable asking you to try this on a card I
+have never tested.
+
 ## Build from source
 
 **Linux.** Install the CUDA toolkit and glslang, then run make.
