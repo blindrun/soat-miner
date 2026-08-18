@@ -493,6 +493,18 @@ class PearlPow : public Algorithm {
         // failed long before this ran.
         uint32_t refFp = 0;
         bool haveRef = false;
+        // Rejecting one configuration is routine. Rejecting an entire FAMILY
+        // means the harness is feeding it something it does not read, not that
+        // the kernel is broken - that exact mistake cost 38% of hashrate and
+        // was invisible because every test launches kernels directly. Counted
+        // per family so it can be said out loud.
+        int seen[4] = {0, 0, 0, 0}, rejected[4] = {0, 0, 0, 0};
+        auto family = [](const char *n) {
+            if (!strncmp(n, "single", 6)) return 0;
+            if (!strncmp(n, "dbuf", 4)) return 1;
+            if (!strncmp(n, "async", 5)) return 2;
+            return 3;   // ptx
+        };
         for (size_t i = 0; i < sizeof(kTileConfigs) / sizeof(kTileConfigs[0]); i++) {
             const TileConfig &tc = kTileConfigs[i];
             if (arch10_ && arch10_ < tc.minArch) continue;
@@ -556,11 +568,14 @@ class PearlPow : public Algorithm {
             cudaMemcpyAsync(&fp, tFp, sizeof(uint32_t),
                             cudaMemcpyDeviceToHost, stream_);
             if (cudaStreamSynchronize(stream_) != cudaSuccess) continue;
-            if (fp == 0) continue;                  // wrote nothing at all
+            const int fam = family(tc.name);
+            seen[fam]++;
+            if (fp == 0) { rejected[fam]++; continue; }   // wrote nothing
             if (!haveRef) {
                 refFp = fp;
                 haveRef = true;
             } else if (fp != refFp) {
+                rejected[fam]++;
                 fprintf(stderr,
                         "[pearl-pow] %s disagrees with the other kernels on "
                         "this card - not selected\n", tc.name);
@@ -577,6 +592,17 @@ class PearlPow : public Algorithm {
         cudaEventDestroy(evB);
         cudaFree(tA);
         cudaFree(tB);
+        // A whole family failing is a harness bug until proven otherwise.
+        static const char *kFamily[4] = {"single", "dbuf", "async", "ptx"};
+        for (int f = 0; f < 4; f++)
+            if (seen[f] > 0 && rejected[f] == seen[f])
+                fprintf(stderr,
+                        "[pearl-pow] WARNING: every '%s' kernel (%d of %d) was "
+                        "rejected. One bad kernel is plausible; a whole family "
+                        "usually means the tuner fed it the wrong B layout. "
+                        "Hashrate may be far below what this card can do.\n",
+                        kFamily[f], rejected[f], seen[f]);
+
         cudaFree(tT);
         cudaFree(tBn);
         cudaFree(tFp);

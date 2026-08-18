@@ -940,6 +940,46 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
+    // The 38% regression this exists to catch: every raw-mma configuration was
+    // rejected by the tuner's fingerprint gate because the tuner fed it a
+    // k-major B when it reads n-major. Correct in isolation, unselectable in
+    // practice, and every other test stayed green. So assert the two layouts
+    // actually agree - which is the property the tuner depends on.
+    printf("8b. the two B layouts agree, which is what the tuner assumes\n");
+    {
+        const uint32_t m = 256, n = 256, k = 2048, rank = 128;
+        const size_t aB = (size_t)m * k, bB = (size_t)n * k;
+        const uint32_t tiles = (m / 16) * (n / 16);
+        int8_t *dA, *dBk, *dBn;
+        uint32_t *t1, *t2;
+        CHECK(cudaMalloc(&dA, aB)); CHECK(cudaMalloc(&dBk, bB));
+        CHECK(cudaMalloc(&dBn, bB));
+        CHECK(cudaMalloc(&t1, (size_t)tiles * 64));
+        CHECK(cudaMalloc(&t2, (size_t)tiles * 64));
+        genMatrix<<<(aB / 8 + 255) / 256, 256>>>(dA, aB, 41);
+        genMatrix<<<(bB / 8 + 255) / 256, 256>>>(dBk, bB, 42);
+        transposeKtoN<<<(bB + 255) / 256, 256>>>(dBk, dBn, n, k);
+        CHECK(cudaDeviceSynchronize());
+        CHECK(cudaMemset(t1, 0, (size_t)tiles * 64));
+        CHECK(cudaMemset(t2, 0, (size_t)tiles * 64));
+        noisyGemmMmaTiledDB<2, 4, 4, 2><<<dim3(n / 128, m / 128), 256>>>(
+            dA, dBk, nullptr, t1, (int)m, (int)n, (int)k, (int)rank, false);
+        noisyGemmPtx<4, 4, 2, 4, 64, 3, 8>
+            <<<dim3(n / 256, m / 128), 512, ptxSmem<4, 4, 2, 4, 64, 3>()>>>(
+                dA, dBn, nullptr, t2, (int)m, (int)n, (int)k, (int)rank, false);
+        CHECK(cudaDeviceSynchronize());
+        std::vector<uint32_t> h1((size_t)tiles * 16), h2((size_t)tiles * 16);
+        CHECK(cudaMemcpy(h1.data(), t1, (size_t)tiles * 64, cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(h2.data(), t2, (size_t)tiles * 64, cudaMemcpyDeviceToHost));
+        size_t bad = 0;
+        for (size_t i = 0; i < h1.size(); i++) if (h1[i] != h2[i]) bad++;
+        check("k-major dbuf and n-major raw-mma agree on the same matrices",
+              bad == 0, std::to_string(bad) + " words differ");
+        CHECK(cudaFree(dA)); CHECK(cudaFree(dBk)); CHECK(cudaFree(dBn));
+        CHECK(cudaFree(t1)); CHECK(cudaFree(t2));
+    }
+
+    // ------------------------------------------------------------------
     printf("9. relative check: does the isolated winner win in a pipeline?\n");
     {
         // RELATIVE ONLY. The absolute milliseconds here run about 3x slower
