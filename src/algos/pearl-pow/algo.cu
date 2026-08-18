@@ -299,9 +299,28 @@ class PearlPow : public Algorithm {
         // then the other picks a local optimum on some card.
         //
         // A second or so at startup, once, against differences of 60%+.
+        // A shape can be pinned. The tuner ranks shapes on tc.launch alone,
+        // which is the GEMM and nothing else - it cannot see the per-attempt
+        // prepare that runs beside it. Prepare goes as m*k while candidates go
+        // as m*n, so a wider n amortises it better, and the ranking the tuner
+        // reports is a proxy rather than the thing we care about. Pinning lets
+        // the choice be checked against the miner's own candidate rate:
+        //   SOAT_PEARL_SHAPE=4096x65536 ./soat-miner --algo pearl-pow ...
+        unsigned pinM = 0, pinN = 0;
+        if (const char *pin = getenv("SOAT_PEARL_SHAPE")) {
+            if (sscanf(pin, "%ux%u", &pinM, &pinN) == 2 && pinM && pinN) {
+                fprintf(stderr, "[pearl-pow] shape pinned to %ux%u\n", pinM, pinN);
+            } else {
+                fprintf(stderr, "[pearl-pow] SOAT_PEARL_SHAPE wants MxN, e.g. "
+                                "4096x65536 - ignoring \"%s\"\n", pin);
+                pinM = pinN = 0;
+            }
+        }
+
         double bestRate = 0;
         bool found = false;
         for (const Shape &cand : kShapes) {
+            if (pinM && (cand.m != pinM || cand.n != pinN)) continue;
             if (bytesFor(cand) + headroom > freeB) continue;
             size_t cfg = 0;
             const double rate = tuneShape(cand, &cfg);
@@ -767,6 +786,14 @@ class PearlPow : public Algorithm {
                     "the chosen configuration\n");
             return false;
         }
+        // Diagnostic mode only: a zero bound makes a hit computationally
+        // impossible, so a local regtest gateway can measure the normal
+        // no-share mining path instead of CPU proof construction.
+        if (getenv("SOAT_PEARL_HARD_TARGET")) {
+            bound_ = U256{};
+            fprintf(stderr, "[pearl-pow] benchmark hard target enabled (no shares)\n");
+        }
+
 
         jobKey(header_, cfg_, jobKey_);
         // A's stream is mixed with the job so two jobs never mine the same A.
@@ -828,6 +855,7 @@ class PearlPow : public Algorithm {
     /** Per-attempt work: A's chain, the GEMM, and the PoW scan. */
     bool runAttempt(uint64_t nonce) {
         const size_t aBytes = (size_t)shape_.m * kK;
+
         cudaMemsetAsync(dHitCount_, 0, sizeof(uint32_t), stream_);
 
         genMatrix<<<(aBytes / 8 + 255) / 256, 256, 0, stream_>>>(
@@ -843,7 +871,6 @@ class PearlPow : public Algorithm {
             dArF_, dArS_, kK, dCommitA_, dSeedA_, kRank);
         applyNoiseA<<<(aBytes + 255) / 256, 256, 0, stream_>>>(
             dA_, dEAL_, dArF_, dArS_, dAn_, shape_.m, kK, kRank);
-
         // Whichever tile configuration prepare() measured fastest on this
         // card. See kTileConfigs for why that is not a constant.
         const TileConfig &tc = kTileConfigs[tile_];
@@ -851,7 +878,6 @@ class PearlPow : public Algorithm {
         tc.launch(grid, tc.threads, stream_, dAn_, tc.nMajorB ? dBnT_ : dBn_,
                   dTranscripts_,
                   (int)shape_.m, (int)shape_.n, (int)kK, kRank);
-
         powScan<<<(tiles() + 255) / 256, 256, 0, stream_>>>(
             dTranscripts_, tiles(), dCommitA_, (const uint32_t *)dTarget_,
             dHitIndex_, dHitDigest_, dHitCount_, kMaxHits);

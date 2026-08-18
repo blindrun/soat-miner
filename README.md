@@ -20,6 +20,21 @@ Unpack it on Linux with command tar xzf soat-miner_v0.1.2_Lin64.tar.gz
 
 On Windows just unzip it.
 
+### Windows Defender will block it
+
+Defender flags soat-miner.exe as a coin miner and refuses to run it.
+It is not wrong about what the program is.
+Every GPU miner gets flagged the same way.
+
+You have to allow it yourself, or it will not start.
+Open Windows Security.
+Go to Virus and threat protection.
+Open Manage settings, then Add or remove exclusions.
+Add the folder you unpacked the miner into.
+
+Do that for a folder you chose, never for your whole drive.
+Build it yourself from source if you would rather not take our word for it.
+
 ## Mine to a pool
 
 This is the part most people want.
@@ -379,16 +394,25 @@ An 8GB card is enough. A 16GB card lets it pick a wider shape and go a bit faste
 
 | GPU | Th/s | of the field |
 |---|---|---|
-| RTX 4090 | 214.4 | no published figure to compare to |
-| RTX 5080 | 165.4 | 88% |
-| RTX 4080 | 129.6 | 81% |
-| RTX 4070 SUPER | 92.4 | 81% |
+| RTX 4090 | 167.9 | no published figure to compare to |
+| RTX 5080 | 140.9 | 75% |
 
 Th/s means tera multiply accumulates per second.
 That is the unit hashrate.no reports, so these compare straight across.
 
-hashrate.no lists 187.8 for a 5080, 159.3 for a 4080 and 114.1 for a 4070 Super.
+hashrate.no lists 187.8 for a 5080.
 They have no 4090 entry, so ignore anyone who quotes you one.
+
+Both rows are measured end to end.
+The number is the miner's own candidate counter, not a benchmark.
+It ran against a live pool, at normal difficulty, on an idle card.
+
+The 4080 and 4070 Super rows are gone for now.
+Their old numbers came from the startup tuner.
+The tuner times the matrix multiply and nothing else.
+It never sees the work that runs beside it.
+So it reads high, by 15 to 20 percent.
+Both cards get re-measured before a number goes back here.
 
 Do not compare watts against their table. We draw more than they list on the
 same card and the same coin, and the same gap shows up on Ergo, so it is their

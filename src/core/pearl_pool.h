@@ -93,7 +93,12 @@ class PearlPoolSource : public JobSource {
 
     bool fetch(Job *job) override {
         if (fd_ == OM_INVALID_SOCKET && !connectAndLogin()) return false;
-        drain(haveJob_ ? 50 : 8000);   // wait properly for the FIRST job only
+        // ZERO, not 50 ms, once we have work. The core calls fetch() before
+        // every search() batch, and a batch is about 10 ms of GPU time at
+        // Pearl's rate - so a 50 ms wait here cost 83% of the hashrate and
+        // showed up as 65 M candidates/s against 413 in the benchmark. Only
+        // the FIRST job is worth blocking for.
+        drain(haveJob_ ? 0 : 8000);
         if (!haveJob_) return false;
 
         pearl::b3::hash(nullptr, header_, 76, job->msg);
@@ -175,15 +180,17 @@ class PearlPoolSource : public JobSource {
     /** Read whatever has arrived, keeping the newest job. */
     void drain(int ms) {
         const long long deadline = nowMs() + ms;
-        while (nowMs() < deadline) {
-            if (!readable(fd_, 50)) {
-                if (haveJob_) return;      // nothing new, and we have work
+        do {
+            // Poll with no timeout when we already have work: take whatever
+            // has arrived and get straight back to mining.
+            if (!readable(fd_, haveJob_ ? 0 : 50)) {
+                if (haveJob_) return;
                 continue;
             }
             std::string line;
             if (!readLine(&line)) { disconnect(); return; }
             if (line.find("mining.notify") != std::string::npos) takeNotify(line);
-        }
+        } while (nowMs() < deadline);
     }
 
     void takeNotify(const std::string &line) {
