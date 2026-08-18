@@ -1120,9 +1120,16 @@ __global__ __launch_bounds__(kWarpsM *kWarpsN * 32, 1) void noisyGemmPtx(
     // the wrong one here. With grid (n/kBlockN, m/kBlockM), consecutive blocks
     // step along n, so a wave of concurrent blocks shares ONE A tile and pulls
     // a DIFFERENT B tile each - and B is the bigger of the two (kBlockN vs
-    // kBlockM rows of k bytes). The profiler shows the cost: L2 throughput 88%
-    // at a 98% hit rate with DRAM at 4.7%, which is the same bytes being
-    // served out of L2 over and over.
+    // kBlockM rows of k bytes).
+    //
+    // CORRECTION, measured later: this was justified at the time by L2
+    // throughput reading 88-91%, which was read as L2 being the limiter. It is
+    // not. The warp stall breakdown on the current kernel puts
+    // long_scoreboard - the memory dependency stall - at 0.32 of 11.46 cycles
+    // (2.8%), while math_pipe_throttle is 4.83 (42%). High L2 UTILISATION is
+    // not the same as being L2 BOUND, and the swizzle measured +0.4%, ie.
+    // nothing, which is what a non-bottleneck fix looks like. Kept because it
+    // is harmless and costs one integer remap; do not cite it as a win.
     //
     // So walk down m in groups of kGroupM first. Within a group, kGroupM
     // consecutive blocks share one B tile, and a wave's distinct footprint
