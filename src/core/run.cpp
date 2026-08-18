@@ -4,6 +4,7 @@
 
 #include "run.h"
 #include "pearl_gateway.h"
+#include "pearl_pool.h"
 #include "stratum.h"
 #include <thread>
 
@@ -125,16 +126,21 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     stats.backend = opt.backendLabel;
     stats.gpuMemGB = gpuMemGB;
 
+    const bool isPearlBanner = algo && algo->name() && !strcmp(algo->name(), "pearl-pow");
     // Banner before any network or GPU work. Connecting to a pool and
     // building the dataset take ~15s combined, and printing nothing for that
     // long reads as a hang - it is the first thing a new user sees.
+    // --pool wins over the gateway when both look set, because pearlHost has a
+    // DEFAULT and an explicitly typed pool does not. Ordering this the other
+    // way made the banner announce the gateway while the miner used the pool.
     stats.source =
         opt.bench ? "BENCHMARK ONLY - not mining, nothing submitted"
+        : !opt.poolHost.empty()
+            ? opt.poolHost + ":" + std::to_string(opt.poolPort) +
+                  (isPearlBanner ? " (pearl pool)" : " (pool)")
         : !opt.pearlHost.empty()
             ? opt.pearlHost + ":" + std::to_string(opt.pearlPort) +
                   " (pearl-gateway)"
-        : !opt.poolHost.empty()
-            ? opt.poolHost + ":" + std::to_string(opt.poolPort) + " (pool)"
             : "ergo node " + opt.target.host + ":" +
                   std::to_string(opt.target.port) + " (solo)";
     printBanner(stats, tty);
@@ -150,13 +156,31 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
 
     algo->setPrefetch(opt.prefetch);
 
+    // Which transport a Pearl job comes over depends on whether the user has
+    // a node. Both end in the same PlainProof.
+    const bool isPearl = algo && algo->name() && !strcmp(algo->name(), "pearl-pow");
+
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
     int nonceBits = 64;
     if (opt.bench) {
         stats.source = "benchmark (no pool/node)";
+    } else if (isPearl && !opt.poolHost.empty()) {
+        // Pearl to a pool. The pool runs the node and the prover, so this
+        // needs nothing but a wallet - which is the whole point, since the
+        // gateway path below requires running a Pearl node yourself.
+        if (opt.wallet.empty()) {
+            logLine(tty, "error",
+                    "mining Pearl to a pool needs --wallet with your PRL "
+                    "address (it starts with prl1).");
+            return 1;
+        }
+        auto *pp = new PearlPoolSource(opt.poolHost, opt.poolPort, opt.wallet,
+                                       opt.worker);
+        source.reset(pp);
+        stats.source = source->describe();
     } else if (!opt.pearlHost.empty()) {
-        // Pearl has no pool and no solo path - see RunOptions::pearlHost.
+        // Pearl straight to your own node, through pearl-gateway.
         auto *pg = new PearlGatewaySource(opt.pearlHost, opt.pearlPort);
         Job probe;
         if (!pg->fetch(&probe)) {

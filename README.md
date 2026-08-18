@@ -341,20 +341,37 @@ one your GPU solved and every share dies as "low difficulty".
 
 Mines Pearl on NVIDIA. CUDA only. There is no Vulkan backend for it yet.
 
-Call this testing. It mines and the blocks get accepted, but it has only run on
+Call this testing. It mines and the shares get accepted, but it has only run on
 Ada and Blackwell cards so far. See below if you have an Ampere or a Turing.
 
-You will need pearl-gateway running before you can mine anything.
-Pearl has no pool and no solo path.
-Every block needs a zero knowledge certificate and the gateway is what builds it.
+This is the part most people want.
+
+Open mine_pearl_herominers.sh in a text editor.
+Change WALLET to your own address.
+Save it.
+Run it with command ./mine_pearl_herominers.sh
+
+That is everything. You do not need a node and you do not need a gateway.
+
+If you would rather type it out, it is command ./soat-miner --algo pearl-pow --pool pearl.herominers.com:1200 --wallet prl1yourwalletgoeshere
+
+The pool is at pearl.herominers.com:1200 and takes no fee.
+
+## Pearl to your own node
+
+Skip this unless you actually run a Pearl node.
+
+A Pearl block needs a zero knowledge certificate. Your miner cannot build one.
+pearl-gateway builds it, and it owns the node connection and the payout address.
+So solo means running both.
 
 Get the gateway from the Pearl repo.
 
 https://github.com/pearl-research-labs/pearl
 
-Start the miner with command ./soat-miner --algo pearl-pow --gateway 127.0.0.1:8455
+Then start the miner with command ./soat-miner --algo pearl-pow --gateway 127.0.0.1:8455
 
-There is no wallet flag. The gateway holds the address.
+No wallet flag on that one. The gateway holds the address.
 
 An 8GB card is enough. A 16GB card lets it pick a wider shape and go a bit faster.
 
