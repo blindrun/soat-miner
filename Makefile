@@ -198,6 +198,11 @@ test-pearl: tests/test_pearl tests/test_pearl_job tests/test_pearl_prepare \
 tests/test_pearl: tests/test_pearl.cu src/algos/pearl-pow/noisy_gemm.cuh
 	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
 
+# Not part of `make test` - it is a measurement, not a gate.
+tests/measure_launch_gap: tests/measure_launch_gap.cu \
+                          src/algos/pearl-pow/noisy_gemm.cuh
+	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
+
 tests/test_pearl_mining_shape: tests/test_pearl_mining_shape.cu \
                                src/algos/pearl-pow/noisy_gemm.cuh
 	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
