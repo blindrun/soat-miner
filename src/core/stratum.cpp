@@ -245,6 +245,14 @@ void StratumSource::handleLine(const std::string &line) {
                     " with a zero target - nothing can ever satisfy it. "
                     "On Lithos this means the client has no share target (tau) "
                     "set yet; wait for it to finish syncing.";
+                // Drop any previous job. Without this, a zero-target notify
+                // arriving mid-session leaves haveJob_ true, so fetch() keeps
+                // handing out the stale job and the miner submits against work
+                // the pool has moved on from. As a first job it also leaves the
+                // startup path with nothing, which reads jobWarning_ to explain
+                // the wait instead of a generic "no job in 20s".
+                haveJob_ = false;
+                current_.valid = false;
                 return;
             }
             j.valid = true;
@@ -352,20 +360,46 @@ void StratumSource::handleLine(const std::string &line) {
 // mining.set_extranonce. `en2Size` is the number of nonce bytes left to us;
 // the prefix occupies the bits above them.
 void StratumSource::applyExtranonce(const std::string &xnHex, int en2Size) {
-    if (en2Size <= 0 || en2Size > 8) en2Size = 8;
+    // A malformed assignment is a protocol error. Mining with a guessed or
+    // empty prefix is not a safe fallback: it collides with other miners and
+    // gets shares rejected. Stop work until a valid job arrives.
+    const bool badSize = (en2Size <= 0 || en2Size > 8);
+    const int safeSize = badSize ? 8 : en2Size;
 
     uint64_t prefix = 0;
-    int prefixNibbles = 0;
+    size_t prefixNibbles = 0;
+    bool badHex = false, tooLong = false;
     for (char c : xnHex) {
-        if (!isxdigit((unsigned char)c)) continue;
+        if (!isxdigit((unsigned char)c)) { badHex = true; break; }
+        // A uint64_t can carry at most 16 nibbles. Bound the accumulator even
+        // if a malicious peer sends an arbitrarily long JSON string.
+        if (prefixNibbles == 16) { tooLong = true; break; }
         const int v = (c <= '9') ? (c - '0') : ((c | 0x20) - 'a' + 10);
         prefix = (prefix << 4) | (uint64_t)v;
         prefixNibbles++;
     }
-    const int ownedBits = en2Size * 8;
+    const int ownedBits = safeSize * 8;
     std::lock_guard<std::mutex> lk(mu_);
-    nonceBitsOwned_ = ownedBits > 64 ? 64 : ownedBits;
-    noncePrefix_ = (prefixNibbles > 0) ? (prefix << nonceBitsOwned_) : 0ULL;
+    nonceBitsOwned_ = ownedBits >= 64 ? 64 : ownedBits;
+    const int prefixBits = 64 - nonceBitsOwned_;
+    const bool emptyPrefix = prefixNibbles == 0;
+    const bool fits = emptyPrefix ||
+        (nonceBitsOwned_ < 64 && prefixNibbles * 4 <= (size_t)prefixBits);
+    if (!badSize && !badHex && !tooLong && fits) {
+        // Guard the shift: nonceBitsOwned_ can be 64 (en2Size 8 with an empty
+        // prefix reaches here via emptyPrefix), and even 0ULL << 64 is UB.
+        // Owning all 64 bits means there is no prefix.
+        noncePrefix_ = (nonceBitsOwned_ < 64) ? (prefix << nonceBitsOwned_) : 0ULL;
+    } else {
+        noncePrefix_ = 0ULL;
+        haveJob_ = false;
+        current_.valid = false;
+        jobWarning_ = "pool sent a malformed extranonce assignment";
+        if (badSize) jobWarning_ += " (invalid en2Size)";
+        else if (badHex) jobWarning_ += " (non-hex prefix)";
+        else if (tooLong || !fits) jobWarning_ += " (prefix does not fit nonce space)";
+        jobWarning_ += "; stopped mining until a valid job arrives.";
+    }
     extranonceGen_++;
 }
 
