@@ -77,15 +77,20 @@ CXXFLAGS = -O3 --std=c++17 -Isrc
 # CUDA 12.4 (max sm_90) run on Blackwell at all. Measured: identical hashrate
 # (217.6 vs 217.5 MH/s on a 4090) and the same ~60 s build.
 CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu \
-            src/algos/pearl-pow/algo.cu
-CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp
+            src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu
+CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp \
+               src/core/stratum_btc.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
             src/core/stratum.h src/core/blake2b.cuh \
-            src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh
+            src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
+            src/core/stratum_btc.h src/core/btc_job.h src/core/sha256.h \
+            src/core/btc_protocol.h src/core/bc3_destination.h src/core/json_lite.h src/algos/sha3-256t/sha3.h \
+            src/algos/sha3-256t/mine.cuh
 
-VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/algo_vk.o $(BUILD)/spirv.o $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o
+VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/algo_vk.o $(BUILD)/spirv.o $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
+            $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-pearl bench install dirs package
+.PHONY: all cuda vulkan clean test test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device bench install dirs package
 
 all: cuda vulkan
 
@@ -120,6 +125,10 @@ $(BUILD)/run_vk.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/stratum_vk.o: src/core/stratum.cpp src/core/stratum.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/stratum_btc_vk.o: src/core/stratum_btc.cpp src/core/stratum_btc.h \
+                           src/core/btc_job.h src/core/sha256.h src/core/json_lite.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/miner_vk.o: src/core/miner_vk.cpp src/core/run.h | dirs
@@ -244,6 +253,40 @@ tests/test_element: tests/test_element.cu src/algos/autolykos2/autolykos.cuh src
 tests/test_hit: tests/test_hit.cu src/algos/autolykos2/mine.cuh src/core/blake2b.cuh
 	$(NVCC) $(NVFLAGS) $< -o $@
 
+tests/test_sha3_algo: tests/test_sha3_algo.cu src/algos/sha3-256t/algo.cu \
+                      src/algos/sha3-256t/mine.cuh src/algos/sha3-256t/sha3.h \
+                      src/core/algo.h src/core/btc_job.h
+	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
+
+# Offline Bitcoin-Stratum protocol fixture: no socket, wallet, GPU, or pool.
+test-btc-stratum: tests/test_btc_stratum tests/fixtures/btc_stratum_v1.jsonl
+	@./tests/test_btc_stratum tests/fixtures/btc_stratum_v1.jsonl
+
+tests/test_btc_stratum: tests/test_btc_stratum.cpp src/core/stratum_btc.cpp \
+	                       src/core/stratum_btc.h src/core/btc_protocol.h \
+	                       src/core/btc_job.h src/core/sha256.h src/core/json_lite.h
+	$(CXX) $(CXXFLAGS) -pthread $< src/core/stratum_btc.cpp -o $@
+
+test-bc3-destination: tests/test_bc3_destination
+	@./tests/test_bc3_destination
+
+tests/test_bc3_destination: tests/test_bc3_destination.cpp src/core/bc3_destination.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# Phase-separated on purpose. The host gate is safe anywhere; the device gate
+# is opt-in and must only run after a purpose-specific GPU claim.
+test-bc3-host: test-btc-stratum test-bc3-destination
+
+# CMake/CTest equivalent of the offline host gate.  It configures and builds
+# only test-btc-stratum, then runs its one checked-in fixture test.  CUDA is
+# still required by the project configure, but this target never executes a
+# CUDA binary or opens a socket.
+test-bc3-cmake:
+	@bash scripts/test-bc3-cmake.sh
+
+test-bc3-device: tests/test_sha3_algo
+	@./tests/test_sha3_algo
+
 tests/test_algo: tests/test_algo.cu src/algos/autolykos2/algo.cu \
                  src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
                  src/core/algo.h src/core/blake2b.cuh
@@ -259,7 +302,9 @@ clean:
 	rm -rf $(BUILD) $(BIN) $(BIN_VK) tests/test_element tests/test_hit \
 	       tests/test_algo tests/test_vulkan tests/test_pearl \
 	       tests/test_pearl_job tests/test_pearl_prepare \
-	       tests/test_pearl_algo tests/test_pearl_gateway
+	       tests/test_pearl_algo tests/test_pearl_gateway tests/test_btc_stratum \
+	       tests/test_bc3_destination \
+	       tests/test_sha3_algo
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
 VERSION ?= 0.1.2

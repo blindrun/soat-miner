@@ -1,0 +1,6 @@
+{"id":1,"result":[[],"01020304",4],"error":null}
+{"id":2,"result":true,"error":null}
+{"id":null,"method":"mining.set_difficulty","params":[0.01]}
+{"id":null,"method":"mining.notify","params":["job-A","000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","010000000100000000000000000000000000000000000000000000000000000000000000ffffffff0301e803","01000000",["0000000000000000000000000000000000000000000000000000000000000000"],"00100020","1d00ffff","5f5e1000",true]}
+{"id":null,"method":"mining.set_extranonce","params":["a1b2",8]}
+{"id":2,"result":false,"error":[20,"bad worker",null]}

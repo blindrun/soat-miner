@@ -3,8 +3,10 @@
 // "test these nonces".
 
 #include "run.h"
+#include "bc3_destination.h"
 #include "pearl_gateway.h"
 #include "pearl_pool.h"
+#include "stratum_btc.h"
 #include "stratum.h"
 #include <thread>
 
@@ -160,6 +162,11 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     // a node. Both end in the same PlainProof.
     const bool isPearl = algo && algo->name() && !strcmp(algo->name(), "pearl-pow");
 
+    // BC3 speaks Bitcoin stratum, not Ergo stratum: the pool hands out job
+    // parts and the miner assembles the header itself. Different protocol,
+    // different JobSource - see stratum_btc.h.
+    const bool isBc3 = algo && algo->name() && !strcmp(algo->name(), "sha3-256t");
+
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
     int nonceBits = 64;
@@ -179,6 +186,78 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                                        opt.worker);
         source.reset(pp);
         stats.source = source->describe();
+    } else if (isBc3) {
+        // BitcoinIII to a pool. There is no solo path yet: solo would mean
+        // getblocktemplate against a bitcoinIII node and assembling the
+        // coinbase ourselves, which is a different job again.
+        if (opt.poolHost.empty()) {
+            logLine(tty, "error",
+                    "--algo sha3-256t is pool-only for now; pass --pool "
+                    "HOST:PORT (e.g. stratum.pythonpool.dev:3357).");
+            return 1;
+        }
+        const std::string &w = opt.wallet;
+        // A pool login is a public payout address, never a recovery secret,
+        // private key, or Control-only secret reference.  Keep the acceptance
+        // rule in the side-effect-free destination schema so it is covered by
+        // the offline host test before this networking path is ever reached.
+        if (!bc3AddressShape(w)) {
+            logLine(tty, "error",
+                    w.empty() ? "no --wallet given; pool mining needs your BC3 "
+                                "payout address"
+                              : "'" + w + "' is not a usable BC3 address");
+            logLine(tty, "error",
+                    "BC3 uses a payout-address form starting with 1, 3 or bc1; "
+                    "do not pass a seed, key, or secret reference.");
+            return 1;
+        }
+        logLine(tty, "info", "payout address: " + w);
+        logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
+                                 std::to_string(opt.poolPort) + " ...");
+        auto *bs = new BitcoinStratumSource(opt.poolHost, opt.poolPort, w,
+                                            opt.worker, opt.password, opt.batch);
+        std::string err;
+        if (!bs->start(&err)) {
+            fprintf(stderr, "pool connect failed: %s\n", err.c_str());
+            delete bs;
+            return 1;
+        }
+        source.reset(bs);
+        stats.source = source->describe();
+        logLine(tty, "ok", "TCP connected, waiting for first job...");
+        bool gotJob = false;
+        for (int i = 0; i < 200; i++) {
+            Job probe;
+            if (bs->fetch(&probe)) { gotJob = true; break; }
+            if (bs->loginRejected()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (bs->loginRejected()) {
+            logLine(tty, "error",
+                    "pool REJECTED the login: " + bs->loginError());
+            logLine(tty, "error",
+                    "check --wallet is a real BC3 address and that the port is "
+                    "the pool's sha3-256t port.");
+            return 1;
+        }
+        if (!gotJob) {
+            const std::string jw = bs->takeJobWarning();
+            if (!jw.empty()) {
+                logLine(tty, "warn", jw);
+                return 1;
+            }
+            logLine(tty, "error",
+                    "connected to the pool but it sent no job in 20s. The "
+                    "socket is open, so this is not a firewall - the port may "
+                    "be for a different algorithm.");
+            return 1;
+        }
+        // A warning can be set on a job that is still perfectly mineable (a
+        // pool that forgot version bit 12, say), so surface it and carry on.
+        const std::string jw = bs->takeJobWarning();
+        if (!jw.empty()) logLine(tty, "warn", jw);
+        noncePrefix = bs->noncePrefix();
+        nonceBits = bs->nonceBitsOwned();
     } else if (!opt.pearlHost.empty()) {
         // Pearl straight to your own node, through pearl-gateway.
         auto *pg = new PearlGatewaySource(opt.pearlHost, opt.pearlPort);
