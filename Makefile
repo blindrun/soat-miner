@@ -202,6 +202,34 @@ $(BUILD)/lin/gen/%.o: $(BUILD)/%.cpp | dirs
 $(BIN_VK): $(VK_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -lvulkan -ldl -lpthread -o $@
 
+# --- does everything still LINK? -------------------------------------------
+# Builds every test binary and both platform binaries without running any of
+# them. No GPU, no pool, no network.
+#
+# This exists because three bugs in one day were the same shape: a target
+# nobody builds. The Windows cross-build broke twice, once for BC3 and once for
+# the next algorithm, and three test targets that link individual objects were
+# left naming object paths that no longer existed. None of it was visible to
+# `make cuda`, `make vulkan` or the offline test gate, because those targets
+# link a different set of objects. Each was found by someone running a target
+# by hand, which is not a system.
+#
+# Run this after any change to the build, to a shared header, or to anything
+# that adds or renames a source. It is the cheapest thing that catches
+# link-level drift across the whole tree.
+TEST_BINARIES = $(shell grep -oE '^tests/[a-z0-9_]+:' $(firstword $(MAKEFILE_LIST)) \
+                  | tr -d ':' | sort -u)
+
+.PHONY: build-tests
+build-tests: cuda vulkan $(TEST_BINARIES)
+	@echo "all $(words $(TEST_BINARIES)) test binaries and both platform binaries link"
+
+# The Windows cross-build is separate because it needs mingw, which a GPU box
+# may not have. Run it too when you have the toolchain - it is the target with
+# the worst track record in this file.
+.PHONY: build-all
+build-all: build-tests windows
+
 # --- correctness gates -----------------------------------------------------
 # test_hit is the one that matters: it rebuilds the real dataset and
 # reproduces a real mainnet block's hit from that block's winning nonce.
