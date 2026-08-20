@@ -33,21 +33,54 @@ done
 BACKEND="${BACKEND:-auto}"
 
 # Pearl is CUDA only. Without this the Blackwell rule below sends it to the
-# Vulkan binary, which has no pearl-pow, and the run fails as a bad ERGO
+# Vulkan binary, which does not have it, and the run fails as a bad ERGO
 # address - which is a baffling thing to be told when you asked for Pearl.
 # Non-NVIDIA hits the same path, so this is not only a Blackwell problem.
-WANT_PEARL=0
-for a in "$@"; do [[ "$a" == "pearl-pow" ]] && WANT_PEARL=1; done
-if [[ "$WANT_PEARL" == "1" ]]; then
+# Kept as a list rather than a hardcoded test: a hardcoded pearl-pow check is
+# what let BC3 inherit this bug when it was added.
+# Checks config.txt's ALGO too, not only the command line. Setting an ALGO
+# there and running this with no arguments used to fall through to the
+# Blackwell rule and pick a binary that could not mine it.
+#
+# BC3 (sha3-256t) is NOT on this list any more: it has a Vulkan backend and a
+# .comp shader of its own, verified against the host reference on an RX 7900 XT
+# as well as on NVIDIA. Leaving it here was the thing that made BC3 CUDA-only
+# in practice no matter what the binary supported - an AMD user was told the
+# algorithm did not exist for them.
+CUDA_ONLY_ALGO=""
+for a in "$@" "${ALGO:-}"; do
+  case "$a" in
+    pearl-pow) CUDA_ONLY_ALGO="Pearl" ;;
+  esac
+done
+if [[ -n "$CUDA_ONLY_ALGO" ]]; then
   if [[ ! -x ./soat-miner ]]; then
-    echo "Pearl needs the CUDA binary (./soat-miner) and it is not here."
-    echo "  Pearl is NVIDIA only. There is no Vulkan or AMD build of it yet."
+    echo "$CUDA_ONLY_ALGO needs the CUDA binary (./soat-miner) and it is not here."
+    echo "  $CUDA_ONLY_ALGO is NVIDIA only. There is no Vulkan or AMD build of it yet."
     exit 1
   fi
   if [[ "$BACKEND" == "vulkan" ]]; then
-    echo "note: Pearl is CUDA only, using the CUDA binary despite BACKEND=vulkan"
+    echo "note: $CUDA_ONLY_ALGO is CUDA only, using the CUDA binary despite BACKEND=vulkan"
   fi
   BACKEND=cuda
+fi
+
+# Which backend wins is PER ALGORITHM, not one rule for the whole miner. The
+# Blackwell-prefers-Vulkan rule below was measured on Autolykos and does not
+# carry: BC3 is faster on CUDA on NVIDIA (4090: CUDA 1543 MH/s, Vulkan 1086).
+# BC3 got this wrong the moment it stopped being CUDA-only and fell through to
+# the Autolykos rule, and an NVIDIA card quietly picked the slower backend.
+PREFERS_CUDA_ON_NVIDIA=""
+for a in "$@" "${ALGO:-}"; do
+  case "$a" in
+    sha3-256t) PREFERS_CUDA_ON_NVIDIA="BC3" ;;
+  esac
+done
+if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" && -x ./soat-miner ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    BACKEND=cuda
+    echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, it beats Vulkan here"
+  fi
 fi
 
 if [[ "$BACKEND" == "auto" ]]; then
@@ -95,14 +128,28 @@ elif [[ "${LITHOS:-no}" == "yes" ]]; then
          --worker "${WORKER:-rig1}")
   echo "SOAT Miner [$BACKEND] -> Lithos client at ${LITHOS_ADDR:-127.0.0.1:4444}"
 elif [[ -n "${POOL:-}" ]]; then
-  if [[ -z "${WALLET:-}" || "$WALLET" == 9YOUR_ERGO_ADDRESS_HERE ]]; then
-    echo "Set WALLET in config.txt to your Ergo address before pool mining."
-    echo "  (or use one of the mine_ergo_*.sh scripts and edit WALLET there)"
+  # Per-algorithm, because the placeholder and the address shape differ. This
+  # used to test the Ergo placeholder only, so a BC3 config with an unedited
+  # wallet sailed past and the message named the wrong coin either way.
+  case "${ALGO:-autolykos2}" in
+    pearl-pow) COIN="Pearl";       PLACEHOLDER="prl1YOUR_PEARL_ADDRESS_HERE"; SCRIPTS="mine_pearl_*.sh" ;;
+    sha3-256t) COIN="Bitcoin III"; PLACEHOLDER="YOUR_BC3_ADDRESS_HERE";       SCRIPTS="mine_bc3_*.sh" ;;
+    *)         COIN="Ergo";        PLACEHOLDER="9YOUR_ERGO_ADDRESS_HERE";     SCRIPTS="mine_ergo_*.sh" ;;
+  esac
+  # Any coin's placeholder, not just this coin's. Switching ALGO and forgetting
+  # to switch WALLET leaves the previous coin's placeholder sitting there, and
+  # testing only the current one let that through to a confusing pool error.
+  case "$WALLET" in
+    9YOUR_ERGO_ADDRESS_HERE|prl1YOUR_PEARL_ADDRESS_HERE|YOUR_BC3_ADDRESS_HERE) WALLET="" ;;
+  esac
+  if [[ -z "${WALLET:-}" || "$WALLET" == "$PLACEHOLDER" ]]; then
+    echo "Set WALLET in config.txt to your $COIN address before pool mining."
+    echo "  (or use one of the $SCRIPTS scripts and edit WALLET there)"
     exit 1
   fi
-  ARGS+=(--pool "$POOL" --wallet "$WALLET"
+  ARGS+=(--algo "${ALGO:-autolykos2}" --pool "$POOL" --wallet "$WALLET"
          --worker "${WORKER:-rig1}" --pass "${PASSWORD:-x}")
-  echo "SOAT Miner [$BACKEND] -> pool $POOL as ${WORKER:-rig1} paying $WALLET"
+  echo "SOAT Miner [$BACKEND] -> $COIN on $POOL as ${WORKER:-rig1} paying $WALLET"
 else
   ARGS+=(--node "${NODE:-127.0.0.1}" --port "${NODE_PORT:-9053}")
   echo "SOAT Miner [$BACKEND] -> solo via node ${NODE:-127.0.0.1}:${NODE_PORT:-9053}"

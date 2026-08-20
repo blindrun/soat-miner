@@ -1,9 +1,13 @@
 @echo off
-REM Ergo -> WoolyPooly. Edit WALLET below, then double-click.
+REM Bitcoin III -> Vexta PPLNS. 0.5% fee, PPLNS.
+REM Same host also runs solo on 7334 and proportional on 7335.
+REM Edit WALLET, then run.
 cd /d "%~dp0"
-set WALLET=9YOUR_ERGO_ADDRESS_HERE
+set WALLET=YOUR_BC3_ADDRESS_HERE
 set WORKER=%COMPUTERNAME%
-soat-miner.bat --pool pool.woolypooly.com:3100 --wallet %WALLET% --worker %WORKER% --pass x %*
+REM Goes through soat-miner.bat, not soat-miner.exe, so the backend is picked
+REM for the card: CUDA on NVIDIA, Vulkan on AMD.
+soat-miner.bat --algo sha3-256t --pool vexta-pool.co.uk:7333 --wallet %WALLET% --worker %WORKER% --pass x %*
 pause
 
 REM Ctrl+C is delivered to every process on this console, so cmd starts asking

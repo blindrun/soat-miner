@@ -87,10 +87,21 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/core/btc_protocol.h src/core/bc3_destination.h src/core/json_lite.h src/algos/sha3-256t/sha3.h \
             src/algos/sha3-256t/mine.cuh
 
-VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/algo_vk.o $(BUILD)/spirv.o $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
+# The Vulkan build carries one object per algorithm plus its embedded SPIR-V
+# module, and vk_common.o holds the registry and the shared device handling.
+# Adding a Vulkan algorithm is: a .comp, an algo_vk.cpp, the four rules below
+# copied, and two lines in src/core/vk_common.cpp.
+VK_SRC    = src/core/vk_common.cpp src/core/vk_registry.cpp \
+            src/algos/autolykos2/algo_vk.cpp \
+            src/algos/sha3-256t/algo_vk.cpp
+
+VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
+            $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
+            $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
+            $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
             $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device bench install dirs package
+.PHONY: all cuda vulkan clean test test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -118,7 +129,33 @@ $(BUILD)/spirv.cpp: $(BUILD)/kernel.spv scripts/embed_spirv.py | dirs
 $(BUILD)/spirv.o: $(BUILD)/spirv.cpp | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/algo_vk.o: src/algos/autolykos2/algo_vk.cpp src/core/algo.h | dirs
+$(BUILD)/algo_vk.o: src/algos/autolykos2/algo_vk.cpp src/core/algo.h \
+                    src/core/vk_common.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# --- sha3-256t (BC3) on Vulkan ---------------------------------------------
+# Same pattern as autolykos2 above; the only difference is the symbol the
+# SPIR-V is embedded under, so both modules can live in one binary.
+$(BUILD)/kernel_sha3.spv: src/algos/sha3-256t/kernel.comp | dirs
+	glslangValidator -V --target-env vulkan1.2 $< -o $@
+
+$(BUILD)/spirv_sha3.cpp: $(BUILD)/kernel_sha3.spv scripts/embed_spirv.py | dirs
+	python3 scripts/embed_spirv.py $< $@ kSha3Spirv
+
+$(BUILD)/spirv_sha3.o: $(BUILD)/spirv_sha3.cpp | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/algo_vk_sha3.o: src/algos/sha3-256t/algo_vk.cpp src/core/algo.h \
+                         src/core/vk_common.h src/core/btc_job.h \
+                         src/algos/sha3-256t/sha3.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/vk_common.o: src/core/vk_common.cpp src/core/vk_common.h \
+                      src/core/algo.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/vk_registry.o: src/core/vk_registry.cpp src/core/vk_common.h \
+                        src/core/algo.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/run_vk.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
@@ -131,7 +168,8 @@ $(BUILD)/stratum_btc_vk.o: src/core/stratum_btc.cpp src/core/stratum_btc.h \
                            src/core/btc_job.h src/core/sha256.h src/core/json_lite.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/miner_vk.o: src/core/miner_vk.cpp src/core/run.h | dirs
+$(BUILD)/miner_vk.o: src/core/miner_vk.cpp src/core/run.h \
+                     src/core/vk_common.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BIN_VK): $(VK_OBJS)
@@ -243,9 +281,30 @@ tests/test_pearl_gateway: tests/test_pearl_gateway.cpp src/core/pearl_gateway.h 
 # The Vulkan gate needs only the algorithm and the embedded SPIR-V, not the
 # miner's job/stratum plumbing.
 tests/test_vulkan: tests/test_vulkan.cpp $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
-                   src/core/algo.h
+                   $(BUILD)/vk_common.o src/core/algo.h
 	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
-	    -lvulkan -ldl -lpthread -o $@
+	    $(BUILD)/vk_common.o -lvulkan -ldl -lpthread -o $@
+
+# The Vulkan BC3 gate. This is the one that decides whether the shader is
+# trusted at all: NVIDIA's Vulkan compiler miscompiled the Autolykos kernel in
+# this repo once, and the miner mined happily while every share was silently
+# rejected. Nothing but a host-vs-device comparison catches that.
+#
+# It links vk_common.o for the registry but drives the algorithm directly, and
+# it also runs its own bare pipeline against the embedded module so a bug in
+# algo_vk.cpp's push-constant layout and a bug in the shader cannot mask each
+# other.
+tests/test_sha3_vulkan: tests/test_sha3_vulkan.cpp tests/sha3_vectors.h \
+                        $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
+                        $(BUILD)/vk_common.o src/algos/sha3-256t/sha3.h \
+                        src/core/algo.h src/core/btc_job.h
+	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
+	    $(BUILD)/vk_common.o -lvulkan -ldl -lpthread -o $@
+
+# Opt-in like test-bc3-device: it puts real load on a GPU, so it runs after a
+# purpose-specific gpulock claim rather than as part of a plain `make test`.
+test-bc3-vulkan: tests/test_sha3_vulkan
+	@./tests/test_sha3_vulkan
 
 tests/test_element: tests/test_element.cu src/algos/autolykos2/autolykos.cuh src/core/blake2b.cuh
 	$(NVCC) $(NVFLAGS) $< -o $@
@@ -253,7 +312,8 @@ tests/test_element: tests/test_element.cu src/algos/autolykos2/autolykos.cuh src
 tests/test_hit: tests/test_hit.cu src/algos/autolykos2/mine.cuh src/core/blake2b.cuh
 	$(NVCC) $(NVFLAGS) $< -o $@
 
-tests/test_sha3_algo: tests/test_sha3_algo.cu src/algos/sha3-256t/algo.cu \
+tests/test_sha3_algo: tests/test_sha3_algo.cu tests/sha3_vectors.h \
+                      src/algos/sha3-256t/algo.cu \
                       src/algos/sha3-256t/mine.cuh src/algos/sha3-256t/sha3.h \
                       src/core/algo.h src/core/btc_job.h
 	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
@@ -304,7 +364,7 @@ clean:
 	       tests/test_pearl_job tests/test_pearl_prepare \
 	       tests/test_pearl_algo tests/test_pearl_gateway tests/test_btc_stratum \
 	       tests/test_bc3_destination \
-	       tests/test_sha3_algo
+	       tests/test_sha3_algo tests/test_sha3_vulkan
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
 VERSION ?= 0.1.2
@@ -336,23 +396,43 @@ $(WINDIR)/include/vulkan:
 	-cp -r /usr/include/vk_video $(WINDIR)/include/
 
 # Import library for vulkan-1.dll, generated from the symbols we call.
-$(WINDIR)/libvulkan-1.a: | $(WINDIR)/include/vulkan
+#
+# It depends on $(VK_SRC) deliberately. Without that this is a one-shot target:
+# adding a Vulkan call anywhere leaves the stale .def in place, the symbol is
+# never exported, and the cross-build fails at link with an undefined reference
+# that looks like a toolchain problem rather than a stale generated file.
+# Adding vkGetPhysicalDeviceFeatures for the BC3 shaderInt64 check hit exactly
+# this.
+$(WINDIR)/libvulkan-1.a: $(VK_SRC) | $(WINDIR)/include/vulkan
 	@mkdir -p $(WINDIR)
 	@{ echo "LIBRARY vulkan-1.dll"; echo "EXPORTS"; \
-	   grep -ohE '\bvk[A-Z][A-Za-z0-9]*\s*\(' src/algos/autolykos2/algo_vk.cpp \
+	   grep -ohE '\bvk[A-Z][A-Za-z0-9]*\s*\(' $(VK_SRC) \
 	   | tr -d '( ' | sort -u \
-	   | grep -vE '^vk(DeviceMemGB|DeviceName|DriverVersion|ListDevices)$$' \
+	   | grep -vE '^vk(DeviceMemGB|DeviceName|DriverVersion|ListDevices|PickPhysicalDevice|SetDeviceInfo)$$' \
 	   | sed 's/^/    /'; } > $(WINDIR)/vulkan-1.def
 	x86_64-w64-mingw32-dlltool -d $(WINDIR)/vulkan-1.def -l $@
 
-windows: $(BUILD)/spirv.cpp $(WINDIR)/libvulkan-1.a
+# stratum_btc.cpp is here because run.cpp references BitcoinStratumSource
+# unconditionally. The Linux Vulkan target already links stratum_btc_vk.o; this
+# one did not, so adding BC3 broke the Windows cross-build at link time with an
+# undefined symbol and nothing else changed.
+windows: $(BUILD)/spirv.cpp $(BUILD)/spirv_sha3.cpp $(WINDIR)/libvulkan-1.a
+	$(WINCXX) $(WINFLAGS) -c src/core/vk_common.cpp          -o $(WINDIR)/vk_common.o
+	$(WINCXX) $(WINFLAGS) -c src/core/vk_registry.cpp        -o $(WINDIR)/vk_registry.o
 	$(WINCXX) $(WINFLAGS) -c src/algos/autolykos2/algo_vk.cpp -o $(WINDIR)/algo_vk.o
 	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv.cpp              -o $(WINDIR)/spirv.o
+	$(WINCXX) $(WINFLAGS) -c src/algos/sha3-256t/algo_vk.cpp -o $(WINDIR)/algo_vk_sha3.o
+	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv_sha3.cpp         -o $(WINDIR)/spirv_sha3.o
 	$(WINCXX) $(WINFLAGS) -c src/core/run.cpp                -o $(WINDIR)/run.o
 	$(WINCXX) $(WINFLAGS) -c src/core/stratum.cpp            -o $(WINDIR)/stratum.o
+	$(WINCXX) $(WINFLAGS) -c src/core/stratum_btc.cpp        -o $(WINDIR)/stratum_btc.o
 	$(WINCXX) $(WINFLAGS) -c src/core/miner_vk.cpp           -o $(WINDIR)/miner_vk.o
-	$(WINCXX) $(WINFLAGS) $(WINDIR)/miner_vk.o $(WINDIR)/algo_vk.o $(WINDIR)/spirv.o \
-	    $(WINDIR)/run.o $(WINDIR)/stratum.o $(WINDIR)/libvulkan-1.a -lws2_32 \
+	$(WINCXX) $(WINFLAGS) $(WINDIR)/miner_vk.o $(WINDIR)/vk_common.o \
+	    $(WINDIR)/vk_registry.o \
+	    $(WINDIR)/algo_vk.o $(WINDIR)/spirv.o \
+	    $(WINDIR)/algo_vk_sha3.o $(WINDIR)/spirv_sha3.o \
+	    $(WINDIR)/run.o $(WINDIR)/stratum.o $(WINDIR)/stratum_btc.o \
+	    $(WINDIR)/libvulkan-1.a -lws2_32 \
 	    -o $(WINDIR)/soat-miner-vk.exe
 	@x86_64-w64-mingw32-objdump -p $(WINDIR)/soat-miner-vk.exe | grep -i "DLL Name" | sort -u
 

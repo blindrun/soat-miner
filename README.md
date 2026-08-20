@@ -425,6 +425,80 @@ outside contributor mining into a live pool to find it. That is why the check
 is there, and it is why I am comfortable asking you to try this on a card I
 have never tested.
 
+## Bitcoin III (testing)
+
+Mines Bitcoin III on NVIDIA via CUDA and on AMD, Intel and NVIDIA via Vulkan.
+Both backends are checked against the same six real mainnet blocks, and the
+Vulkan shader is additionally compared digest-for-digest against the host
+implementation in `sha3.h` before it is trusted - 4.7 million nonces per run,
+on each card. Measured: 1543 MH/s CUDA and 1086 MH/s Vulkan on an RTX 4090,
+540 MH/s at 289 W on an RX 7900 XT.
+
+Call this testing too. The protocol and the algorithm are covered by offline
+tests and the six header vectors run on a real card, but nobody has mined a
+share with it yet.
+
+Open mine_bc3_pythonpool.sh in a text editor.
+Change WALLET to your own address.
+Save it.
+Run it with command ./mine_bc3_pythonpool.sh
+
+If you would rather type it out, it is command ./soat-miner --algo sha3-256t --pool stratum.pythonpool.dev:3357 --wallet yourbc3addresshere
+
+The pool is at stratum.pythonpool.dev:3357.
+
+### Other pools
+
+You are not stuck with the one we happen to use. There is a script per pool,
+and they all work the same way: edit WALLET, run it.
+
+| script | pool | stratum | fee | payout |
+|---|---|---|---|---|
+| mine_bc3_pythonpool.sh | pythonpool.dev | stratum.pythonpool.dev:3357 | 0% | solo |
+| mine_bc3_axehub.sh | axehub.app | pool.axehub.app:3338 | 0% | solo |
+| mine_bc3_btc3forge.sh | btc3forge.com | btc3forge.com:3337 | 0.5% | proportional |
+| mine_bc3_hashbay.sh | hashbay.io | stratum.hashbay.io:3344 | 0.5% | proportional |
+| mine_bc3_vexta.sh | vexta-pool.co.uk | vexta-pool.co.uk:7333 | 0.5% | PPLNS |
+| mine_bc3_argfamining_solo.sh | argfamining.com | stratum-us.argfamining.com:24152 | 1% | solo |
+| mine_bc3_argfamining_prop.sh | argfamining.com | stratum-us.argfamining.com:24153 | 1% | proportional |
+| mine_bc3_rplant.sh | rplant.xyz | stratum-na.rplant.xyz:7157 | 1% | proportional |
+| mine_bc3_cryptoeire.sh | crypto-eire.com | stratum.crypto-eire.com:3362 | 1% | solo |
+| mine_bc3_hashforge.sh | hashforge.online | stratum.hashforge.online:3341 | 1% | solo |
+
+pythonpool and axehub are the only two that take nothing, which is a real
+reason to prefer them. Fees are what each pool publishes, not what we measured.
+
+Every endpoint in that list was opened by hand before the script was written:
+it answers mining.subscribe, accepts a BC3 address, and pushes a mining.notify
+whose prevhash matches the tip every other pool is building on. Several pools
+run more than one port, and a few of them are for a different coin or a
+different processor, so do not guess a port from another pool's number. Where a
+pool has a second BC3 port worth knowing about, the script says so in a comment
+at the top.
+
+Some pools listed for BC3 on miningpoolstats have no script here on purpose.
+zpool.ca sells hashrate by algorithm rather than by coin, so its sha3-256t port
+was serving a different chain entirely when we looked, and it pays you in BTC
+against a BTC address. ariabrain.com answers and authorises, but its
+mining.notify carries 5 parameters where Bitcoin stratum has 9, so this miner
+cannot read its work. btc3forge's advertised solo endpoint refuses connections.
+A launcher pointing somewhere wrong is worse than no launcher.
+
+BC3 pays to an ordinary Bitcoin-shaped address, so it starts with 1, 3 or bc1.
+The miner checks the shape before it opens a socket and refuses anything that
+is not one, so a seed or a private key pasted in by mistake never leaves your
+machine.
+
+## Bitcoin III is pool only
+
+There is no solo path. Solo would mean calling getblocktemplate against a
+Bitcoin III node and building the coinbase here, which is a different job from
+the one the pool already does.
+
+That also means nothing in the miner reads a wallet, a node, or a key. The
+address you put in WALLET is a payout address the pool sends coins to, and it
+is the only piece of BC3 identity the miner ever handles.
+
 ## Build from source
 
 **Linux.** Install the CUDA toolkit and glslang, then run make.
@@ -629,8 +703,12 @@ them.
 ## Not done yet
 
 - Multi GPU. One card at a time right now.
-- More algorithms. Only Autolykos v2 so far.
+- More algorithms. Autolykos v2, Pearl and Bitcoin III so far.
 - The Windows CUDA build is tested on a 5080 and nothing else.
+- Bitcoin III on Windows. The code is there, the build is not: nvcc needs MSVC
+  on a Windows host, so it comes from the windows-cuda job rather than from a
+  Linux cross-build.
+- Bitcoin III has never had a share accepted by a pool.
 
 ## Resources
 

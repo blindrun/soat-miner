@@ -151,9 +151,18 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         logLine(tty, "warn",
                 "benchmark mode: measuring hashrate only. No pool, no wallet, "
                 "no shares, no payouts.");
+        // Name the script for the algorithm actually selected. This said
+        // mine_ergo_* for every algorithm, so benchmarking BC3 told you to go
+        // and mine Ergo.
+        const char *script = "mine_ergo_*";
+        if (algo && algo->name()) {
+            if (!strcmp(algo->name(), "pearl-pow")) script = "mine_pearl_*";
+            else if (!strcmp(algo->name(), "sha3-256t")) script = "mine_bc3_*";
+        }
         logLine(tty, "info",
-                "to actually mine, use a mine_ergo_* script (edit WALLET first) "
-                "or pass --pool HOST:PORT --wallet <address>");
+                std::string("to actually mine, use a ") + script +
+                    " script (edit WALLET first) or pass --pool HOST:PORT "
+                    "--wallet <address>");
     }
 
     algo->setPrefetch(opt.prefetch);
@@ -558,9 +567,19 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 // the verdict comes back on the reader thread. Only solo, which
                 // cannot report counters, can call it accepted here.
                 if (source->poolCounters(&a, &r, &p, &le)) {
-                    snprintf(buf, sizeof(buf), "share submitted   nonce=%016llx",
-                             (unsigned long long)s.nonce);
-                    logLine(tty, "info", buf);
+                    // Deliberately silent. A share per second is normal on an
+                    // easy pool target - BC3 at difficulty 0.01 submitted 537 in
+                    // one minute - and a line each buries the readout, the
+                    // rejections and the connection messages that actually need
+                    // reading. The periodic report already carries accepted,
+                    // rejected, hashrate and watts. Set SOAT_LOG_SHARES=1 to get
+                    // the per-share line back for diagnosis.
+                    static const bool logShares = getenv("SOAT_LOG_SHARES") != nullptr;
+                    if (logShares) {
+                        snprintf(buf, sizeof(buf), "share submitted   nonce=%016llx",
+                                 (unsigned long long)s.nonce);
+                        logLine(tty, "info", buf);
+                    }
                 } else {
                     stats.accepted++;
                     snprintf(buf, sizeof(buf), "SOLUTION ACCEPTED  nonce=%016llx",
@@ -604,20 +623,29 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // Surface each pool rejection once, with the pool's own words. Without
         // this a miner that is being refused every share looks identical to
         // one that is being paid for every share.
+        //
+        // Both stratum sources are handled here. BitcoinStratumSource is a
+        // JobSource, not a StratumSource, so the single cast this used to do
+        // returned null for BC3: the pool accepted 367 shares in a minute and
+        // the readout sat at "accepted 0, rejected 0" the whole time, which is
+        // the exact confusion the paragraph above exists to prevent.
         {
-            auto *st = dynamic_cast<StratumSource *>(source.get());
-            if (st) {
-                const std::string v = st->takeSubmitVerdict();
+            auto drain = [&](auto *src) {
+                if (!src) return false;
+                const std::string v = src->takeSubmitVerdict();
                 if (!v.empty())
                     logLine(tty, "error", "pool REJECTED the share: " + v);
-                const std::string jw = st->takeJobWarning();
+                const std::string jw = src->takeJobWarning();
                 if (!jw.empty()) logLine(tty, "warn", jw);
                 uint64_t a = 0, r = 0, p = 0;
                 std::string le;
-                st->poolCounters(&a, &r, &p, &le);
+                src->poolCounters(&a, &r, &p, &le);
                 stats.accepted = a;
                 stats.rejected = hostRejected + r;
-            }
+                return true;
+            };
+            if (!drain(dynamic_cast<StratumSource *>(source.get())))
+                drain(dynamic_cast<BitcoinStratumSource *>(source.get()));
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -637,8 +665,22 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
     }
 
-    if (tty) printf("\n");
+    // Shutdown output, ordered so it does not collide with whatever the shell
+    // draws next. Ctrl+C is delivered to every process sharing the console, so
+    // the shell starts redrawing its prompt - and cmd.exe starts asking
+    // "Terminate batch job (Y/N)?" - while this is still printing. Without a
+    // flush and a clear line break the two interleave and the prompt lands in
+    // the middle of a word.
+    //
+    // On a TTY, \r plus erase-to-end-of-line clears the partially drawn
+    // readout row first, so the last thing on screen is a whole line rather
+    // than a stump with a prompt hanging off it.
+    if (tty) {
+        printf("\r\033[K\n");
+        fflush(stdout);
+    }
     logLine(tty, "info", "stopping");
+    fflush(stdout);
     // Put the card back the way it was found.
     if (opt.memOffsetMhz != 0) gpu.applyMemOffsetMhz(0);
     algo->release();

@@ -167,20 +167,41 @@ __global__ void reduceTree(const uint8_t *__restrict__ in, uint32_t count,
     }
     __syncthreads();
 
+    // Read the whole level, barrier, THEN write it. One barrier per level is
+    // not enough, and the missing one is a real bug that reached a pool.
+    //
+    // Thread t consumes slots 2t and 2t+1 and produces slot t, so slot s < half
+    // is read by thread s/2 and written by thread s in the SAME level. Inside a
+    // warp the lockstep load-then-store ordering hides that; across warps
+    // nothing ordered them, and thread 100 could overwrite slot 100 before
+    // thread 50 had read it. It survived on Ada and did not on Blackwell, and
+    // it scaled with block count - so B (131072 chunks, 256 blocks) came out
+    // wrong while A (8192 chunks, 16 blocks) came out right on the same card.
+    //
+    // Nothing downstream could see it: recheck() and digestFromProof() both
+    // take commitA/commitB FROM THE DEVICE, so a corrupted root made the noise,
+    // the transcript and the digest all wrong together and all agreeing. The
+    // pool recomputes the root from the leaves the proof opens, which is why
+    // the only symptom was every share refused with "hash does not meet
+    // difficulty target".
     for (uint32_t n = per; n > 1; n >>= 1) {
         const uint32_t half = n >> 1;
-        if (threadIdx.x < half) {
-            uint32_t l[8], r[8], p[8];
+        const bool active = threadIdx.x < half;
+        uint32_t p[8];
+        if (active) {
+            uint32_t l[8], r[8];
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 l[j] = sReduce[(threadIdx.x * 2) * 8 + j];
                 r[j] = sReduce[(threadIdx.x * 2 + 1) * 8 + j];
             }
             b3d::parentCv(k, l, r, false, p);
+        }
+        __syncthreads();          // every read of this level has happened
+        if (active)
 #pragma unroll
             for (int j = 0; j < 8; j++) sReduce[threadIdx.x * 8 + j] = p[j];
-        }
-        __syncthreads();
+        __syncthreads();          // every write is visible to the next level
     }
 
     if (threadIdx.x == 0) {

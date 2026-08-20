@@ -19,14 +19,12 @@
 #include <vector>
 
 #include "../../core/algo.h"
+#include "../../core/vk_common.h"
 
 extern const uint32_t kAutolykosSpirv[];
 extern const size_t kAutolykosSpirvWords;
 
 namespace om {
-
-const char *driverTypeName(int t);
-
 namespace {
 
 uint32_t calcN(uint64_t height) {
@@ -107,56 +105,10 @@ class Autolykos2VK : public Algorithm {
         ici.pApplicationInfo = &app;
         VKCHECK(vkCreateInstance(&ici, nullptr, &inst_));
 
-        uint32_t count = 0;
-        vkEnumeratePhysicalDevices(inst_, &count, nullptr);
-        if (count == 0) {
-            fprintf(stderr, "no Vulkan device found\n");
-            return false;
-        }
-        std::vector<VkPhysicalDevice> devs(count);
-        vkEnumeratePhysicalDevices(inst_, &count, devs.data());
-
-        // Only real GPUs. llvmpipe/lavapipe advertise themselves as Vulkan
-        // devices of type CPU and would "work" at about 0.1 MH/s.
-        std::vector<VkPhysicalDevice> usable;
-        for (auto d : devs) {
-            VkPhysicalDeviceProperties p{};
-            vkGetPhysicalDeviceProperties(d, &p);
-            if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
-                p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
-                usable.push_back(d);
-        }
-        if (usable.empty()) {
-            fprintf(stderr,
-                    "no Vulkan GPU found (only CPU/software devices).\n"
-                    "  install your GPU vendor's Vulkan driver, then check "
-                    "with: vulkaninfo --summary\n");
-            return false;
-        }
-
-        size_t pick = 0;
-        if (requestedIndex >= 0) {
-            if ((size_t)requestedIndex >= usable.size()) {
-                fprintf(stderr, "device %d requested but only %zu GPU(s) found\n",
-                        requestedIndex, usable.size());
-                return false;
-            }
-            pick = (size_t)requestedIndex;
-        } else {
-            // Largest device-local heap wins: the right answer when an iGPU
-            // sits alongside a discrete card.
-            VkDeviceSize best = 0;
-            for (size_t i = 0; i < usable.size(); i++) {
-                VkPhysicalDeviceMemoryProperties mp{};
-                vkGetPhysicalDeviceMemoryProperties(usable[i], &mp);
-                VkDeviceSize local = 0;
-                for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
-                    if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                        local = std::max(local, mp.memoryHeaps[h].size);
-                if (local > best) { best = local; pick = i; }
-            }
-        }
-        phys_ = usable[pick];
+        // Device choice is shared with every other Vulkan algorithm - see
+        // core/vk_common.cpp. It used to live here, which is fine with one
+        // algorithm and a silent divergence with two.
+        if (!vkPickPhysicalDevice(inst_, requestedIndex, &phys_)) return false;
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
@@ -642,8 +594,6 @@ class Autolykos2VK : public Algorithm {
     uint32_t n_ = 0, chunks_ = 0, chunkElems_ = 0, chunkShift_ = 0, height_ = 0;
 };
 
-Autolykos2VK *g_instance = nullptr;
-
 }  // namespace
 
 Algorithm *makeAutolykos2VK(int deviceIndex) {
@@ -652,64 +602,10 @@ Algorithm *makeAutolykos2VK(int deviceIndex) {
         delete a;
         return nullptr;
     }
-    g_instance = a;
+    // The backend, not the algorithm, owns the readout now: with a registry
+    // there is no single algorithm instance to read it back out of.
+    vkSetDeviceInfo(a->deviceName(), a->deviceMemGB(), a->driverVersion());
     return a;
-}
-
-const char *vkDeviceName() { return g_instance ? g_instance->deviceName() : "unknown"; }
-double vkDeviceMemGB() { return g_instance ? g_instance->deviceMemGB() : 0.0; }
-const char *vkDriverVersion() { return g_instance ? g_instance->driverVersion() : ""; }
-
-/** Prints every Vulkan GPU, for --list-devices. */
-void vkListDevices() {
-    VkApplicationInfo app{};
-    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.apiVersion = VK_API_VERSION_1_2;
-    VkInstanceCreateInfo ici{};
-    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ici.pApplicationInfo = &app;
-    VkInstance inst = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
-        printf("cannot create a Vulkan instance - is a driver installed?\n");
-        return;
-    }
-    uint32_t n = 0;
-    vkEnumeratePhysicalDevices(inst, &n, nullptr);
-    std::vector<VkPhysicalDevice> devs(n);
-    vkEnumeratePhysicalDevices(inst, &n, devs.data());
-    int idx = 0;
-    for (auto d : devs) {
-        VkPhysicalDeviceProperties p{};
-        vkGetPhysicalDeviceProperties(d, &p);
-        const bool gpu = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
-                         p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-        VkPhysicalDeviceMemoryProperties mp{};
-        vkGetPhysicalDeviceMemoryProperties(d, &mp);
-        VkDeviceSize local = 0;
-        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
-            if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                local = std::max(local, mp.memoryHeaps[h].size);
-        if (gpu) {
-            printf("  [%d] %-38s %5.1f GB  max buffer %4.1f GB  (%s)\n", idx++,
-                   p.deviceName, local / 1e9,
-                   p.limits.maxStorageBufferRange / 1e9, driverTypeName(p.deviceType));
-        } else {
-            printf("   -  %-38s %5.1f GB  (skipped: %s)\n", p.deviceName, local / 1e9,
-                   driverTypeName(p.deviceType));
-        }
-    }
-    if (idx == 0) printf("no usable Vulkan GPU found\n");
-    vkDestroyInstance(inst, nullptr);
-}
-
-const char *driverTypeName(int t) {
-    switch (t) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return "virtual GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_CPU: return "CPU / software";
-        default: return "other";
-    }
 }
 
 }  // namespace om

@@ -1,0 +1,284 @@
+#version 450
+// SHA3-256t (BitcoinIII / BC3) as a Vulkan compute shader.
+//
+// A second transcription of src/algos/sha3-256t/sha3.h, which is the one
+// source of truth shared by the host and the CUDA device. Two transcriptions
+// of the same permutation is a correctness risk, not a convenience, so
+// tests/test_sha3_vulkan.cpp hashes the same nonces on this shader and on
+// sha3.h and requires every digest to match bit for bit before anything here
+// is trusted. That check is not ceremony: NVIDIA's Vulkan compiler once
+// miscompiled the Autolykos kernel in this repo and the miner mined happily
+// while every share was silently rejected.
+//
+// The permutation body below is GENERATED from the same ROTC/PILN tables that
+// sha3.h uses (scripts/gen_keccak_round.py). Hand-typing 24 rho/pi
+// assignments is precisely how a shader ends up subtly wrong in a way that
+// still produces plausible-looking digests.
+//
+// 64-bit lanes are used unconditionally. shaderInt64 was checked on every card
+// this miner targets - RTX 4090, RX 7900 XT (RADV NAVI31) and RX 6700 XT
+// (RADV NAVI22) - and is true on all of them, RDNA2 included, so a 32-bit
+// lane-pair fallback would be dead code that no test ever covers. The host
+// still asks for the feature at device creation and fails honestly if some
+// future device lacks it, rather than producing wrong hashes.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Workgroup size is a specialization constant so the host dispatch and the
+// shader can never disagree about it. Hardcoding it in both places already
+// drifted once in this repo (256 vs 512) and silently ran half the work while
+// crediting the full batch.
+layout(local_size_x_id = 0) in;
+
+// Solution buffer capacity, also from the host. constant_id 1.
+layout(constant_id = 1) const uint MAX_OUT = 256;
+
+// 5 words per solution: the nonce, then the 4 hit limbs.
+// In DUMP mode this same buffer instead takes 4 limbs per nonce, packed, so
+// the host can compare every digest rather than only the winners.
+layout(std430, binding = 0) buffer Out { uint64_t v[]; } outbuf;
+
+// A plain 32-bit atomic counter. A 64-bit atomic would need
+// GL_EXT_shader_atomic_int64, which is not universally present on AMD drivers;
+// atomicAdd on uint is core.
+layout(std430, binding = 1) buffer Cnt { uint n; } cnt;
+
+layout(push_constant) uniform Push {
+    // The 80-byte block header as ten little-endian lanes. Lane 9's high half
+    // is the nonce and is overwritten per thread; everything else is fixed for
+    // the job.
+    uint64_t h0, h1, h2, h3, h4, h5, h6, h7, h8, h9;
+    uint64_t t0, t1, t2, t3;   // 256-bit target, t0 least significant
+    uint base;                 // first nonce in this batch
+    uint count;                // nonces in this batch
+    uint mode;                 // 0 = search, 1 = dump every digest
+} pc;
+// 14 * 8 + 12 = 124 bytes, inside the 128 bytes Vulkan guarantees.
+
+const uint MODE_SEARCH = 0u;
+const uint MODE_DUMP = 1u;
+
+const uint64_t RC[24] = uint64_t[24](
+    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL,
+    0x8000000080008000UL, 0x000000000000808bUL, 0x0000000080000001UL,
+    0x8000000080008081UL, 0x8000000000008009UL, 0x000000000000008aUL,
+    0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL,
+    0x8000000000008003UL, 0x8000000000008002UL, 0x8000000000000080UL,
+    0x000000000000800aUL, 0x800000008000000aUL, 0x8000000080008081UL,
+    0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL);
+
+uint64_t rotl64(uint64_t x, int n) {
+    return (x << n) | (x >> (64 - n));
+}
+
+/**
+ * Keccak-f[1600].
+ *
+ * `a` is indexed only by literal constants inside the round, which is what
+ * keeps the 25 lanes in registers. A dynamic index into a local array is the
+ * GLSL trap that cost this repo a 75x slowdown in the Blake2b kernel; the one
+ * dynamic index here is RC[r], into a compile-time constant table, which every
+ * driver folds when it unrolls the loop.
+ */
+void keccakf(inout uint64_t a[25]) {
+    uint64_t bc0, bc1, bc2, bc3, bc4, t;
+    for (int r = 0; r < 24; r++) {
+        // Theta
+        bc0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
+        bc1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
+        bc2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
+        bc3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
+        bc4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
+        t = bc4 ^ rotl64(bc1, 1);
+        a[0] ^= t;
+        a[5] ^= t;
+        a[10] ^= t;
+        a[15] ^= t;
+        a[20] ^= t;
+        t = bc0 ^ rotl64(bc2, 1);
+        a[1] ^= t;
+        a[6] ^= t;
+        a[11] ^= t;
+        a[16] ^= t;
+        a[21] ^= t;
+        t = bc1 ^ rotl64(bc3, 1);
+        a[2] ^= t;
+        a[7] ^= t;
+        a[12] ^= t;
+        a[17] ^= t;
+        a[22] ^= t;
+        t = bc2 ^ rotl64(bc4, 1);
+        a[3] ^= t;
+        a[8] ^= t;
+        a[13] ^= t;
+        a[18] ^= t;
+        a[23] ^= t;
+        t = bc3 ^ rotl64(bc0, 1);
+        a[4] ^= t;
+        a[9] ^= t;
+        a[14] ^= t;
+        a[19] ^= t;
+        a[24] ^= t;
+
+        // Rho and Pi
+        t = a[1];
+        bc0 = a[10]; a[10] = rotl64(t, 1); t = bc0;
+        bc0 = a[7]; a[7] = rotl64(t, 3); t = bc0;
+        bc0 = a[11]; a[11] = rotl64(t, 6); t = bc0;
+        bc0 = a[17]; a[17] = rotl64(t, 10); t = bc0;
+        bc0 = a[18]; a[18] = rotl64(t, 15); t = bc0;
+        bc0 = a[3]; a[3] = rotl64(t, 21); t = bc0;
+        bc0 = a[5]; a[5] = rotl64(t, 28); t = bc0;
+        bc0 = a[16]; a[16] = rotl64(t, 36); t = bc0;
+        bc0 = a[8]; a[8] = rotl64(t, 45); t = bc0;
+        bc0 = a[21]; a[21] = rotl64(t, 55); t = bc0;
+        bc0 = a[24]; a[24] = rotl64(t, 2); t = bc0;
+        bc0 = a[4]; a[4] = rotl64(t, 14); t = bc0;
+        bc0 = a[15]; a[15] = rotl64(t, 27); t = bc0;
+        bc0 = a[23]; a[23] = rotl64(t, 41); t = bc0;
+        bc0 = a[19]; a[19] = rotl64(t, 56); t = bc0;
+        bc0 = a[13]; a[13] = rotl64(t, 8); t = bc0;
+        bc0 = a[12]; a[12] = rotl64(t, 25); t = bc0;
+        bc0 = a[2]; a[2] = rotl64(t, 43); t = bc0;
+        bc0 = a[20]; a[20] = rotl64(t, 62); t = bc0;
+        bc0 = a[14]; a[14] = rotl64(t, 18); t = bc0;
+        bc0 = a[22]; a[22] = rotl64(t, 39); t = bc0;
+        bc0 = a[9]; a[9] = rotl64(t, 61); t = bc0;
+        bc0 = a[6]; a[6] = rotl64(t, 20); t = bc0;
+        bc0 = a[1]; a[1] = rotl64(t, 44); t = bc0;
+
+        // Chi
+        bc0 = a[0];
+        bc1 = a[1];
+        bc2 = a[2];
+        bc3 = a[3];
+        bc4 = a[4];
+        a[0] ^= (~bc1) & bc2;
+        a[1] ^= (~bc2) & bc3;
+        a[2] ^= (~bc3) & bc4;
+        a[3] ^= (~bc4) & bc0;
+        a[4] ^= (~bc0) & bc1;
+        bc0 = a[5];
+        bc1 = a[6];
+        bc2 = a[7];
+        bc3 = a[8];
+        bc4 = a[9];
+        a[5] ^= (~bc1) & bc2;
+        a[6] ^= (~bc2) & bc3;
+        a[7] ^= (~bc3) & bc4;
+        a[8] ^= (~bc4) & bc0;
+        a[9] ^= (~bc0) & bc1;
+        bc0 = a[10];
+        bc1 = a[11];
+        bc2 = a[12];
+        bc3 = a[13];
+        bc4 = a[14];
+        a[10] ^= (~bc1) & bc2;
+        a[11] ^= (~bc2) & bc3;
+        a[12] ^= (~bc3) & bc4;
+        a[13] ^= (~bc4) & bc0;
+        a[14] ^= (~bc0) & bc1;
+        bc0 = a[15];
+        bc1 = a[16];
+        bc2 = a[17];
+        bc3 = a[18];
+        bc4 = a[19];
+        a[15] ^= (~bc1) & bc2;
+        a[16] ^= (~bc2) & bc3;
+        a[17] ^= (~bc3) & bc4;
+        a[18] ^= (~bc4) & bc0;
+        a[19] ^= (~bc0) & bc1;
+        bc0 = a[20];
+        bc1 = a[21];
+        bc2 = a[22];
+        bc3 = a[23];
+        bc4 = a[24];
+        a[20] ^= (~bc1) & bc2;
+        a[21] ^= (~bc2) & bc3;
+        a[22] ^= (~bc3) & bc4;
+        a[23] ^= (~bc4) & bc0;
+        a[24] ^= (~bc0) & bc1;
+
+        // Iota
+        a[0] ^= RC[r];
+    }
+}
+
+/**
+ * The full BC3 hash: SHA3-256 three times over the 80-byte header.
+ *
+ * The 0x06 pad byte is what makes this NIST SHA3 rather than Keccak-256. A
+ * Keccak pad (0x01) produces a completely different digest and every share is
+ * rejected, so it is called out here as it is in sha3.h.
+ *
+ * 80 bytes is exactly ten lanes, so the first absorb needs no partial-lane
+ * handling: lanes 0..9 are message, lane 10 carries the pad and lane 16 the
+ * 0x80 terminator (rate 136 bytes = 17 lanes).
+ */
+void bc3Hash(uint nonce, out uint64_t d0, out uint64_t d1, out uint64_t d2,
+             out uint64_t d3) {
+    uint64_t a[25];
+    for (int i = 0; i < 25; i++) a[i] = 0UL;
+    a[0] = pc.h0; a[1] = pc.h1; a[2] = pc.h2; a[3] = pc.h3; a[4] = pc.h4;
+    a[5] = pc.h5; a[6] = pc.h6; a[7] = pc.h7; a[8] = pc.h8;
+    a[9] = (pc.h9 & 0xffffffffUL) | (uint64_t(nonce) << 32);
+    a[10] = 0x06UL;
+    a[16] = 0x8000000000000000UL;
+    keccakf(a);
+
+    // Two more passes over the 32-byte digest. Four lanes of message, so the
+    // pad byte lands in lane 4.
+    for (int p = 0; p < 2; p++) {
+        uint64_t s0 = a[0], s1 = a[1], s2 = a[2], s3 = a[3];
+        for (int i = 0; i < 25; i++) a[i] = 0UL;
+        a[0] = s0; a[1] = s1; a[2] = s2; a[3] = s3;
+        a[4] = 0x06UL;
+        a[16] = 0x8000000000000000UL;
+        keccakf(a);
+    }
+
+    d0 = a[0]; d1 = a[1]; d2 = a[2]; d3 = a[3];
+}
+
+/** True when the digest is at or below the target, both little-endian limbs.
+ *  Equal is a valid hit: consensus rejects only hash > target. */
+bool underTarget(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3) {
+    if (d3 != pc.t3) return d3 < pc.t3;
+    if (d2 != pc.t2) return d2 < pc.t2;
+    if (d1 != pc.t1) return d1 < pc.t1;
+    if (d0 != pc.t0) return d0 < pc.t0;
+    return true;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    const uint nonce = pc.base + i;
+    uint64_t d0, d1, d2, d3;
+    bc3Hash(nonce, d0, d1, d2, d3);
+
+    if (pc.mode == MODE_DUMP) {
+        // Every digest, in nonce order, for the host-vs-device comparison.
+        // No atomic and no target test, so this path cannot hide a disagreement
+        // behind a filter.
+        outbuf.v[i * 4 + 0] = d0;
+        outbuf.v[i * 4 + 1] = d1;
+        outbuf.v[i * 4 + 2] = d2;
+        outbuf.v[i * 4 + 3] = d3;
+        return;
+    }
+
+    if (!underTarget(d0, d1, d2, d3)) return;
+
+    // Count every hit even past capacity, so the host can report how many were
+    // dropped rather than presenting a full buffer as the total.
+    const uint slot = atomicAdd(cnt.n, 1u);
+    if (slot >= MAX_OUT) return;
+    outbuf.v[slot * 5 + 0] = uint64_t(nonce);
+    outbuf.v[slot * 5 + 1] = d0;
+    outbuf.v[slot * 5 + 2] = d1;
+    outbuf.v[slot * 5 + 3] = d2;
+    outbuf.v[slot * 5 + 4] = d3;
+}
