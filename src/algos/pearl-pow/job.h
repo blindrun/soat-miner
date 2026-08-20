@@ -799,6 +799,79 @@ inline void encodeMerkleProof(const MerkleProof &p, std::vector<uint8_t> *out) {
 }
 
 /** The full dense PlainProof a winning tile is submitted as. */
+/**
+ * Pull the opened rows back out of a Merkle proof, the way a verifier does.
+ *
+ * The proof carries whole 1024-byte leaves, not rows, so a row is a window
+ * into them. Returns false when a byte the rows need was never opened, which
+ * is itself a bug worth catching: it means the leaf indices and the row list
+ * disagree.
+ */
+inline bool rowsFromProof(const MerkleProof &p, uint64_t firstRow,
+                          uint64_t rowCount, uint64_t cols,
+                          std::vector<int8_t> *out) {
+    out->assign((size_t)rowCount * cols, 0);
+    for (uint64_t r = 0; r < rowCount; r++)
+        for (uint64_t c = 0; c < cols; c++) {
+            const uint64_t off = (firstRow + r) * cols + c;
+            const uint64_t leaf = off / kChunkLen;
+            size_t slot = p.leafIndices.size();
+            for (size_t i = 0; i < p.leafIndices.size(); i++)
+                if (p.leafIndices[i] == leaf) { slot = i; break; }
+            if (slot == p.leafIndices.size()) return false;
+            const size_t at = slot * kChunkLen + (size_t)(off % kChunkLen);
+            if (at >= p.leafData.size()) return false;
+            (*out)[(size_t)r * cols + c] = (int8_t)p.leafData[at];
+        }
+    return true;
+}
+
+/**
+ * The PoW digest recomputed from the PROOF, not from the device buffers.
+ *
+ * recheck() is fed the A and B_t copied out of device memory, so it agrees
+ * with the device whatever the device computed. This does not: it reads back
+ * only what was serialised into the submission, which is what the pool
+ * reconstructs from. If the two digests ever differ, the proof does not
+ * describe the tile that won, and the pool will answer "hash does not meet
+ * difficulty target".
+ */
+inline bool digestFromProof(const MerkleProof &aProof, uint32_t tRow,
+                            const MerkleProof &btProof, uint32_t tCol,
+                            const uint8_t commitA[32], const uint8_t commitB[32],
+                            uint32_t m, uint32_t n, uint32_t k, int rank,
+                            int side, U256 *out) {
+    std::vector<int8_t> aRows, btRows;
+    if (!rowsFromProof(aProof, tRow, (uint64_t)side, k, &aRows)) return false;
+    if (!rowsFromProof(btProof, tCol, (uint64_t)side, k, &btRows)) return false;
+
+    Noise noise;
+    noise.generate(commitA, commitB, m, n, k, rank);
+
+    std::vector<int8_t> aStrip((size_t)side * k), bStrip((size_t)k * side);
+    for (int i = 0; i < side; i++)
+        for (size_t col = 0; col < k; col++) {
+            const int32_t e =
+                (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.first[col]] -
+                (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.second[col]];
+            aStrip[(size_t)i * k + col] = (int8_t)(aRows[(size_t)i * k + col] + e);
+        }
+    for (size_t p = 0; p < k; p++)
+        for (int j = 0; j < side; j++) {
+            const int32_t e =
+                (int32_t)noise.eBR[(size_t)noise.bl.first[p] * n + tCol + j] -
+                (int32_t)noise.eBR[(size_t)noise.bl.second[p] * n + tCol + j];
+            bStrip[p * side + j] = (int8_t)(btRows[(size_t)j * k + p] + e);
+        }
+
+    uint32_t tr[kTranscriptWords];
+    tileTranscript(aStrip.data(), bStrip.data(), k, side, rank, 0, 0, side, side, tr);
+    uint8_t d[32];
+    powDigest(tr, commitA, d);
+    *out = U256::fromBytesLE(d);
+    return true;
+}
+
 inline std::vector<uint8_t> encodePlainProof(uint64_t m, uint64_t n, uint64_t k,
                                              uint64_t rank,
                                              const MerkleProof &aProof,

@@ -1,0 +1,96 @@
+// powScan: hash each tile's transcript and record the ones that beat the
+// target. The twin of the kernel of the same name in prepare.cuh.
+//
+// One invocation per transcript. No shared memory and no barriers - the only
+// coordination is an atomic counter, so this is structurally the simplest of
+// Pearl's shaders. The care needed is all in getting four pieces of behaviour
+// exactly right, because each of them fails silently in a different way.
+//
+// THE KEY IS COMMITMENT A, NOT THE JOB KEY. powDigest keys on commitA, which is
+// what makes every digest depend on the matrices. Keying on the job key instead
+// produces a shader that runs, reports hits at the expected rate, and finds
+// nothing a pool will accept.
+//
+// EQUALITY IS A WIN. The comparison walks limb 7 down to limb 0: strictly less
+// wins, strictly greater loses, equal continues to the next limb. A digest
+// equal to the target in every limb therefore wins - the bound is <=, not <.
+// The direction of that walk is load-bearing and was mutation-tested on the
+// CUDA side: reversing it gave 1003 hits where 8 were correct, which is a bug
+// that looks like good luck rather than like a failure.
+//
+// THE COUNTER INCREMENTS BEFORE THE BOUNDS TEST, and is deliberately not
+// clamped. hitCount therefore counts every hit including the ones dropped for
+// want of space, so the host can tell "8 hits" from "maxHits hits and an
+// unknown number lost". Clamping it would present a full buffer as the total.
+//
+// hitCount IS NOT ZEROED HERE. The driver loop clears it between attempts, the
+// same way algo.cu does. A shader that zeroed it would race with itself.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "blake3.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufT   { uint transcripts[]; };
+layout(std430, binding = 1) readonly  buffer BufKey { uint key[8]; };
+layout(std430, binding = 2) readonly  buffer BufTgt { uint target[8]; };
+layout(std430, binding = 3) writeonly buffer BufHI  { uint hitIndex[]; };
+layout(std430, binding = 4) writeonly buffer BufHD  { uint hitDigest[]; };
+// Not writeonly: atomicAdd reads it.
+layout(std430, binding = 5)           buffer BufHC  { uint hitCount; };
+
+layout(push_constant) uniform Push {
+    uint count;
+    uint maxHits;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;   // no barrier below, so a bare return is safe
+
+    uint k[8];
+    for (uint j = 0u; j < 8u; j++) k[j] = key[j];
+
+    // Sixteen words, written out rather than looped, for the reason
+    // merkle_chunk.comp documents: a runtime index into a per-invocation array
+    // is the trap that measured 75x on autolykos2's blake2b, and spelling it
+    // out means nobody has to decide whether this is that case.
+    const uint o = i * 16u;
+    uint m[16];
+    m[0]  = transcripts[o     ]; m[1]  = transcripts[o +  1];
+    m[2]  = transcripts[o +  2]; m[3]  = transcripts[o +  3];
+    m[4]  = transcripts[o +  4]; m[5]  = transcripts[o +  5];
+    m[6]  = transcripts[o +  6]; m[7]  = transcripts[o +  7];
+    m[8]  = transcripts[o +  8]; m[9]  = transcripts[o +  9];
+    m[10] = transcripts[o + 10]; m[11] = transcripts[o + 11];
+    m[12] = transcripts[o + 12]; m[13] = transcripts[o + 13];
+    m[14] = transcripts[o + 14]; m[15] = transcripts[o + 15];
+
+    // One keyed blake3 of a single 64-byte block: chunk start, chunk end and
+    // root, counter zero. b3HashBlock64 is exactly that, and exists in
+    // blake3.glsl so no stage after the Merkle group needs a second blake3.
+    uint dig[8];
+    b3HashBlock64(k, m, dig);
+
+    // Big-endian comparison over little-endian limbs: word 7 is the most
+    // significant, so the walk runs downward and stops at the first limb that
+    // differs. Falling out of the loop means every limb was equal, and `win`
+    // is still true - that is the <= bound, not an oversight.
+    bool win = true;
+    for (int j = 7; j >= 0; --j) {
+        if (dig[j] < target[j]) break;
+        if (dig[j] > target[j]) { win = false; break; }
+    }
+    if (!win) return;
+
+    // Increment first, bound second. The counter is the true hit total.
+    const uint slot = atomicAdd(hitCount, 1u);
+    if (slot >= pc.maxHits) return;
+
+    hitIndex[slot] = i;
+    const uint d = slot * 8u;
+    for (uint j = 0u; j < 8u; j++) hitDigest[d + j] = dig[j];
+}

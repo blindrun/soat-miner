@@ -126,6 +126,61 @@ void vkListDevices() {
     vkDestroyInstance(inst, nullptr);
 }
 
+bool vkInt8CooperativeMatrix(VkInstance inst, VkPhysicalDevice dev,
+                             uint32_t *kOut) {
+    if (kOut) *kOut = 0;
+
+    // 1. THE DEVICE EXTENSION LIST. Not the configuration enumeration, which
+    //    answers for devices that do not support this at all - the loader
+    //    resolves the entry point if ANY device on the box has the extension,
+    //    and then happily returns 14 configurations for an RX 6700 XT that
+    //    supports none of them. Measured on a box where the extension and the
+    //    feature bit both belonged to llvmpipe and neither to the 6700 XT.
+    uint32_t n = 0;
+    if (vkEnumerateDeviceExtensionProperties(dev, nullptr, &n, nullptr) != VK_SUCCESS)
+        return false;
+    std::vector<VkExtensionProperties> exts(n);
+    if (n && vkEnumerateDeviceExtensionProperties(dev, nullptr, &n, exts.data()) != VK_SUCCESS)
+        return false;
+    bool haveExt = false;
+    for (const auto &e : exts)
+        if (!strcmp(e.extensionName, "VK_KHR_cooperative_matrix")) { haveExt = true; break; }
+    if (!haveExt) return false;
+
+    // 2. THE FEATURE BIT. Present-but-false is a real state; without this
+    //    vkCreateDevice fails later with VK_ERROR_FEATURE_NOT_PRESENT, which
+    //    is a hard failure where a clean skip was wanted.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{};
+    cm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &cm;
+    vkGetPhysicalDeviceFeatures2(dev, &f2);
+    if (!cm.cooperativeMatrix) return false;
+
+    // 3. ONLY NOW the configuration list, for the K this device wants. It is
+    //    32 on Ada and 16 on RDNA3, which is why the shader takes it as a
+    //    specialisation constant rather than baking one in.
+    auto getCoop = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+        vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    if (!getCoop) return false;
+    uint32_t c = 0;
+    getCoop(dev, &c, nullptr);
+    if (!c) return false;
+    std::vector<VkCooperativeMatrixPropertiesKHR> cps(c);
+    for (auto &p : cps) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    getCoop(dev, &c, cps.data());
+    for (const auto &p : cps)
+        if (p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+            p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+            p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
+            p.MSize == 16 && p.NSize == 16) {
+            if (kOut) *kOut = p.KSize;
+            return true;
+        }
+    return false;
+}
+
 const char *driverTypeName(int t) {
     switch (t) {
         case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete GPU";

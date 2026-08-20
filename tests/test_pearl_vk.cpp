@@ -22,6 +22,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "../src/core/vk_common.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -131,23 +133,17 @@ int main(int argc, char **argv) {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(pd, &props);
 
-    // ---- pick an int8 coopmat config; skip rather than fail if absent ----
-    auto getCoop = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
-        vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
-    int kDim = 0;
-    if (getCoop) {
-        uint32_t c = 0;
-        getCoop(pd, &c, nullptr);
-        std::vector<VkCooperativeMatrixPropertiesKHR> cps(c);
-        for (auto &p : cps) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-        if (c) getCoop(pd, &c, cps.data());
-        for (auto &p : cps)
-            if (p.AType == VK_COMPONENT_TYPE_SINT8_KHR && p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
-                p.CType == VK_COMPONENT_TYPE_SINT32_KHR && p.MSize == 16 && p.NSize == 16) {
-                kDim = (int)p.KSize;
-                break;
-            }
-    }
+    // ---- int8 coopmat, checked in the only order that is safe ----
+    //
+    // Extension list, then feature bit, then the configuration list. This used
+    // to enumerate configurations straight away, which reports success on an
+    // RX 6700 XT that supports cooperative matrix not at all - the loader
+    // answers for it because another device on the box has the extension - and
+    // then vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT, turning a
+    // clean skip into a hard failure. vk_common owns that check now, so the
+    // miner and the tests cannot drift on it.
+    uint32_t kSize = 0;
+    const int kDim = om::vkInt8CooperativeMatrix(inst, pd, &kSize) ? (int)kSize : 0;
     if (!kDim) {
         // Not a failure. A box without int8 cooperative matrix must not take
         // the rest of the suite down with it.

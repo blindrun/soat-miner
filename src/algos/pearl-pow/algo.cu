@@ -719,12 +719,42 @@ class PearlPow : public Algorithm {
      * A card overclocked into instability produces wrong accumulators, and
      * there is no other way to tell that from a genuine win.
      */
+    /**
+     * MACs one candidate costs, so the readout can report the unit the field
+     * is measured in.
+     *
+     * A candidate is a kTileSide x kTileSide tile of the product and every
+     * element of it is a length-k dot product, so the cost is tile area times
+     * k. Note what is NOT in here: the cooperative-matrix K. That is the depth
+     * of one hardware matrix instruction - 32 on Ada, 16 on RDNA3 - and a tile
+     * takes k/K of them, so K cancels. Multiplying by the config's K instead
+     * would be 64x low on one vendor and 128x low on the other, which is worse
+     * than a hardcoded constant because it looks vendor-aware while being
+     * vendor-specifically wrong.
+     *
+     * Zero before prepare(), meaning "not known yet", never a guess.
+     */
+    double macsPerUnit() const override {
+        // kK before prepare() has run is the shipped configuration, not a
+        // guess: prepare() sets cfg_.commonDim to exactly this. Returning 0
+        // here instead would make the very first readout print MH/s for an
+        // algorithm that does not hash.
+        const uint32_t k = cfg_.commonDim ? cfg_.commonDim : kK;
+        return (double)kTileSide * (double)kTileSide * (double)k;
+    }
+
     bool verify(const Job &job, const Solution &sol) const override {
         (void)job;
         // Newest first: if a nonce ever repeats, the current attempt's answer
         // is the right one.
         for (auto it = wins_.rbegin(); it != wins_.rend(); ++it)
-            if (it->nonce == sol.nonce) return it->verified;
+            if (it->nonce == sol.nonce)
+                // `sol.hit` came from the GPU scan.  Do not merely check that
+                // it is below the target: bind it to the host-recomputed
+                // digest of the exact proof before a pool submission.
+                return it->verified &&
+                       memcmp(sol.hit, it->digest.v, sizeof(sol.hit)) == 0 &&
+                       U256::fromLimbs(sol.hit).le(it->bound);
         return false;
     }
 
@@ -739,6 +769,8 @@ class PearlPow : public Algorithm {
     struct Win {
         uint64_t nonce = 0;
         bool verified = false;
+        U256 bound;
+        U256 digest;
     };
 
     uint32_t tiles() const {
@@ -859,10 +891,14 @@ class PearlPow : public Algorithm {
 
     /** Per-job work: everything that depends on the header but not on A. */
     bool beginJob(const Job &job, const uint8_t header[76], int cert) {
-        if (haveJob_ && memcmp(header, header_, 76) == 0 && cert == cert_)
+        // A pool may refresh its share target without changing its block
+        // header. The target sets the GPU/host bound and must bust this cache.
+        if (haveJob_ && memcmp(header, header_, 76) == 0 && cert == cert_ &&
+            memcmp(job.target, target_, sizeof(target_)) == 0)
             return true;
 
         memcpy(header_, header, 76);
+        memcpy(target_, job.target, sizeof(target_));
         cert_ = cert;
         cfg_.commonDim = kK;
         cfg_.rank = kRank;
@@ -873,6 +909,13 @@ class PearlPow : public Algorithm {
                     bad.c_str());
             return false;
         }
+        // Pool and gateway targets are both scaled here, once. HeroMiners
+        // publishes the ordinary difficulty target (0xFFFF * 2^208 / D) and its
+        // verifier applies the same rank/work penalty the chain does, so a
+        // proof built against the unscaled target is one the pool will never
+        // ask for: measured, one submit per 419 days on a 5080. Twelve shares
+        // accepted and none rejected on a 4090 establish the scaled bound as
+        // the one this pool wants. See scratchpad/handoffs/pearl.md.
         if (!cfg_.penalizedTarget(U256::fromLimbs(job.target), &bound_)) {
             fprintf(stderr,
                     "[pearl-pow] this target does not scale into 256 bits for "
@@ -1025,8 +1068,10 @@ class PearlPow : public Algorithm {
 
         Win win;
         win.nonce = nonce;
+        win.bound = bound_;
         uint32_t hostTr[kTranscriptWords] = {};
-        win.verified = recheck(A, Bt, commitA, commitB, tRow, tCol, hostTr);
+        win.verified = recheck(A, Bt, commitA, commitB, tRow, tCol, hostTr,
+                               &win.digest);
         if (!win.verified && getenv("SOAT_PEARL_DEBUG")) {
             // Is the GPU's transcript for this tile the same as the one the
             // host just rebuilt from A, B and the noise? If they match, the
@@ -1076,6 +1121,78 @@ class PearlPow : public Algorithm {
                         leafIndicesFromRows(tCol, kTileSide, kK), &btProof))
             return false;
 
+        // The one link in the chain nothing else can catch.
+        //
+        // recheck() and digestFromProof() both take commitA/commitB from the
+        // DEVICE, so a wrong Merkle root makes the noise wrong, the transcript
+        // wrong and the digest wrong all together - and every local check
+        // agrees, because they are all downstream of the same bad value. The
+        // pool is the first party to recompute the root from the opened leaves,
+        // and when it disagrees the only thing it can say is "hash does not
+        // meet difficulty target".
+        //
+        // buildProof() has just rebuilt both trees on the host from the same
+        // bytes the device used, so the comparison is already paid for.
+        // `chunkCvs`/`reduceTree` are covered by no device test at all
+        // (tests/test_pearl.cu launches only the noisyGemm family and
+        // powCheck), which is exactly why this guard is here and not a comment.
+        uint8_t devRoots[64];
+        if (cudaMemcpy(devRoots, dRoots_, sizeof(devRoots),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        const bool aRootOk = memcmp(devRoots, aProof.root, 32) == 0;
+        const bool bRootOk = memcmp(devRoots + 32, btProof.root, 32) == 0;
+        if (!aRootOk || !bRootOk) {
+            fprintf(stderr,
+                    "[pearl-pow] the device's Merkle root for %s disagrees with "
+                    "the host's over the same bytes - the commitments this proof "
+                    "was mined under are not the ones it opens, so it is not "
+                    "submitted. This is a GPU-side defect, not a pool problem.\n",
+                    !aRootOk ? (bRootOk ? "A" : "A and B") : "B");
+            return true;
+        }
+
+        // The second half of the same blind spot. Everything downstream takes
+        // commitA/commitB FROM THE DEVICE - recheck() and digestFromProof()
+        // both - so a wrong derivation is invisible to every local check and
+        // visible to the pool, which recomputes it from the root the proof
+        // opens. Two blake3 blocks on the host, once per win.
+        uint8_t hostCommitA[32], hostCommitB[32];
+        commitments(aProof.root, btProof.root, jobKey_, shape_.m, shape_.n,
+                    cert_ >= 3, hostCommitA, hostCommitB);
+        if (memcmp(hostCommitA, commitA, 32) != 0 ||
+            memcmp(hostCommitB, commitB, 32) != 0) {
+            fprintf(stderr,
+                    "[pearl-pow] the device's commitments disagree with the "
+                    "host's over the same Merkle roots - this proof is bound to "
+                    "a key the pool will not derive, so it is not submitted. "
+                    "This is a GPU-side defect, not a pool problem.\n");
+            return true;
+        }
+
+        // The last thing that can still be wrong is the proof itself. recheck()
+        // agreed with the device because it was handed the device's own
+        // buffers; this reads back only what was serialised, which is what the
+        // pool reconstructs from. If they disagree the proof does not describe
+        // the tile that won, and submitting it wastes a share and earns
+        // "hash does not meet difficulty target".
+        U256 proofDigest;
+        if (!digestFromProof(aProof, tRow, btProof, tCol, commitA, commitB,
+                             shape_.m, shape_.n, kK, kRank, kTileSide,
+                             &proofDigest)) {
+            fprintf(stderr,
+                    "[pearl-pow] the proof does not open the rows this tile "
+                    "needs - not submitted\n");
+            return true;
+        }
+        if (memcmp(proofDigest.v, win.digest.v, sizeof(proofDigest.v)) != 0) {
+            fprintf(stderr,
+                    "[pearl-pow] proof digest disagrees with the mined digest "
+                    "at tile (%u,%u) - not submitted\n",
+                    tRow, tCol);
+            return true;
+        }
+
         Solution sol;
         sol.nonce = nonce;
         for (int i = 0; i < 4; i++)
@@ -1092,7 +1209,7 @@ class PearlPow : public Algorithm {
     bool recheck(const std::vector<int8_t> &A, const std::vector<int8_t> &Bt,
                  const uint8_t commitA[32], const uint8_t commitB[32],
                  uint32_t tRow, uint32_t tCol,
-                 uint32_t *trOut = nullptr) const {
+                 uint32_t *trOut = nullptr, U256 *digestOut = nullptr) const {
         Noise noise;
         noise.generate(commitA, commitB, shape_.m, shape_.n, kK, kRank);
 
@@ -1124,7 +1241,9 @@ class PearlPow : public Algorithm {
             for (uint32_t w = 0; w < kTranscriptWords; w++) trOut[w] = transcript[w];
         uint8_t d[32];
         powDigest(transcript, commitA, d);
-        return U256::fromBytesLE(d).le(bound_);
+        const U256 digest = U256::fromBytesLE(d);
+        if (digestOut) *digestOut = digest;
+        return digest.le(bound_);
     }
 
     /** Chunk CVs, then as many tree levels per launch as a block can hold. */
@@ -1160,6 +1279,7 @@ class PearlPow : public Algorithm {
     bool allocated_ = false;
     bool haveJob_ = false;
     uint8_t header_[76] = {};
+    uint64_t target_[4] = {};
     int cert_ = 3;
     MiningConfig cfg_;
     U256 bound_;

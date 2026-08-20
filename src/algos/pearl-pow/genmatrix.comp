@@ -1,0 +1,57 @@
+// Pearl matrix generation: A and B from their seeds.
+//
+// Mirrors genMatrix in prepare.cuh and fillMatrix in job.h, which must all
+// three agree byte for byte - the matrices ARE the nonce, so a divergence here
+// is not a slow miner, it is a miner whose every share is rejected.
+//
+// One invocation produces eight bytes from one splitmix draw, exactly as the
+// CUDA does, so the mapping from invocation to output is identical and there
+// is no ordering to get wrong.
+//
+// The output buffer is uint rather than int8_t. Eight bytes is two words, and
+// on a little-endian device packing them here costs two stores where a
+// byte-addressed buffer would cost eight. Same reason blake3's input is uint.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer Out { uint v[]; } outbuf;
+
+layout(push_constant) uniform Push {
+    uint64_t seed;
+    uint     count;      // bytes to produce
+} pc;
+
+uint64_t splitmix(uint64_t z) {
+    z += 0x9E3779B97F4A7C15UL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+    return z ^ (z >> 31);
+}
+
+void main() {
+    const uint group = gl_GlobalInvocationID.x;
+    if (group * 8u >= pc.count) return;
+
+    const uint64_t v = splitmix(pc.seed + uint64_t(group));
+
+    // (int)((v >> 8i) & 0x7F) - 64, stored as a signed byte. The mask is 0x7F
+    // and not 0xFF: the value lands in [-64, 63] so that adding the noise
+    // later cannot overflow int8, which the chain checks on its side too.
+    uint lo = 0u, hi = 0u;
+    for (int i = 0; i < 4; i++) {
+        const uint b = uint((int(uint(v >> (8 * i)) & 0x7Fu) - 64) & 0xFF);
+        lo |= b << (8 * i);
+    }
+    for (int i = 4; i < 8; i++) {
+        const uint b = uint((int(uint(v >> (8 * i)) & 0x7Fu) - 64) & 0xFF);
+        hi |= b << (8 * (i - 4));
+    }
+
+    outbuf.v[group * 2u] = lo;
+    outbuf.v[group * 2u + 1u] = hi;
+}

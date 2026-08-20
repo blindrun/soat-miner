@@ -1,5 +1,6 @@
 @echo off
-REM Ergo -> HeroMiners. Edit WALLET below, then double-click.
+REM Ergo -> HeroMiners. Source: https://ergo.herominers.com
+REM Edit WALLET, then double-click. Plain Stratum V1/TCP (no TLS).
 cd /d "%~dp0"
 set WALLET=9YOUR_ERGO_ADDRESS_HERE
 set WORKER=%COMPUTERNAME%

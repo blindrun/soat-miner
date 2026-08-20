@@ -50,6 +50,7 @@
 #include <string>
 
 #include "algo.h"
+#include "json_lite.h"   // jsonRawValue: read the reply field, not its punctuation
 #include "http.h"
 #include "platform.h"
 #include "run.h"
@@ -85,6 +86,53 @@ inline bool unpackPearlExtra(const std::string &extra, uint8_t header[76],
     if (!hexToBytes(extra.substr(0, 152), header, 76)) return false;
     *certVersion = atoi(extra.c_str() + colon + 1);
     return *certVersion > 0;
+}
+
+/** Did the gateway take this proof, and if not, why.
+ *
+ * Read the fields, and require an explicit success. This used to
+ * search for the bytes `"error": null` and `"error":null` and fell
+ * through to `return true` otherwise, which failed in BOTH directions:
+ *
+ *   FALSE REJECT - it knew exactly two spellings of null out of the
+ *   infinitely many conforming ones. `"error" : null`, two spaces, or
+ *   a newline after the colon each read as a failure, so a submitted
+ *   proof was reported rejected and hostRejected went up.
+ *
+ *   FALSE ACCEPT, and worse - the guard needed the literal "error" to
+ *   be PRESENT before it would consider the response a failure at all.
+ *   Any rejection not using an `error` key (`{"result":{"status":
+ *   "rejected"}}`, a bare message, an HTTP-level failure body) fell
+ *   through to `return true` and the share was counted ACCEPTED. A
+ *   gateway refusing everything read identically to one accepting
+ *   everything.
+ *
+ * The documented success is {"jsonrpc":"2.0","result":"submitted",...},
+ * so a missing or null result is now a failure rather than a silence
+ * we treat as consent.
+ *
+ * STILL OPEN, and deliberately not guessed at: a rejection carried INSIDE a
+ * non-null result - something like {"result":{"status":"rejected"}} - would
+ * still read as an accept. That example is HYPOTHETICAL. It was raised in
+ * review as an illustration, confirmed on asking to be invented rather than
+ * observed, and appears in neither pearl-gateway's source nor any captured
+ * response. It stays a note precisely because coding against a schema nobody
+ * has seen is a different bug wearing a fix's clothes. Confirm against a live
+ * gateway before adding a rule for it.
+ */
+inline bool pearlGatewaySubmitAccepted(const std::string &resp, std::string *err) {
+    std::string e;
+    if (jsonRawValue(resp, "error", &e) && e != "null" && !e.empty()) {
+        *err = resp;
+        return false;
+    }
+    std::string result;
+    if (!jsonRawValue(resp, "result", &result) || result.empty() ||
+        result == "null" || result == "false") {
+        *err = "gateway answered without a result: " + resp;
+        return false;
+    }
+    return true;
 }
 
 class PearlGatewaySource : public JobSource {
@@ -152,12 +200,7 @@ class PearlGatewaySource : public JobSource {
             *err = "gateway did not answer";
             return false;
         }
-        if (resp.find("\"error\"") != std::string::npos &&
-            resp.find("\"error\": null") == std::string::npos &&
-            resp.find("\"error\":null") == std::string::npos) {
-            *err = resp;
-            return false;
-        }
+        if (!pearlGatewaySubmitAccepted(resp, err)) return false;
         return true;
     }
 

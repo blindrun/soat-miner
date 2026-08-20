@@ -1,0 +1,64 @@
+// chunkCvs: one chaining value per 1024-byte chunk. The twin of the kernel of
+// the same name in src/algos/pearl-pow/prepare.cuh.
+//
+// One invocation per chunk, sixteen compressions each. No shared memory and no
+// barriers, so this is the straightforward one of the three - the hazards live
+// in merkle_reduce.comp.
+//
+// Only the full-chunk case, because every matrix is zero-padded to a chunk
+// boundary before it is hashed, which is the same padding the Merkle leaf size
+// implies rather than an extra step.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "blake3.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufData { uint data[]; };
+layout(std430, binding = 1) readonly buffer BufKey  { uint key[8]; };
+layout(std430, binding = 2) writeonly buffer BufCv  { uint cvs[]; };
+
+layout(push_constant) uniform Push {
+    uint chunks;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.chunks) return;   // no barrier below, so a bare return is safe
+
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = key[i];
+
+    const uint base = idx * B3_CHUNK_WORDS;
+
+    for (uint b = 0u; b < 16u; b++) {
+        uint flags = B3_KEYED_HASH;
+        if (b == 0u)  flags |= B3_CHUNK_START;
+        if (b == 15u) flags |= B3_CHUNK_END;
+
+        // Written out rather than looped. The loop form indexes m[] by the
+        // loop variable, which every compiler here unrolls - but the same
+        // pattern with a data-dependent index is the 75x trap autolykos2
+        // documents, and spelling it out means nobody has to decide which
+        // one this is.
+        const uint o = base + b * B3_BLOCK_WORDS;
+        uint m[16];
+        m[0]  = data[o     ]; m[1]  = data[o +  1]; m[2]  = data[o +  2];
+        m[3]  = data[o +  3]; m[4]  = data[o +  4]; m[5]  = data[o +  5];
+        m[6]  = data[o +  6]; m[7]  = data[o +  7]; m[8]  = data[o +  8];
+        m[9]  = data[o +  9]; m[10] = data[o + 10]; m[11] = data[o + 11];
+        m[12] = data[o + 12]; m[13] = data[o + 13]; m[14] = data[o + 14];
+        m[15] = data[o + 15];
+
+        // The chunk index is the blake3 counter. The high word is carried
+        // explicitly rather than assumed zero, as blake3.cuh does, even though
+        // the largest matrix here is 131072 chunks.
+        b3Compress(cv, m, idx, 0u, 64u, flags);
+    }
+
+    const uint out0 = idx * B3_CV_WORDS;
+    for (uint i = 0u; i < 8u; i++) cvs[out0 + i] = cv[i];
+}

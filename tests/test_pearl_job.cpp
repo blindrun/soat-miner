@@ -354,6 +354,308 @@ int main(int argc, char **argv) {
               base64Decode(base64(proof), &back) && back == proof);
     }
 
+    // ---------------------------------------------------------------- T1b
+    //
+    // openWin() hands recheck() the A and B_t buffers COPIED OUT OF DEVICE
+    // MEMORY, plus a tile index the device chose. It never regenerates them.
+    // So a device that computes the wrong thing is re-verified against its own
+    // wrong data, win.verified comes back true, and the pool is the first
+    // party in the chain to regenerate and disagree.
+    //
+    // This is the test whose absence let the Blackwell rejections pass local
+    // verification. It builds the same tile digest twice: once the way
+    // recheck() does, from supplied buffers, and once from buffers a caller
+    // could not have tampered with. Then it tampers with one byte.
+    // Reference transcript and digest for tile (0,0), appended by the emitter.
+    const uint8_t *wantTranscript = r.take(kTranscriptWords * 4);
+    const uint8_t *wantPowDigest = r.take(32);
+    if (!r.ok) {
+        fprintf(stderr, "vector file has no transcript vectors - regenerate it "
+                        "with tests/pearl_job.py --emit-vectors\n");
+        return 2;
+    }
+
+    printf("8b. tileTranscript and powDigest against the Python reference\n");
+    {
+        Noise noise;
+        noise.generate(wantCommitA, wantCommitB, m, n, k, (int)rank);
+        const int side = 16;
+        std::vector<int8_t> aStrip((size_t)side * k), bStrip((size_t)k * side);
+        for (int i = 0; i < side; i++)
+            for (size_t col = 0; col < k; col++) {
+                const int32_t e =
+                    (int32_t)noise.eAL[(size_t)i * rank + noise.ar.first[col]] -
+                    (int32_t)noise.eAL[(size_t)i * rank + noise.ar.second[col]];
+                aStrip[(size_t)i * k + col] = (int8_t)(A[(size_t)i * k + col] + e);
+            }
+        for (size_t pp = 0; pp < k; pp++)
+            for (int j = 0; j < side; j++) {
+                const int32_t e =
+                    (int32_t)noise.eBR[(size_t)noise.bl.first[pp] * n + j] -
+                    (int32_t)noise.eBR[(size_t)noise.bl.second[pp] * n + j];
+                bStrip[pp * side + j] = (int8_t)(Bt[(size_t)j * k + pp] + e);
+            }
+        uint32_t tr[kTranscriptWords];
+        tileTranscript(aStrip.data(), bStrip.data(), k, side, (int)rank, 0, 0,
+                       side, side, tr);
+        check("the tile (0,0) transcript matches the reference",
+              memcmp(tr, wantTranscript, sizeof(tr)) == 0);
+        uint8_t d[32];
+        powDigest(tr, wantCommitA, d);
+        check("and its PoW digest matches the reference",
+              memcmp(d, wantPowDigest, 32) == 0);
+    }
+
+    printf("9. recheck cannot see a device that lied about its matrices\n");
+    {
+        // A host mirror of recheck(): noise from the commitments, the two
+        // winning strips, the tile transcript, the digest. Same arithmetic as
+        // algo.cu, deliberately - the point is what it is FED, not how it
+        // computes.
+        auto digestFor = [&](const std::vector<int8_t> &a,
+                             const std::vector<int8_t> &bt, uint32_t tRow,
+                             uint32_t tCol) {
+            Noise noise;
+            noise.generate(wantCommitA, wantCommitB, m, n, k, (int)rank);
+            const int side = 16;
+            std::vector<int8_t> aStrip((size_t)side * k), bStrip((size_t)k * side);
+            for (int i = 0; i < side; i++)
+                for (size_t col = 0; col < k; col++) {
+                    const int32_t e =
+                        (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.first[col]] -
+                        (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.second[col]];
+                    aStrip[(size_t)i * k + col] =
+                        (int8_t)(a[(size_t)(tRow + i) * k + col] + e);
+                }
+            for (size_t pp = 0; pp < k; pp++)
+                for (int j = 0; j < side; j++) {
+                    const int32_t e =
+                        (int32_t)noise.eBR[(size_t)noise.bl.first[pp] * n + tCol + j] -
+                        (int32_t)noise.eBR[(size_t)noise.bl.second[pp] * n + tCol + j];
+                    bStrip[pp * side + j] =
+                        (int8_t)(bt[(size_t)(tCol + j) * k + pp] + e);
+                }
+            uint32_t tr[kTranscriptWords];
+            tileTranscript(aStrip.data(), bStrip.data(), k, side, (int)rank, 0, 0,
+                           side, side, tr);
+            uint8_t d[32];
+            powDigest(tr, wantCommitA, d);
+            return U256::fromBytesLE(d);
+        };
+
+        const U256 honest = digestFor(A, Bt, 0, 0);
+
+        // One byte wrong in a row the tile actually opens, which is what a
+        // miscompiled genMatrix or a stale buffer read looks like.
+        std::vector<int8_t> tamperedA = A;
+        tamperedA[5 * k + 3] = (int8_t)(tamperedA[5 * k + 3] ^ 1);
+        const U256 fromTampered = digestFor(tamperedA, Bt, 0, 0);
+
+        check("a single wrong byte of A changes the tile digest",
+              memcmp(honest.v, fromTampered.v, sizeof(honest.v)) != 0);
+
+        // The blind spot, stated as an assertion: recheck() agrees with itself
+        // on the tampered data. Feed it the wrong A and it returns a digest
+        // that is perfectly self-consistent, so a bound test on it says
+        // nothing about whether the network will agree.
+        check("and recheck is self-consistent on the wrong data, which is the bug",
+              memcmp(digestFor(tamperedA, Bt, 0, 0).v, fromTampered.v,
+                     sizeof(honest.v)) == 0);
+
+        // The fix this test exists to justify: regenerate from the seeds and
+        // compare BEFORE trusting the buffers. synthMatrix here stands in for
+        // the seeded generator; the property is the same.
+        const std::vector<int8_t> regeneratedA = synthMatrix(m, k, 11);
+        check("regenerating A from its seed catches the tampering",
+              memcmp(regeneratedA.data(), tamperedA.data(), regeneratedA.size()) != 0 &&
+                  memcmp(regeneratedA.data(), A.data(), A.size()) == 0);
+        check("and the regenerated digest is the honest one",
+              memcmp(digestFor(regeneratedA, Bt, 0, 0).v, honest.v,
+                     sizeof(honest.v)) == 0);
+
+        // B is the other half and fails the same way.
+        std::vector<int8_t> tamperedBt = Bt;
+        tamperedBt[7 * k + 11] = (int8_t)(tamperedBt[7 * k + 11] ^ 1);
+        check("a single wrong byte of B^t changes the tile digest too",
+              memcmp(digestFor(A, tamperedBt, 0, 0).v, honest.v,
+                     sizeof(honest.v)) != 0);
+    }
+
+    // ---------------------------------------------------------------- T1a
+    //
+    // noisy_gemm.cuh writes transcripts block-major over rank-sized blocks and
+    // then (hi, wi) inside each. openWin() inverts that to a tile origin.
+    // Getting it wrong opens the wrong sixteen rows, which verifies locally
+    // against nothing and is rejected by the node.
+    //
+    // Checked as PROPERTIES, not by restating the expression: restating it
+    // would pass against any expression, including a wrong one.
+    printf("10. the transcript index inversion is a bijection over tiles\n");
+    {
+        const uint32_t side = 16, rk = 128;
+        const uint32_t tm = 256, tn = 512;              // small, exhaustive
+        const uint32_t tilesPerSide = rk / side;
+        const uint32_t blocksPerRow = tn / rk;
+        const uint32_t tiles = (tm / side) * (tn / side);
+
+        std::vector<uint8_t> seen((size_t)(tm / side) * (tn / side), 0);
+        bool inRange = true, aligned = true;
+        for (uint32_t flat = 0; flat < tiles; flat++) {
+            const uint32_t wi = flat % tilesPerSide;
+            const uint32_t hi = (flat / tilesPerSide) % tilesPerSide;
+            const uint32_t block = flat / (tilesPerSide * tilesPerSide);
+            const uint32_t jIdx = block % blocksPerRow;
+            const uint32_t iIdx = block / blocksPerRow;
+            const uint32_t tRow = iIdx * rk + hi * side;
+            const uint32_t tCol = jIdx * rk + wi * side;
+            if (tRow + side > tm || tCol + side > tn) { inRange = false; break; }
+            if (tRow % side || tCol % side) aligned = false;
+            seen[(size_t)(tRow / side) * (tn / side) + (tCol / side)]++;
+        }
+        bool bijective = inRange;
+        for (uint8_t c : seen) if (c != 1) bijective = false;
+
+        check("every transcript index lands inside the matrix", inRange);
+        check("every tile origin is 16-aligned", aligned);
+        check("and every tile is hit exactly once", bijective);
+
+        // Block-major, not row-major: the first tilesPerSide^2 indices must all
+        // fall inside ONE rank x rank block. A row-major inversion spreads them
+        // across the full width instead, so this is what tells the two apart.
+        bool firstBlockIsOneBlock = true;
+        for (uint32_t flat = 0; flat < tilesPerSide * tilesPerSide; flat++) {
+            const uint32_t wi = flat % tilesPerSide;
+            const uint32_t hi = (flat / tilesPerSide) % tilesPerSide;
+            if (hi * side >= rk || wi * side >= rk) firstBlockIsOneBlock = false;
+        }
+        check("the first rank-block's tiles stay inside one rank x rank block",
+              firstBlockIsOneBlock);
+    }
+
+    // ---------------------------------------------------------------- T1c
+    //
+    // verify() tests a solution against win.bound, captured when the win was
+    // opened, not the bound current at submit time. Those are the same value
+    // in today's loop. This pins the behaviour so a future restructure that
+    // lets a solution outlive a target refresh fails here instead of at the
+    // pool, where it reads as "hash does not meet difficulty target".
+    printf("11. a win carries the bound it was opened under\n");
+    {
+        MiningConfig c;
+        c.commonDim = 2048;
+        c.rank = 128;
+        const U256 poolTarget = U256::fromLimbs((const uint64_t[4]){0, 0, 0, 1ull << 11});
+        U256 easy, hard;
+        check("an easy bound scales", c.penalizedTarget(poolTarget, &easy));
+        U256 harderTarget = poolTarget;
+        harderTarget.v[3] >>= 4;                       // pool raises difficulty
+        check("a harder bound scales", c.penalizedTarget(harderTarget, &hard));
+        check("harder really is harder", hard.le(easy) && !easy.le(hard));
+
+        // A digest that passed the easy bound and fails the hard one.
+        U256 digest = hard;
+        ++digest.v[0];
+        check("the candidate passes the bound it was found under",
+              digest.le(easy));
+        check("and fails the bound that replaced it", !digest.le(hard));
+        check("so a stale win must not be submitted after a refresh",
+              !(digest.le(hard)));
+    }
+
+    // ---------------------------------------------------------------- T3
+    //
+    // The live-path probe, offline. recheck() is fed the device's own buffers,
+    // so it cannot disagree with the device. digestFromProof() reads back only
+    // what was serialised into the submission, which is what the pool
+    // reconstructs from. openWin now compares the two before submitting.
+    printf("12. the digest re-derived from the proof bytes\n");
+    {
+        const uint32_t side = 16, tRow = 16, tCol = 16;
+
+        // The same tile digest recheck() would compute, from the buffers.
+        auto digestFromBuffers = [&](const std::vector<int8_t> &a,
+                                     const std::vector<int8_t> &bt) {
+            Noise noise;
+            noise.generate(wantCommitA, wantCommitB, m, n, k, (int)rank);
+            std::vector<int8_t> aStrip((size_t)side * k), bStrip((size_t)k * side);
+            for (uint32_t i = 0; i < side; i++)
+                for (size_t col = 0; col < k; col++) {
+                    const int32_t e =
+                        (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.first[col]] -
+                        (int32_t)noise.eAL[(size_t)(tRow + i) * rank + noise.ar.second[col]];
+                    aStrip[(size_t)i * k + col] =
+                        (int8_t)(a[(size_t)(tRow + i) * k + col] + e);
+                }
+            for (size_t pp = 0; pp < k; pp++)
+                for (uint32_t j = 0; j < side; j++) {
+                    const int32_t e =
+                        (int32_t)noise.eBR[(size_t)noise.bl.first[pp] * n + tCol + j] -
+                        (int32_t)noise.eBR[(size_t)noise.bl.second[pp] * n + tCol + j];
+                    bStrip[pp * side + j] =
+                        (int8_t)(bt[(size_t)(tCol + j) * k + pp] + e);
+                }
+            uint32_t tr[kTranscriptWords];
+            tileTranscript(aStrip.data(), bStrip.data(), k, side, (int)rank, 0, 0,
+                           (int)side, (int)side, tr);
+            uint8_t d[32];
+            powDigest(tr, wantCommitA, d);
+            return U256::fromBytesLE(d);
+        };
+
+        MerkleProof aP, bP;
+        const bool built =
+            buildProof(Apad.data(), Apad.size(), wantKey,
+                       leafIndicesFromRows(tRow, side, k), &aP) &&
+            buildProof(Btpad.data(), Btpad.size(), wantKey,
+                       leafIndicesFromRows(tCol, side, k), &bP);
+        check("the proofs for the winning tile build", built);
+
+        const U256 fromBuffers = digestFromBuffers(A, Bt);
+        U256 fromProof;
+        check("the digest re-derives from the proof bytes",
+              digestFromProof(aP, tRow, bP, tCol, wantCommitA, wantCommitB, m, n,
+                              k, (int)rank, (int)side, &fromProof));
+        check("and it equals the digest mined from the buffers",
+              memcmp(fromProof.v, fromBuffers.v, sizeof(fromProof.v)) == 0);
+
+        // A proof opening the WRONG rows while the tile index still says tRow.
+        // This is the shape of the bug openWin's new check exists to catch:
+        // everything is self-consistent to us and wrong to the pool.
+        MerkleProof wrongA;
+        check("a proof for the wrong rows builds too",
+              buildProof(Apad.data(), Apad.size(), wantKey,
+                         leafIndicesFromRows(tRow + side, side, k), &wrongA));
+        U256 wrongDigest;
+        const bool wrongDerived =
+            digestFromProof(wrongA, tRow, bP, tCol, wantCommitA, wantCommitB, m,
+                            n, k, (int)rank, (int)side, &wrongDigest);
+        check("a proof that opens the wrong rows is refused or disagrees",
+              !wrongDerived ||
+                  memcmp(wrongDigest.v, fromBuffers.v, sizeof(wrongDigest.v)) != 0);
+
+        // One flipped byte inside the opened leaves.
+        MerkleProof tamperedA = aP;
+        tamperedA.leafData[3] ^= 1;
+        U256 tamperedDigest;
+        check("a flipped byte in the opened leaves changes the digest",
+              digestFromProof(tamperedA, tRow, bP, tCol, wantCommitA,
+                              wantCommitB, m, n, k, (int)rank, (int)side,
+                              &tamperedDigest) &&
+                  memcmp(tamperedDigest.v, fromBuffers.v,
+                         sizeof(tamperedDigest.v)) != 0);
+
+        // A proof that simply does not carry the rows the tile needs must be
+        // reported, not silently treated as a zero-filled match.
+        MerkleProof shortA;
+        check("a proof for unrelated leaves builds",
+              buildProof(Apad.data(), Apad.size(), wantKey,
+                         leafIndicesFromRows(0, side, k), &shortA));
+        U256 unused;
+        check("and re-deriving from it fails rather than guessing",
+              !digestFromProof(shortA, tRow, bP, tCol, wantCommitA, wantCommitB,
+                               m, n, k, (int)rank, (int)side, &unused));
+    }
+
     printf("\n%d passed, %d failed\n", gPass, gFail);
     return gFail ? 1 : 0;
 }

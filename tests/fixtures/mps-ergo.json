@@ -1,0 +1,16 @@
+{
+  "time": 1700000000,
+  "data": [
+    {"id": 1, "url": "https://sigmanauts.com/mining", "hashrate": 10, "miners": 1, "fee": 1},
+    {"id": 2, "url": "https://cruxpool.com/ergo", "hashrate": 20, "miners": 2, "fee": 1},
+    {"id": 5, "url": "https://ergo.herominers.com", "hashrate": 30, "miners": 3, "fee": 0.9},
+    {"id": 6, "url": "https://woolypooly.com", "hashrate": 40, "miners": 4, "fee": 0.9},
+    {"id": 10, "url": "https://erg.2miners.com", "hashrate": 50, "miners": 5, "fee": 1},
+    {"id": 11, "url": "https://solo-erg.2miners.com", "hashrate": 60, "miners": 6, "fee": 1.5},
+    {"id": 14, "url": "https://www.666pool.com", "hashrate": 70, "miners": 7},
+    {"id": 19, "url": "https://k1pool.com/pool/erg", "hashrate": 80, "miners": 8, "fee": 1},
+    {"id": 20, "url": "https://k1pool.com/pool/ergsolo", "hashrate": 90, "miners": 9, "fee": 1},
+    {"id": 24, "url": "https://pool.kryptex.com/erg", "hashrate": 100, "miners": 10, "fee": 1},
+    {"id": 44, "url": "https://fenixpool.com/pools/mps-ergsolo", "hashrate": 110, "miners": 11, "fee": 0}
+  ]
+}

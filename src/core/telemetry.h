@@ -446,6 +446,9 @@ struct MinerStats {
     std::string gpuName, algo, source, arch, backend;
     double gpuMemGB = 0;
     double hashrate = 0, hashrateAvg = 0, datasetGB = 0;
+    /// MACs one counted unit costs, or 0 when the unit IS the hash. Pearl
+    /// counts 16x16 tiles of a matrix product; Autolykos counts hashes.
+    double macsPerUnit = 0;
     uint64_t epoch = 0, totalNonces = 0;
     uint64_t accepted = 0, rejected = 0, jobs = 0, epochs = 0;
     double uptimeSeconds = 0;
@@ -578,16 +581,60 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     const double watts = t.valid ? t.powerMilliwatts / 1000.0 : 0.0;
     const double eff = (watts > 1.0) ? s.hashrate / watts : 0.0;
 
+    // Pearl does not hash, and it is not enough to say so. Calling a million
+    // 16x16 tiles a megahash made it falsely comparable to BC3; calling them
+    // megacandidates made it comparable to nothing, including the field.
+    //
+    // hashrate.no measures Pearl in tera-MACs per second - 5080 187.8, 4080
+    // 159.3, 4070 Super 114.1 - so that is the unit, and the conversion comes
+    // from the algorithm rather than a table here:
+    //
+    //   T MAC/s = (millions of candidates/s) * MACs-per-candidate / 1e6
+    //
+    // The algorithm supplies MACs-per-candidate because only it knows the tile
+    // and the common dimension. Zero means the unit IS the hash, which is the
+    // case for every algorithm that actually hashes.
+    const bool macs = s.macsPerUnit > 0;
+    const char *rateUnit = macs ? "T MAC/s" : "MH/s";
+    const char *effUnit = macs ? "T MAC/W" : "MH/W";
+    const double shownRate = macs ? s.hashrate * s.macsPerUnit / 1e6 : s.hashrate;
+    const double shownAvg = macs ? s.hashrateAvg * s.macsPerUnit / 1e6 : s.hashrateAvg;
+    const double shownEff = (watts > 1.0) ? shownRate / watts : 0.0;
+
     if (!tty) {
+        // Three things at once, on purpose.
+        //
+        //  * `unit` and `eff_unit` carry the unit in the payload, so adding
+        //    the next algorithm never means renaming a field again.
+        //  * `rate`, `rate_avg` and `eff` are the honest names for what those
+        //    numbers are.
+        //  * `mhs`, `mhs_avg` and `eff_mh_w` stay, because things already
+        //    parse them - the GUI does - and breaking the shape silently
+        //    breaks whatever reads it. They now carry the value in the stated
+        //    unit, which is what a consumer pairing them with `unit` already
+        //    assumes. Retire them a release after the GUI reads `rate`.
+        //  * `candidates_per_s` keeps the raw counter for anything diagnosing
+        //    the miner rather than comparing it, since the T MAC/s figure is
+        //    derived and the count is what was measured.
+        char rawField[64] = "";
+        if (macs)
+            snprintf(rawField, sizeof(rawField), ",\"candidates_per_s\":%.0f",
+                     s.hashrate * 1e6);
         printf(
-            "{\"uptime_s\":%.0f,\"algo\":\"%s\",\"backend\":\"%s\",\"mhs\":%.2f,"
-            "\"mhs_avg\":%.2f,\"watts\":%.1f,\"temp_c\":%u,\"fan_pct\":%u,"
-            "\"eff_mh_w\":%.3f,\"epoch\":%llu,\"accepted\":%llu,"
-            "\"rejected\":%llu,\"nonces\":%llu}\n",
-            s.uptimeSeconds, s.algo.c_str(), s.backend.c_str(), s.hashrate,
-            s.hashrateAvg, watts, t.temperatureC, t.fanPercent, eff,
+            "{\"uptime_s\":%.0f,\"algo\":\"%s\",\"backend\":\"%s\","
+            "\"rate\":%.2f,\"rate_avg\":%.2f,\"unit\":\"%s\","
+            "\"eff\":%.3f,\"eff_unit\":\"%s\","
+            "\"mhs\":%.2f,\"mhs_avg\":%.2f,\"eff_mh_w\":%.3f,"
+            "\"watts\":%.1f,\"temp_c\":%u,\"fan_pct\":%u,"
+            "\"epoch\":%llu,\"accepted\":%llu,"
+            "\"rejected\":%llu,\"nonces\":%llu%s}\n",
+            s.uptimeSeconds, s.algo.c_str(), s.backend.c_str(),
+            shownRate, shownAvg, rateUnit, shownEff, effUnit,
+            shownRate, shownAvg, shownEff,
+            watts, t.temperatureC, t.fanPercent,
             (unsigned long long)s.epoch, (unsigned long long)s.accepted,
-            (unsigned long long)s.rejected, (unsigned long long)s.totalNonces);
+            (unsigned long long)s.rejected, (unsigned long long)s.totalNonces,
+            rawField);
         fflush(stdout);
         return;
     }
@@ -620,15 +667,6 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     // Deliberately NOT the accepted count: that already has its own line lower
     // down, and printing it twice on one screen makes the reader check whether
     // the two disagree. This says one thing - the loop is turning.
-    // Pearl does not hash. A candidate is a 16x16 tile of a matrix product, and
-    // calling a million of them a megahash invites a straight comparison with
-    // Ergo and BC3 that means nothing - Pearl's 66 MC/s and BC3's 1543 MH/s are
-    // different units, and labelling both "MH/s" makes Pearl look broken and slow.
-    // This labelling exists on algo/pearl and was missing from this tree.
-    const bool candidates = s.algo.rfind("pearl", 0) == 0;
-    const char *rateUnit = candidates ? "MC/s" : "MH/s";
-    const char *effUnit = candidates ? "MC/W" : "MH/W";
-
     static unsigned pulse = 0;
     pulse++;
     char act[64];
@@ -636,14 +674,14 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
              C_ORANGE, kPulse[pulse % kPulseFrames], C_RESET);
     printf("   " C_BOLD C_GREEN "%9.2f %s" C_RESET "   " C_DIM "avg" C_RESET
            " %7.2f   %s\033[K\n",
-           s.hashrate, rateUnit, s.hashrateAvg, act);
+           shownRate, rateUnit, shownAvg, act);
     lines++;
 
     if (t.valid) {
         printf("   %6.0f W   %s%3u C" C_RESET "   fan %3u%%   " C_DIM "eff" C_RESET
                " " C_ORANGE "%5.2f" C_RESET " %s\033[K\n",
-               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff,
-               effUnit);
+               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent,
+               shownEff, effUnit);
         lines++;
         if (t.smClockMhz || t.memClockMhz) {
             printf("   " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET

@@ -1,0 +1,70 @@
+// Adding the noise to A and to B, three ways.
+//
+// Mirrors applyNoiseA, applyNoiseB and applyNoiseBt in prepare.cuh. All three
+// compute the same element value - eL[.][first[.]] - eL[.][second[.]] added to
+// the matrix - and differ only in how they walk it:
+//
+//   A     out[idx] = A[idx]            + e(row, col)     idx = row*k + col
+//   Bt    out[idx] = Bt[idx]           + e(p, j)         idx = j*k + p
+//   B     out[idx] = Bt[j*k + p]       + e(p, j)         idx = p*n + j
+//
+// B is the one to be careful with: it READS transposed and writes k-major,
+// while Bt reads and writes the same layout. They produce the same values in
+// different arrangements, so using one for the other yields a full buffer of
+// plausible numbers in the wrong order - which the GEMM consumes silently.
+//
+// The +1/-1 pair comes from the permutation draw, where second is never equal
+// to first. If it ever were, e would be zero for that line and the noise would
+// vanish there rather than cancel to a visible zero row.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InM   { int8_t v[]; } src;
+layout(std430, binding = 1) readonly buffer InE   { int8_t v[]; } noise;
+layout(std430, binding = 2) readonly buffer InF   { uint16_t v[]; } first;
+layout(std430, binding = 3) readonly buffer InS   { uint16_t v[]; } second;
+layout(std430, binding = 4) writeonly buffer Out  { int8_t v[]; } dst;
+
+const uint MODE_A = 0u, MODE_BT = 1u, MODE_B = 2u;
+
+layout(push_constant) uniform Push {
+    uint mode;
+    uint rows;    // m for A, n for Bt and B
+    uint k;
+    uint rank;    // A only; Bt and B index eBR by n
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.rows * pc.k) return;
+
+    int e;
+    int base;
+
+    if (pc.mode == MODE_A) {
+        const uint row = idx / pc.k;
+        const uint col = idx % pc.k;
+        e = int(noise.v[row * pc.rank + uint(first.v[col])]) -
+            int(noise.v[row * pc.rank + uint(second.v[col])]);
+        base = int(src.v[idx]);
+    } else if (pc.mode == MODE_BT) {
+        const uint j = idx / pc.k;          // column of B
+        const uint p = idx % pc.k;          // which k
+        e = int(noise.v[uint(first.v[p]) * pc.rows + j]) -
+            int(noise.v[uint(second.v[p]) * pc.rows + j]);
+        base = int(src.v[idx]);
+    } else {
+        const uint p = idx / pc.rows;       // which k
+        const uint j = idx % pc.rows;       // column of B
+        e = int(noise.v[uint(first.v[p]) * pc.rows + j]) -
+            int(noise.v[uint(second.v[p]) * pc.rows + j]);
+        base = int(src.v[j * pc.k + p]);    // reads transposed
+    }
+
+    dst.v[idx] = int8_t(base + e);
+}

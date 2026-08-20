@@ -16,6 +16,40 @@
 
 namespace om {
 
+/** Quote a string for use as one JSON value.
+ *
+ * The miner deliberately has no JSON dependency, but its pool protocols still
+ * accept user-supplied labels. Keeping this here prevents a wallet, worker, or
+ * pool job id containing a quote, backslash, or newline from changing the
+ * request around it. */
+inline std::string jsonQuoted(const std::string &value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() + 2);
+    out += '"';
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out += "\\u00";
+                    out += hex[c >> 4];
+                    out += hex[c & 0xf];
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    out += '"';
+    return out;
+}
+
 struct HttpTarget {
     std::string host = "127.0.0.1";
     int port = 9053;

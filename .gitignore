@@ -21,10 +21,27 @@ soat-miner-13
 tests/test_pearl_mining_shape
 tests/measure_launch_gap
 tests/test_pearl_vk
+
+# Build dirs and compiled test binaries (never commit these)
+build120/
+scratchpad/
+scripts/__pycache__/
+tools/__pycache__/
+tests/test_pearl_pool
+tests/test_telemetry
+tests/test_pearl_job
+tests/test_pearl_prepare
 tests/test_btc_stratum
 tests/test_bc3_destination
 tests/test_sha3_algo
 tests/test_sha3_vulkan
-
-scratchpad/
-tools/__pycache__/
+# Compiler-generated dependency lists
+*.d
+tests/test_pearl_merkle_vk
+tests/test_pearl_vk
+tests/test_pearl_genmatrix_vk
+tests/test_pearl_transpose_vk
+tests/test_pearl_commitments_vk
+tests/test_pearl_noise_vk
+tests/test_pearl_apply_noise_vk
+tests/test_pearl_powscan_vk

@@ -94,6 +94,15 @@ class Algorithm {
      * free), 0 never, 1 always. Default is a no-op, so a backend that has not
      * implemented it is unaffected.
      */
+    /** Multiply-accumulates one counted work unit costs, or 0 when the unit
+     * IS the hash and no conversion applies.
+     *
+     * Autolykos counts hashes and returns 0. Pearl counts candidates, and a
+     * candidate is a 16x16 tile of a matrix product whose every element is a
+     * length-k dot product, so it costs tileSize * k MACs. Reporting the rate
+     * in TH/s means multiplying by exactly this and nothing else. */
+    virtual double macsPerUnit() const { return 0; }
+
     virtual void setPrefetch(int mode) { (void)mode; }
 
     /** True when the last prepare() was served from a prefetched buffer. */

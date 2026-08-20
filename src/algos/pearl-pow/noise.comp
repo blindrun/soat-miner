@@ -1,0 +1,108 @@
+// Pearl's two noise draws.
+//
+// Mirrors noiseUniform and noisePerm in prepare.cuh, and uniformNoise and
+// permutationIndices in job.h. One keyed blake3 block per draw in both cases,
+// so blake3.glsl does the work and this only builds the message and unpacks.
+//
+// The two differ in ONE byte of that message, and it is easy to miss: the draw
+// counter goes at offset 0 for the uniform draw and at offset 4 for the
+// permutation. That is the whole domain separation between them - same key,
+// same seed, same block otherwise. Putting it in the wrong place gives a
+// perfectly uniform-looking noise field that is the other draw's, and the GEMM
+// consumes it without complaint.
+//
+// Mode rather than two shaders because the message construction is shared and
+// only the offset and the unpacking differ. The branch is uniform across the
+// dispatch.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "blake3.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// key | seed, eight words each.
+layout(std430, binding = 0) readonly buffer In { uint v[16]; } inbuf;
+// Uniform mode: count int8 values, packed four per word.
+// Perm mode:    `first` as one uint16 per entry, packed two per word.
+layout(std430, binding = 1) writeonly buffer Out0 { uint v[]; } out0;
+// Perm mode only: `second`. Untouched in uniform mode.
+layout(std430, binding = 2) writeonly buffer Out1 { uint v[]; } out1;
+
+layout(push_constant) uniform Push {
+    uint mode;     // 0 = uniform, 1 = permutation
+    uint count;    // int8 values, or index pairs
+    uint mask;     // uniform only
+    uint shift;    // uniform only
+    uint rank;     // perm only
+} pc;
+
+const uint MODE_UNIFORM = 0u;
+
+void main() {
+    const uint draw = gl_GlobalInvocationID.x;
+    const uint per = (pc.mode == MODE_UNIFORM) ? 32u : 8u;
+    if (draw * per >= pc.count) return;
+
+    uint m[16];
+    for (int i = 0; i < 16; i++) m[i] = 0u;
+    // THE domain separation: word 0 for the uniform draw, word 1 for the
+    // permutation. Both are the same (1 + draw) little-endian u32.
+    m[pc.mode == MODE_UNIFORM ? 0 : 1] = 1u + draw;
+    for (int i = 0; i < 8; i++) m[8 + i] = inbuf.v[8 + i];   // seed
+
+    uint key[8];
+    for (int i = 0; i < 8; i++) key[i] = inbuf.v[i];
+    uint digest[8];
+    b3HashBlock64(key, m, digest);
+
+    if (pc.mode == MODE_UNIFORM) {
+        // Assemble each output word in registers and store it once. A
+        // read-modify-write is not available - the buffer is writeonly - and
+        // would be wrong anyway: it is a data race unless the invocation owns
+        // the whole word, which is exactly what makes assembling it correct.
+        //
+        // 32 bytes is eight whole words and no two invocations share one, so
+        // the only partial word is the last, whose padding the host never
+        // reads.
+        const uint base = draw * 32u;
+        for (uint w = 0u; w < 8u; w++) {
+            uint packed = 0u;
+            for (uint j = 0u; j < 4u; j++) {
+                const uint i = w * 4u + j;
+                const uint idx = base + i;
+                if (idx >= pc.count) break;
+                const uint b = (digest[i >> 2u] >> (8u * (i & 3u))) & 0xFFu;
+                const uint val = uint(int(b & pc.mask) - int(pc.shift)) & 0xFFu;
+                packed |= val << (8u * j);
+            }
+            if (base + w * 4u < pc.count) out0.v[(base >> 2u) + w] = packed;
+        }
+    } else {
+        const uint rankMask = pc.rank - 1u;
+        const uint base = draw * 8u;
+        for (uint w = 0u; w < 4u; w++) {
+            uint packedF = 0u, packedS = 0u;
+            for (uint j = 0u; j < 2u; j++) {
+                const uint idx = base + w * 2u + j;
+                if (idx >= pc.count) break;
+                const uint r = digest[w * 2u + j];
+                const uint f = r & rankMask;
+                // 64-bit multiply-high. The operand is at least 1, so second
+                // is never equal to first - which is what stops a line being
+                // all zeros instead of +1/-1.
+                const uint hi = uint((uint64_t(pc.rank - 1u) * uint64_t(r)) >> 32);
+                packedF |= f << (16u * j);
+                packedS |= (f ^ (1u + hi)) << (16u * j);
+            }
+            if (base + w * 2u < pc.count) {
+                out0.v[(base >> 1u) + w] = packedF;
+                out1.v[(base >> 1u) + w] = packedS;
+            }
+        }
+    }
+}

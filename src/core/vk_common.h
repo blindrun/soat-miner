@@ -47,6 +47,32 @@ bool vkPickPhysicalDevice(VkInstance inst, int requestedIndex,
                           VkPhysicalDevice *out);
 
 /**
+ * Does this device really support int8 cooperative matrix, and at what shape?
+ *
+ * CHECK ORDER IS LOAD BEARING, and the obvious order is wrong.
+ * vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR returns 14 configurations
+ * on an RX 6700 XT, several of them int8, and that device supports cooperative
+ * matrix not at all: VK_KHR_cooperative_matrix is absent from its extension
+ * list, the feature bit is false, and vkCreateDevice fails with
+ * VK_ERROR_FEATURE_NOT_PRESENT. The loader resolves the enumeration entry
+ * point because another device on the same box has the extension, and then
+ * answers for a device that does not.
+ *
+ * Measured 2026-08-20 on a box with three Vulkan devices, where the extension
+ * and the feature bit both belonged to llvmpipe and neither belonged to the
+ * 6700 XT.
+ *
+ * So: extension list first, then the feature bit, and only then the
+ * configuration list. Returns false unless all three agree, and fills *kOut
+ * with the K of the first sint8 x sint8 -> sint32 configuration when they do.
+ * K differs by vendor - 32 on Ada, 16 on RDNA3 - which is why it is returned
+ * rather than assumed, and why the shader takes it as a specialisation
+ * constant.
+ */
+bool vkInt8CooperativeMatrix(VkInstance inst, VkPhysicalDevice dev,
+                             uint32_t *kOut);
+
+/**
  * Each backend reports the device it opened here, so the readout belongs to
  * the backend rather than to whichever algorithm happens to be compiled in.
  */

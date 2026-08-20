@@ -317,7 +317,17 @@ int main(int argc, char **argv) {
         // the bug this catches. Checked against the host hash rather than a
         // fixed vector, which is fair here because that host hash is already
         // pinned to the blake3 library and to Pearl's Rust.
-        static const uint32_t kChunkCounts[] = {2, 4, 8, 64, 1024, 4096, 8192};
+        //
+        // The sweep used to stop at 8192, which is exactly what A needs at
+        // m=4096 - and never reached what B needs at n=65536, which is
+        // 131072. That gap hid a real defect for a week: the reduction was
+        // wrong only often enough to matter once a matrix was big enough to
+        // need hundreds of blocks, so A came out right and B came out wrong on
+        // the same card, and the only visible symptom was a pool refusing
+        // every share. Any count here must stay a power of two; the reduction
+        // requires a balanced tree.
+        static const uint32_t kChunkCounts[] = {2,    4,     8,     64,    1024,
+                                                4096, 8192,  32768, 65536, 131072};
         for (size_t c = 0; c < sizeof(kChunkCounts) / sizeof(kChunkCounts[0]); c++) {
             const uint32_t chunks = kChunkCounts[c];
             const size_t bytes = (size_t)chunks * kChunkLen;
@@ -1123,6 +1133,135 @@ int main(int argc, char **argv) {
         CHECK(cudaFree(gRoots)); CHECK(cudaFree(gCA)); CHECK(cudaFree(gCB));
         CHECK(cudaFree(gTrans));
         CHECK(cudaEventDestroy(a)); CHECK(cudaEventDestroy(b));
+    }
+
+    // powScan is the last kernel in the winning path with no fixed-vector
+    // coverage. It hashes each transcript, compares against the target, and
+    // reports the index and digest of every tile that passes. openWin builds
+    // the whole proof around what it says, so a wrong answer here is a share
+    // the pool refuses with "hash does not meet difficulty target".
+    printf("10. powScan against a host scan of the same transcripts\n");
+    {
+        const uint32_t kTiles = 4096;
+        std::vector<uint32_t> tr((size_t)kTiles * kTranscriptWords);
+        for (size_t i = 0; i < tr.size(); i++)
+            tr[i] = (uint32_t)(splitmix(0x9E3779B97F4A7C15ull ^ (uint64_t)i) >> 32);
+
+        // The key powScan is called with in algo.cu is commitment A.
+        uint8_t key[32];
+        for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i * 37 + 5);
+
+        // Host scan first, so the target can be chosen from real digests.
+        std::vector<U256> hostDigest(kTiles);
+        for (uint32_t i = 0; i < kTiles; i++) {
+            uint8_t d[32];
+            powDigest(&tr[(size_t)i * kTranscriptWords], key, d);
+            hostDigest[i] = U256::fromBytesLE(d);
+        }
+
+        uint32_t *gTr = nullptr, *gIdx = nullptr, *gDig = nullptr, *gCount = nullptr;
+        uint8_t *gKey = nullptr, *gTarget = nullptr;
+        const uint32_t kMax = 512;
+        CHECK(cudaMalloc(&gTr, tr.size() * 4));
+        CHECK(cudaMalloc(&gIdx, kMax * 4));
+        CHECK(cudaMalloc(&gDig, (size_t)kMax * 32));
+        CHECK(cudaMalloc(&gCount, 4));
+        CHECK(cudaMalloc(&gKey, 32));
+        CHECK(cudaMalloc(&gTarget, 32));
+        CHECK(cudaMemcpy(gTr, tr.data(), tr.size() * 4, cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(gKey, key, 32, cudaMemcpyHostToDevice));
+
+        auto runScan = [&](const U256 &target, std::vector<uint32_t> *idx,
+                           std::vector<U256> *dig) -> uint32_t {
+            uint8_t tb[32];
+            target.toBytesLE(tb);
+            CHECK(cudaMemcpy(gTarget, tb, 32, cudaMemcpyHostToDevice));
+            CHECK(cudaMemset(gCount, 0, 4));
+            powScan<<<(kTiles + 255) / 256, 256>>>(gTr, kTiles, gKey,
+                                                   (const uint32_t *)gTarget,
+                                                   gIdx, gDig, gCount, kMax);
+            CHECK(cudaDeviceSynchronize());
+            uint32_t n = 0;
+            CHECK(cudaMemcpy(&n, gCount, 4, cudaMemcpyDeviceToHost));
+            const uint32_t kept = n < kMax ? n : kMax;
+            idx->assign(kept, 0);
+            dig->assign(kept, U256{});
+            if (kept) {
+                CHECK(cudaMemcpy(idx->data(), gIdx, kept * 4, cudaMemcpyDeviceToHost));
+                std::vector<uint8_t> raw((size_t)kept * 32);
+                CHECK(cudaMemcpy(raw.data(), gDig, raw.size(), cudaMemcpyDeviceToHost));
+                for (uint32_t i = 0; i < kept; i++)
+                    (*dig)[i] = U256::fromBytesLE(&raw[(size_t)i * 32]);
+            }
+            return n;
+        };
+
+        // A target that lets a handful through: the 8th smallest digest.
+        std::vector<U256> sorted = hostDigest;
+        for (size_t a = 0; a < 12 && a < sorted.size(); a++)
+            for (size_t b = a + 1; b < sorted.size(); b++)
+                if (sorted[b].le(sorted[a])) std::swap(sorted[a], sorted[b]);
+        const U256 target = sorted[7];
+
+        std::vector<uint32_t> wantIdx;
+        for (uint32_t i = 0; i < kTiles; i++)
+            if (hostDigest[i].le(target)) wantIdx.push_back(i);
+
+        std::vector<uint32_t> gotIdx;
+        std::vector<U256> gotDig;
+        uint32_t n = runScan(target, &gotIdx, &gotDig);
+        check("the host scan found a workable number of hits",
+              wantIdx.size() >= 4 && wantIdx.size() <= 32,
+              std::to_string(wantIdx.size()));
+        check("powScan reports the same hit count as the host",
+              n == wantIdx.size(),
+              std::to_string(n) + " vs " + std::to_string(wantIdx.size()));
+
+        // atomicAdd hands out slots in no particular order, so compare sets.
+        std::vector<uint32_t> sortedGot = gotIdx;
+        for (size_t a = 0; a + 1 < sortedGot.size(); a++)
+            for (size_t b = a + 1; b < sortedGot.size(); b++)
+                if (sortedGot[b] < sortedGot[a]) std::swap(sortedGot[a], sortedGot[b]);
+        check("and exactly the same tile indices", sortedGot == wantIdx);
+
+        bool digestsMatch = gotIdx.size() == gotDig.size();
+        for (size_t i = 0; i < gotIdx.size() && digestsMatch; i++)
+            if (memcmp(gotDig[i].v, hostDigest[gotIdx[i]].v, 32) != 0)
+                digestsMatch = false;
+        check("every reported digest is the host's digest for that tile",
+              digestsMatch);
+
+        bool allUnderTarget = true;
+        for (const U256 &d : gotDig)
+            if (!d.le(target)) allUnderTarget = false;
+        check("and every reported digest really is at or under the target",
+              allUnderTarget);
+
+        // A zero target cannot be met, which is the mechanism
+        // SOAT_PEARL_HARD_TARGET relies on to benchmark without shares.
+        std::vector<uint32_t> zi; std::vector<U256> zd;
+        check("a zero target yields no hits", runScan(U256{}, &zi, &zd) == 0);
+
+        // An all-ones target must take every tile, which proves the comparison
+        // is not accidentally strict at the top end.
+        U256 maxT;
+        for (int i = 0; i < 4; i++) maxT.v[i] = ~0ull;
+        std::vector<uint32_t> ai; std::vector<U256> ad;
+        check("a maximum target takes every tile",
+              runScan(maxT, &ai, &ad) == kTiles);
+        check("and that overflows maxHits, which the counter still reports",
+              ai.size() == kMax);
+
+        // Equality is a win, not a loss: the bound is <=, not <.
+        std::vector<uint32_t> ei; std::vector<U256> ed;
+        const U256 exact = hostDigest[wantIdx[0]];
+        runScan(exact, &ei, &ed);
+        bool hasExact = false;
+        for (uint32_t i : ei) if (i == wantIdx[0]) hasExact = true;
+        check("a digest exactly equal to the target counts as a hit", hasExact);
+
+        CHECK(cudaFree(gTr)); CHECK(cudaFree(gIdx)); CHECK(cudaFree(gDig));
+        CHECK(cudaFree(gCount)); CHECK(cudaFree(gKey)); CHECK(cudaFree(gTarget));
     }
 
     printf("\n%d passed, %d failed\n", gPass, gFail);

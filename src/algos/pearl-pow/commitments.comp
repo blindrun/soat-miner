@@ -1,0 +1,85 @@
+// Pearl's commitment chain.
+//
+// Mirrors deriveCommitments in prepare.cuh and commitments() in job.h. One
+// invocation: it is three blake3 compressions in total, so a workgroup would
+// be 255 threads doing nothing.
+//
+// The chain is ORDERED and the order is the point. commitB binds the job key
+// to B's root; commitA binds commitB to A's root. So A's commitment transitively
+// covers B, and a miner cannot pick A after seeing which B pays. Computing them
+// in the other order, or independently, produces two valid-looking 32-byte
+// values that the network rejects.
+//
+// Layout is packed rather than five bindings, because every input here is
+// exactly 32 bytes and a descriptor set costs more than an offset does.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "blake3.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// aRoot | btRoot | jobKey | saltA | saltB, eight words each.
+layout(std430, binding = 0) readonly buffer In { uint v[40]; } inbuf;
+// commitA | commitB.
+layout(std430, binding = 1) writeonly buffer Out { uint v[16]; } outbuf;
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint salted;
+} pc;
+
+const uint OFF_A_ROOT = 0u, OFF_BT_ROOT = 8u, OFF_JOB_KEY = 16u,
+           OFF_SALT_A = 24u, OFF_SALT_B = 32u;
+
+/// root(32) || dim as u32 LE || 28 zero bytes is exactly one blake3 block.
+void bindRoot(uint off, uint dim, uint saltOff, out uint result[8]) {
+    uint m[16];
+    for (int i = 0; i < 8; i++) m[i] = inbuf.v[off + uint(i)];
+    m[8] = dim;
+    for (int i = 9; i < 16; i++) m[i] = 0u;
+
+    uint key[8];
+    for (int i = 0; i < 8; i++) key[i] = inbuf.v[saltOff + uint(i)];
+    b3HashBlock64(key, m, result);
+}
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+
+    uint a[8], b[8];
+    if (pc.salted != 0u) {
+        bindRoot(OFF_A_ROOT, pc.m, OFF_SALT_A, a);
+        bindRoot(OFF_BT_ROOT, pc.n, OFF_SALT_B, b);
+    } else {
+        for (int i = 0; i < 8; i++) {
+            a[i] = inbuf.v[OFF_A_ROOT + uint(i)];
+            b[i] = inbuf.v[OFF_BT_ROOT + uint(i)];
+        }
+    }
+
+    // commitB = blake3(jobKey || b), unkeyed.
+    uint msg[16], commitB[8];
+    for (int i = 0; i < 8; i++) {
+        msg[i] = inbuf.v[OFF_JOB_KEY + uint(i)];
+        msg[i + 8] = b[i];
+    }
+    b3HashBlock64Unkeyed(msg, commitB);
+
+    // commitA = blake3(commitB || a), unkeyed. This is the ordering.
+    uint commitA[8];
+    for (int i = 0; i < 8; i++) {
+        msg[i] = commitB[i];
+        msg[i + 8] = a[i];
+    }
+    b3HashBlock64Unkeyed(msg, commitA);
+
+    for (int i = 0; i < 8; i++) {
+        outbuf.v[i] = commitA[i];
+        outbuf.v[i + 8] = commitB[i];
+    }
+}

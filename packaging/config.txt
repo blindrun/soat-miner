@@ -17,10 +17,10 @@ ALGO=autolykos2
 
 WALLET=9YOUR_ERGO_ADDRESS_HERE
 
-# Pool to mine to. Some known Ergo pools:
-#   ergo.herominers.com:1180
-#   pool.woolypooly.com:3100
-#   ergo.2miners.com:8888
+# Pool to mine to. The reviewed, current profiles are in ergo-pools.json.
+# Ready-made Linux/Windows launchers exist for each profile as mine_ergo_*.sh
+# and mine_ergo_*.bat. Do not copy a status URL as a Stratum endpoint.
+# Default: HeroMiners (ergo.herominers.com:1180).
 POOL=ergo.herominers.com:1180
 
 # Worker name shown on the pool dashboard.

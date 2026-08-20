@@ -185,14 +185,22 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // Pearl to a pool. The pool runs the node and the prover, so this
         // needs nothing but a wallet - which is the whole point, since the
         // gateway path below requires running a Pearl node yourself.
-        if (opt.wallet.empty()) {
+        // Check the address here, not at the pool. The pool answers a wrong
+        // one with "Invalid Pearl address", which does not say that the
+        // launcher's placeholder was never edited - the single most likely
+        // reason to see it.
+        const std::string walletProblem = pearlWalletProblem(opt.wallet);
+        if (!walletProblem.empty()) {
             logLine(tty, "error",
-                    "mining Pearl to a pool needs --wallet with your PRL "
-                    "address (it starts with prl1).");
+                    opt.wallet.empty()
+                        ? "mining Pearl to a pool needs --wallet with your PRL "
+                          "address (it starts with prl1)."
+                        : "'" + opt.wallet + "' is not a Pearl payout address: " +
+                              walletProblem);
             return 1;
         }
         auto *pp = new PearlPoolSource(opt.poolHost, opt.poolPort, opt.wallet,
-                                       opt.worker);
+                                       opt.worker, opt.pearlTranscript);
         source.reset(pp);
         stats.source = source->describe();
     } else if (isBc3) {
@@ -408,7 +416,15 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     }
 
     Job job;
-    uint64_t preparedEpoch = ~0ULL;
+    // What prepare() actually depends on. The epoch alone is not enough: a
+    // Pearl pool pushes a new header every ~19 seconds with the epoch pinned
+    // at 0, so gating on the epoch left the miner hashing the FIRST job's
+    // matrices while quoting the newest job id back at the pool. The proof was
+    // valid for a header nobody had asked about any more, and the pool answered
+    // "Jackpot condition not satisfied: hash does not meet difficulty target".
+    // It looked like a Blackwell fault only because a slower card is more
+    // likely to have a rotation land between preparing and finding a share.
+    PreparedJob prepared;
     uint64_t nonceMask =
         (nonceBits >= 64) ? ~0ULL : ((1ULL << nonceBits) - 1ULL);
     uint64_t nonceCounter = ((uint64_t)time(nullptr) << 16) & nonceMask;
@@ -428,8 +444,30 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
 
     if (opt.bench) {
         job.epoch = opt.benchEpoch;
-        memset(job.msg, 0xab, 32);
+        if (isPearl) {
+            // A Pearl search needs the same 76-byte header/certificate envelope
+            // as a gateway or pool job. Bench has no network source, so make a
+            // fixed synthetic one rather than reaching search() with an empty
+            // extra and failing before it can measure anything.
+            uint8_t header[76];
+            memset(header, 0xab, sizeof(header));
+            pearl::b3::hash(nullptr, header, sizeof(header), job.msg);
+            job.extra = packPearlExtra(header, 3);
+        } else {
+            memset(job.msg, 0xab, 32);
+        }
         for (int i = 0; i < 4; i++) job.target[i] = 0;  // never hits
+        // Diagnostic only. A zero bench target means openWin is never reached,
+        // so the proof-byte recheck it now carries cannot be exercised without
+        // a pool. This makes every tile a hit so that path runs on demand.
+        // Bench still submits nothing: run.cpp skips submit in bench mode.
+        if (isPearl && getenv("SOAT_PEARL_BENCH_ALL_HIT")) {
+            job.target[0] = job.target[1] = job.target[2] = 0;
+            job.target[3] = 1ull << 44;   // 2^236, scales to 2^255 without overflow
+            logLine(tty, "info",
+                    "diagnostic: bench target set to maximum, every tile wins - "
+                    "exercising the proof recheck. Nothing is submitted.");
+        }
         job.valid = true;
     }
 
@@ -449,6 +487,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             Job fresh;
             if (!source->fetch(&fresh)) {
                 auto *st = dynamic_cast<StratumSource *>(source.get());
+                auto *pp = dynamic_cast<PearlPoolSource *>(source.get());
                 if (st && st->loginRejected()) {
                     logLine(tty, "error",
                             "pool REJECTED the login: " + st->loginError());
@@ -472,12 +511,23 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                         continue;
                     }
                 }
+                if (pp && !pp->lastError().empty()) {
+                    logLine(tty, "warn", "Pearl pool " + pp->lastError() +
+                                             " - retrying in 5s");
+                    sleepSeconds(5);
+                    continue;
+                }
                 logLine(tty, "warn", std::string("cannot reach ") +
                                          source->describe() + " - retrying in 5s");
                 sleepSeconds(5);
                 continue;
             }
-            if (memcmp(fresh.msg, job.msg, 32) != 0 || fresh.epoch != job.epoch) {
+            // Pools may refresh share difficulty without changing the block
+            // header. Target and job id must therefore participate in identity;
+            // keeping an older target can submit a now-invalid candidate.
+            if (memcmp(fresh.msg, job.msg, 32) != 0 ||
+                memcmp(fresh.target, job.target, sizeof(job.target)) != 0 ||
+                fresh.extra != job.extra || fresh.epoch != job.epoch) {
                 const bool newEpoch = fresh.epoch != job.epoch;
                 job = fresh;
                 if (!newEpoch) stats.jobs++;
@@ -485,7 +535,13 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
         if (!job.valid) { sleepSeconds(1); continue; }
 
-        if (job.epoch != preparedEpoch) {
+        // Autolykos keeps the epoch-only gate: re-preparing there rebuilds a
+        // 7.27 GB dataset, and its epoch really does track the work. Pearl
+        // re-prepares on any material change; PearlPow::prepare() caches on
+        // header, target and certificate version, so an unchanged job costs
+        // nothing.
+        const bool epochChanged = !prepared.valid || job.epoch != prepared.epoch;
+        if (shouldPrepare(isPearl, prepared, job)) {
             // Only warn about a wait when there is going to be one. Building
             // ahead makes this instant, and "please wait" followed immediately
             // by "ready in 0.00s" is just noise.
@@ -495,7 +551,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             // epoch at all, so telling someone to please wait for a 0.01 GB
             // dataset is just wrong.
             const double gb = algo->memoryBytes(job) / 1e9;
-            if (!algo->prefetchReadyFor(job) && gb >= 1.0) {
+            if (epochChanged && !algo->prefetchReadyFor(job) && gb >= 1.0) {
                 char pre[160];
                 snprintf(pre, sizeof(pre),
                          "epoch %llu - building %.2f GB dataset, please wait...",
@@ -508,6 +564,10 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                     .count();
             stats.datasetGB = algo->memoryBytes(job) / 1e9;
+            // Only the algorithm knows what one counted unit costs, and it
+            // only knows after prepare() has a job. Zero means the unit is
+            // the hash and the readout says MH/s.
+            stats.macsPerUnit = algo->macsPerUnit();
             char buf[160];
             if (stats.datasetGB >= 1.0)
                 snprintf(buf, sizeof(buf), "dataset ready in %.2fs%s - mining",
@@ -515,9 +575,9 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
             else
                 snprintf(buf, sizeof(buf), "ready in %.2fs (%.0f MB) - mining",
                          secs, stats.datasetGB * 1e3);
-            logLine(tty, "ok", buf);
-            preparedEpoch = job.epoch;
-            stats.epochs++;
+            if (epochChanged) logLine(tty, "ok", buf);
+            prepared.take(job);
+            if (epochChanged) stats.epochs++;
 
             // Say once what build-ahead decided, and why if it declined.
             const std::string note = algo->prefetchNote();

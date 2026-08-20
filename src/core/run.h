@@ -134,6 +134,9 @@ struct RunOptions {
     // 8337 is pearl-gateway's own default TCP port.
     std::string pearlHost;
     int pearlPort = 0;
+    // Test-only, credential-redacted Pearl pool protocol evidence. This is
+    // intentionally unavailable to the gateway path and never logs authorize.
+    std::string pearlTranscript;
 
     // Lithos mode. Lithos is not a coin or an algorithm: it is a decentralised
     // pool protocol whose reference client runs a local stratum server (default
@@ -147,6 +150,53 @@ struct RunOptions {
     // perfectly good Lithos setup.
     bool lithos = false;
 };
+
+/**
+ * What the last prepare() was for, and whether a new job needs another one.
+ *
+ * Kept here rather than inside the run loop so the decision is testable
+ * without a GPU. It is the whole of the fix for the Pearl pool rejections:
+ * gating on the epoch alone left the miner mining the first job's matrices
+ * for the life of the connection.
+ */
+struct PreparedJob {
+    bool valid = false;
+    uint64_t epoch = ~0ULL;
+    uint8_t msg[32] = {};
+    uint64_t target[4] = {};
+    std::string extra;
+
+    /** True when `j` is the job this prepare() was for, field by field. */
+    bool matches(const Job &j) const {
+        return valid && epoch == j.epoch &&
+               memcmp(msg, j.msg, sizeof(msg)) == 0 &&
+               memcmp(target, j.target, sizeof(target)) == 0 && extra == j.extra;
+    }
+
+    void take(const Job &j) {
+        valid = true;
+        epoch = j.epoch;
+        memcpy(msg, j.msg, sizeof(msg));
+        memcpy(target, j.target, sizeof(target));
+        extra = j.extra;
+    }
+};
+
+/**
+ * Does this job need prepare() run for it?
+ *
+ * Autolykos keeps an epoch-only gate: re-preparing rebuilds a 7.27 GB dataset,
+ * and its epoch genuinely tracks the work. Pearl re-prepares on any material
+ * change, because a pool changes the header without ever moving the epoch -
+ * `PearlPoolSource` sets `epoch = 0` on every job it builds. PearlPow::prepare()
+ * caches on header, target and certificate version, so a job that has not
+ * really changed costs nothing.
+ */
+inline bool shouldPrepare(bool isPearl, const PreparedJob &prepared,
+                          const Job &job) {
+    const bool epochChanged = !prepared.valid || job.epoch != prepared.epoch;
+    return isPearl ? !prepared.matches(job) : epochChanged;
+}
 
 /** Drives an already-constructed algorithm until *stop becomes non-zero. */
 int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,

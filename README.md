@@ -16,7 +16,7 @@ Download the release for your os.
 
 https://github.com/blindrun/soat-miner/releases
 
-Unpack it on Linux with command tar xzf soat-miner_v0.2.17_Lin64.tar.gz
+Unpack it on Linux with command tar xzf soat-miner_v0.2.18_Lin64.tar.gz
 
 On Windows just unzip it.
 
@@ -50,6 +50,34 @@ click it.
 That is it. You are mining.
 
 There is a woolypooly script in there too if you prefer that pool.
+
+### Other verified pools
+
+Every release includes an `ergo-pools.json` catalog and a matching Linux
+(`mine_ergo_*.sh`) and Windows (`mine_ergo_*.bat`) launcher for each verified
+plain Stratum V1/TCP profile. Edit the credential placeholder in the launcher;
+all of them use `--pass x` and pass the worker separately.
+
+| Pool | Launcher stem | Endpoint | Credential |
+|---|---|---|---|
+| 2Miners | `mine_ergo_2miners` | `erg.2miners.com:8888` | Ergo wallet |
+| 2Miners Solo | `mine_ergo_2miners_solo` | `solo-erg.2miners.com:9999` | Ergo wallet |
+| Cruxpool | `mine_ergo_cruxpool` | `ergo.cruxpool.com:4444` | Ergo wallet |
+| FenixPool Solo | `mine_ergo_fenixpool_solo` | `fenixpool.com:9052` | Ergo wallet |
+| HeroMiners | `mine_ergo_herominers` | `ergo.herominers.com:1180` | Ergo wallet |
+| K1Pool | `mine_ergo_k1pool` | `eu.erg.k1pool.com:3746` | K1Pool `Kr_` account |
+| K1Pool Solo | `mine_ergo_k1pool_solo` | `eu.ergsolo.k1pool.com:3748` | K1Pool `Kr_` account |
+| Kryptex | `mine_ergo_kryptex` | `erg.kryptex.network:7021` | Ergo wallet |
+| Sigmanauts | `mine_ergo_sigmanauts` | `65.108.57.232:3052` | Ergo wallet |
+| WoolyPooly | `mine_ergo_woolypooly` | `pool.woolypooly.com:3100` | Ergo wallet |
+
+The source URL for every endpoint is recorded beside its profile. The developer
+refresh command, `python3 scripts/refresh_ergo_pools.py`, updates only
+`ergo-pool-status.json` from MiningPoolStats. It does **not** change a launcher
+endpoint: that needs a review against the pool's own setup page. This avoids an
+aggregator update silently redirecting a mining configuration. Run
+`make test-ergo-pools` to validate the catalog and generated launchers without
+starting a miner, contacting a pool, or using a GPU.
 
 First start takes about 15 seconds. It builds the 7.27GB dataset before it
 hashes anything. That is normal and it is not frozen.
@@ -356,8 +384,8 @@ one your GPU solved and every share dies as "low difficulty".
 
 Mines Pearl on NVIDIA. CUDA only. There is no Vulkan backend for it yet.
 
-Call this testing. It mines and the shares get accepted, but it has only run on
-Ada and Blackwell cards so far. See below if you have an Ampere or a Turing.
+**Pearl7 is withdrawn after a pool rejected a controlled share. Do not use a
+normal Pearl launcher until Control approves a corrected release.**
 
 This is the part most people want.
 
@@ -368,9 +396,92 @@ Run it with command ./mine_pearl_herominers.sh
 
 That is everything. You do not need a node and you do not need a gateway.
 
-If you would rather type it out, it is command ./soat-miner --algo pearl-pow --pool pearl.herominers.com:1200 --wallet prl1yourwalletgoeshere
+If you would rather type it out, it is command ./soat-miner --algo pearl-pow --pool pearl.herominers.com:1200 --wallet prl1yourwalletgoeshere --worker rig1
 
-The pool is at pearl.herominers.com:1200 and takes no fee.
+The pool is at pearl.herominers.com:1200 and takes no fee. `--worker` is
+optional. Pool mode needs `--wallet`; it takes precedence over Pearl's default
+local gateway, so do not remove `--pool` just because the startup banner also
+mentions the gateway default.
+
+### The other Pearl pools
+
+There is a launcher for each pool below. They work the same way: edit WALLET,
+run it. The withdrawal notice above covers all of them equally.
+
+Every endpoint here was connected to and made to authorize, and the job it
+pushed was checked field by field against what this miner's own notify parser
+requires. Pools that authorize but push something we cannot read are listed
+underneath, so nobody re-tests them by accident.
+
+| launcher | endpoint | fee | payout | share difficulty on connect |
+| --- | --- | --- | --- | --- |
+| `mine_pearl_suprnova.sh` | prl.suprnova.cc:3373 | 0% (promo) | PPLNS | 244, vardiff |
+| `mine_pearl_alphapool.sh` | us2.alphapool.tech:5571 | 0% | PPLNS | 50000 |
+| `mine_pearl_rabbitminer.sh` | nl.rabbitminer.cc:1902 | 1% | PROP | 232827 |
+| `mine_pearl_baikalmine.sh` | pearl-eu.baikalmine.com:2010 | 0.5% | PPLNS | 262144 |
+| `mine_pearl_luckypool.sh` | pearl-us-east.luckypool.io:3360 | 1% | PROP | 888888 |
+| `mine_pearl_k1pool_solo.sh` | us.pearlsolo.k1pool.com:3362 | 1% | SOLO | 1310720 |
+| `mine_pearl_k1pool.sh` | us.pearl.k1pool.com:3360 | 0% | PPLNS | 1966080 |
+| `mine_pearl_jetskipool.sh` | pearlski.jetskipool.ai:6970 | 1% | PROP | 2000000 |
+| `mine_pearl_kryptex.sh` | prl.kryptex.network:7048 | 1% | PROP / SOLO | 2097120 |
+| `mine_pearl_herominers.sh` | pearl.herominers.com:1200 | 0% | PROP / SOLO | 2097152 |
+| `mine_pearl_mkpool_solo.sh` | pearl.mkpool.com:3411 | 2% | SOLO | 2097184 |
+
+The difficulty column is the real reason to read this table rather than pick by
+fee. HeroMiners hands out a fixed 2097152 and negotiates nothing, so a slow card
+can mine for hours before it has one share to look at. Suprnova opened at 244 on
+its vardiff port and lower still on its fixed ones - 1.22 on :3370 - and
+AlphaPool opened at 50000. On a card that cannot reach HeroMiners' bound in
+reasonable time, those are the pools that will actually produce a share to test
+against. Each launcher's header records the alternate ports and regions.
+
+Two things about difficulty that cost time to work out:
+
+* The `target` in `mining.notify` is the truth. Pools label difficulty in their
+  own units - Suprnova's job id says 4000000 where its target decodes to 244,
+  a factor of 16384 - and the miner mines the target, not the label.
+* Nothing here is negotiable from the miner's side yet. RabbitMiner and
+  AlphaPool both accept a static difficulty as `d=VALUE` in the password field,
+  but the Pearl login path always sends `pass "x"` (`pearlPoolAuthorizeRequest`
+  defaults it and `run.cpp` never passes `opt.password` through), so `--pass`
+  does nothing on Pearl. Wiring it through is a small change and would make
+  those two pools tunable.
+
+Pools deliberately without a launcher, and why:
+
+| pool | what happened |
+| --- | --- |
+| pearlhash.xyz | Second largest by hashrate, and not this protocol. Its own instructions are `./pearl-miner --host pool.pearlhash.xyz:9000`; the port accepts TCP and then closes on our JSON authorize, on a plain, subscribe-first and array-login attempt alike. |
+| 2miners (prl:1818, solo-prl:1919) | Authorizes, then pushes a notify with no `cert_version` field at all. The proof encoder has explicit V1/V2/V3 paths and guessing one builds a cryptographically different proof, so the parser refuses the job. |
+| himpool (1480-1485) | Same: authorizes, no `cert_version`. |
+| coin-miners.info:9337 | Same: authorizes, no `cert_version`. |
+| linkrra.com:5567 | Same: authorizes, no `cert_version`. |
+| pearlvolt.run:4141 | Header is 160 hex characters, an 80-byte header. Pearl's is 76. |
+| grandpool.io:8070 | Agent whitelist. `soat-miner` gets `{"code":24,"msg":"miner agent not allowed"}`; `SRBMiner-MULTI/3.5.3` and `peakminer` are let straight in. Its notify shape looks right, so this pool is one hardcoded string away from working. |
+| alphapool :5566 and :5573 | Open with a `pearl.challenge` proof-of-work handshake before login. Only their :5571 is plain stratum. |
+| prlforge.com:3333/:3334 | Parses, but announces `"type":"v2"` and `cert_version: 2` while every other live pool is on 3, with no blocks recorded. Not shipped rather than ship a launcher that may mine unusable certificates. |
+| pullsignal.co:3360 | Authorizes and then sends no job at all inside 12 seconds. |
+| pearlfortune.org:443 | Closes the connection without answering. |
+| mkpool :3413 | Advertised beside the working :3411, closes without answering. |
+| akoyapool, tw-pool, kriptokyng, 1miner, nushypool, woolypooly, rplant, h9, f2pool, c3pool, meta2miner, pearlpool.cloud | No stratum endpoint published anywhere findable, and all report zero or no hashrate for Pearl. Not probed, so not shipped. |
+
+### Pearl8 diagnostic capture (Control only)
+
+This test-only build adds `--pearl-transcript FILE`. It records newline JSON
+metadata for `mining.notify` (job id, target and certificate version), the
+submit job id plus a BLAKE3 fingerprint/size of the proof, and the matching
+pool reply. It never records `mining.authorize`, wallet addresses, worker
+names, raw headers, or proof bytes; any PRL address echoed in a pool error is
+redacted.
+
+When Control explicitly authorizes one diagnostic run, add the following to
+the existing Pearl launcher invocation and stop immediately after the first
+reply:
+
+`--pearl-transcript pearl8-control.jsonl`
+
+Do not edit endpoint, wallet, node, gateway, or firewall settings. Give the
+resulting local transcript only to Control; do not publish it.
 
 ## Pearl to your own node
 
@@ -386,7 +497,9 @@ https://github.com/pearl-research-labs/pearl
 
 Then start the miner with command ./soat-miner --algo pearl-pow --gateway 127.0.0.1:8455
 
-No wallet flag on that one. The gateway holds the address.
+No wallet flag on that one. The gateway holds the address. Omitting `--gateway`
+uses `127.0.0.1:8337`, the gateway's normal default; specify `HOST[:PORT]` to
+use a different endpoint.
 
 An 8GB card is enough. A 16GB card lets it pick a wider shape and go a bit faster.
 

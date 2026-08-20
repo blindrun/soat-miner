@@ -1,0 +1,147 @@
+// reduceTree: reduce `per` chaining values to one, per workgroup. The twin of
+// the kernel of the same name in src/algos/pearl-pow/prepare.cuh.
+//
+// Doing several tree levels inside one dispatch rather than one level per
+// dispatch is worth caring about: a 4096x2048 matrix is 8192 chunks, so the
+// naive way is thirteen dispatches per matrix per attempt and the dispatches
+// alone would cost more than the hashing.
+//
+// Correct only for a balanced tree, which is why the chunk count is required
+// to be a power of two - see the header comment in prepare.cuh.
+//
+// ===================================================================
+// THE RACE THIS KERNEL EXISTS TO NOT REPEAT
+// ===================================================================
+//
+// Thread t consumes slots 2t and 2t+1 and produces slot t, so slot s < half is
+// read by thread s/2 and written by thread s IN THE SAME LEVEL. One barrier
+// per level is not enough. Inside a warp or a wave, lockstep load-then-store
+// hides it; across them nothing orders it, and thread 100 can overwrite slot
+// 100 before thread 50 has read it.
+//
+// In CUDA that bug survived on Ada and failed on Blackwell, and it scaled with
+// block count - so B (131072 chunks, 256 blocks) came out wrong while A (8192
+// chunks, 16 blocks) came out right on the same card. Nothing downstream could
+// see it: recheck() and digestFromProof() both take the commitments from the
+// device, so a corrupted root made the noise, the transcript and the digest
+// all wrong together and all agreeing. The pool recomputes the root from the
+// leaves the proof opens, so the only symptom was every share refused for
+// difficulty.
+//
+// The fix is read, barrier, write, barrier. Four things make that fix
+// different in GLSL from the CUDA it is ported from:
+//
+// 1. barrier() here IS a shared-memory barrier, checked rather than assumed.
+//    glslang emits `OpControlBarrier %uint_2 %uint_2 %uint_264` - scope
+//    Workgroup, memory scope Workgroup, semantics WorkgroupMemory (0x100) |
+//    AcquireRelease (0x8). That is exactly __syncthreads(), so the CUDA's
+//    barrier placement transfers unchanged and no memoryBarrierShared() is
+//    needed. If it had been Invocation/None, correct-looking placement would
+//    still have raced.
+//
+// 2. Every invocation must reach every barrier. The CUDA has an
+//    `if (base >= count) return;` which is legal only because base comes from
+//    blockIdx. There is deliberately no such return here: the host dispatches
+//    exactly count/per workgroups, so the question cannot arise, and a future
+//    edit cannot reintroduce it by reaching for gl_GlobalInvocationID.
+//    Both barriers below are OUTSIDE the `if (doWork)` for the same reason.
+//    The loop bound is a push constant, so the trip count is uniform too.
+//
+// 3. Shared memory cannot be sized at dispatch time. CUDA's extern __shared__
+//    has no GLSL spelling. A specialisation constant would work but costs one
+//    pipeline per width - nine of them. This takes a fixed 512-CV array and
+//    passes the active width as a push constant instead: one pipeline, and the
+//    invocations past `half` still execute every barrier, which is what keeps
+//    point 2 true. 16 KB clears the tighter of the two limits - the 4090
+//    reports maxComputeSharedMemorySize 49152, not the 65536 the 7900 XT does.
+//
+// 4. NO SUBGROUP OPERATIONS, and that is a correctness requirement rather than
+//    caution. RDNA3's subgroup is 64 against Ada's 32, so a WIDER subgroup is a
+//    WIDER hiding place - the 7900 XT is the more likely of the two acceptance
+//    cards to pass a wrong shader, not the safety net. Worse, RADV picks wave32
+//    or wave64 per compute shader at its own discretion and NVIDIA reports
+//    subgroupSizeControl true, so a shader whose correctness depends on
+//    subgroup width is non-deterministic across driver versions on the same
+//    card. A subgroupShuffle fast path for the bottom levels would also sit
+//    inside `lid < half`, which is divergent control flow, where subgroup ops
+//    are undefined anyway.
+//
+// There is a fifth hazard of the same shape one level up, and it is NOT in
+// this file: the host driver ping-pongs its two scratch buffers, so level L+1
+// writes the buffer level L read. CUDA stream ordering handles that for free;
+// Vulkan needs a pipeline barrier between every dispatch covering SHADER_READ
+// on the source side, not just SHADER_WRITE. See test_pearl_merkle_vk.cpp.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "blake3.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint MAX_PER = 512u;          // == 2 * local_size_x
+
+layout(std430, binding = 0) readonly  buffer BufIn  { uint inCvs[]; };
+layout(std430, binding = 1) readonly  buffer BufKey { uint key[8]; };
+layout(std430, binding = 2) writeonly buffer BufOut { uint outCvs[]; };
+
+layout(push_constant) uniform Push {
+    // Chaining values consumed per workgroup. A power of two, 2..MAX_PER.
+    // The host owns that invariant, the same way it owns the shared-memory
+    // size in the CUDA. A larger value would run off the end of sReduce, and
+    // shared memory gets no robustBufferAccess.
+    uint per;
+} pc;
+
+shared uint sReduce[MAX_PER * B3_CV_WORDS];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint per = pc.per;
+    const uint base = gl_WorkGroupID.x * per;
+
+    uint k[8];
+    for (int j = 0; j < 8; j++) k[j] = key[j];
+
+    // Each slot is one 8-word chaining value. Two iterations at per == 512,
+    // one at per <= 256, none of it divergent by workgroup.
+    for (uint i = lid; i < per; i += gl_WorkGroupSize.x) {
+        const uint src = (base + i) * B3_CV_WORDS;
+        const uint dst = i * B3_CV_WORDS;
+        for (uint j = 0u; j < 8u; j++) sReduce[dst + j] = inCvs[src + j];
+    }
+    barrier();
+
+    for (uint n = per; n > 1u; n >>= 1) {
+        const uint half_ = n >> 1;
+        const bool doWork = lid < half_;   // not `active`: reserved word in GLSL
+
+        // Read the whole level into registers...
+        uint p[8];
+        if (doWork) {
+            uint l[8], r[8];
+            const uint lo = (lid * 2u) * B3_CV_WORDS;
+            const uint ro = (lid * 2u + 1u) * B3_CV_WORDS;
+            for (uint j = 0u; j < 8u; j++) {
+                l[j] = sReduce[lo + j];
+                r[j] = sReduce[ro + j];
+            }
+            b3ParentCv(k, l, r, false, p);
+        }
+
+        barrier();   // ...every read of this level has happened...
+
+        if (doWork) {
+            const uint o = lid * B3_CV_WORDS;
+            for (uint j = 0u; j < 8u; j++) sReduce[o + j] = p[j];
+        }
+
+        barrier();   // ...and every write is visible to the next level.
+    }
+
+    if (lid == 0u) {
+        const uint o = gl_WorkGroupID.x * B3_CV_WORDS;
+        for (uint j = 0u; j < 8u; j++) outCvs[o + j] = sReduce[j];
+    }
+}

@@ -9,6 +9,8 @@ WHAT IS IN HERE
   vcruntime140_1.dll    "
   soat-miner.bat      launcher, reads config.txt, picks the backend for you
   mine_ergo_*.bat     ready-made pool / solo scripts - edit WALLET and run
+  ergo-pools.json     reviewed pool endpoints and their source URLs
+
   mine_pearl_*.bat    Pearl pool script - edit WALLET and run (CUDA only)
   mine_bc3_*.bat      Bitcoin III pool scripts - edit WALLET and run.
                       One per pool, so you are not stuck with ours:
@@ -66,6 +68,41 @@ QUICK START
   1. Double-click benchmark.bat to check it sees your GPU.
   2. Open mine_ergo_herominers.bat in Notepad, set WALLET to your Ergo address.
   3. Double-click it.
+
+For another reviewed conventional pool, use the matching `mine_ergo_*.bat`
+launcher. `ergo-pools.json` is the source of truth; its K1Pool launchers use a
+K1Pool `Kr_` account instead of an Ergo wallet. `ergo-pool-status.json` is a
+read-only MiningPoolStats snapshot, not a list of Stratum addresses.
+
+PEARL
+  Set WALLET in a mine_pearl_*.bat to a PEARL address - it starts prl1 and is
+  about 63 characters. An Ergo address cannot be paid by a Pearl pool.
+
+  These call soat-miner.exe directly instead of going through soat-miner.bat,
+  and that is deliberate: Pearl is CUDA only, and soat-miner.bat would send a
+  50-series card to the Vulkan binary, which has no pearl-pow in it. So Pearl
+  needs an NVIDIA card and soat-miner.exe present.
+
+  There is one launcher per pool. Each file's header carries that pool's fee,
+  payout scheme, alternate regions and ports, and the share difficulty it
+  actually handed out when it was tested:
+
+    mine_pearl_suprnova.bat     prl.suprnova.cc:3373            0%    diff 244
+    mine_pearl_alphapool.bat    us2.alphapool.tech:5571         0%    diff 50000
+    mine_pearl_rabbitminer.bat  nl.rabbitminer.cc:1902          1%    diff 232827
+    mine_pearl_baikalmine.bat   pearl-eu.baikalmine.com:2010    0.5%  diff 262144
+    mine_pearl_luckypool.bat    pearl-us-east.luckypool.io:3360 1%    diff 888888
+    mine_pearl_k1pool_solo.bat  us.pearlsolo.k1pool.com:3362    1%    diff 1310720
+    mine_pearl_k1pool.bat       us.pearl.k1pool.com:3360        0%    diff 1966080
+    mine_pearl_jetskipool.bat   pearlski.jetskipool.ai:6970     1%    diff 2000000
+    mine_pearl_kryptex.bat      prl.kryptex.network:7048        1%    diff 2097120
+    mine_pearl_herominers.bat   pearl.herominers.com:1200       0%    diff 2097152
+    mine_pearl_mkpool_solo.bat  pearl.mkpool.com:3411           2%    diff 2097184
+
+  Pick by that last column, not by fee, if you are on a slower card. HeroMiners
+  hands out a fixed 2097152 and negotiates nothing, so a slow card can run for
+  hours before it has a single share to look at. Suprnova and AlphaPool start
+  thousands of times easier and will show you a share quickly.
 
 TESTED
   CUDA build, measured on real cards at the 7.27 GB dataset:

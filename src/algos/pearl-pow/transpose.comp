@@ -1,0 +1,51 @@
+// Pearl's two layout changes, in one shader.
+//
+// Mirrors transposeKtoN and transposeNoiseB in prepare.cuh. They are different
+// maps, not the same one twice: KtoN READS transposed and writes linearly,
+// NoiseB reads linearly and WRITES transposed. Getting one where the other
+// belongs produces a correctly-shaped buffer full of the wrong bytes, which
+// the GEMM will happily consume.
+//
+// One shader with a mode rather than two, because the branch is uniform across
+// the dispatch and costs nothing, while a second pipeline costs a descriptor
+// set layout, a pipeline layout, a pool and a set. Pearl needs about nine
+// pipelines; not spending one here is worth a two-way branch.
+//
+// int8_t buffers rather than the uint packing genmatrix.comp uses: a transpose
+// gathers scattered bytes, so there is no whole-word load to be had on both
+// sides at once. Pearl already requires storageBuffer8BitAccess for the GEMM.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In  { int8_t v[]; } inbuf;
+layout(std430, binding = 1) writeonly buffer Out { int8_t v[]; } outbuf;
+
+const uint MODE_K_TO_N = 0u;   // out[j*k + p] = in[p*n + j]
+const uint MODE_NOISE_B = 1u;  // out[c*n + row] = in[row*rank + c]
+
+layout(push_constant) uniform Push {
+    uint mode;
+    uint n;        // columns of B, both modes
+    uint inner;    // k for K_TO_N, rank for NOISE_B
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = pc.n * pc.inner;
+    if (idx >= total) return;
+
+    const uint a = idx / pc.inner;
+    const uint b = idx % pc.inner;
+
+    if (pc.mode == MODE_K_TO_N) {
+        // a is the column of B, b is which k.
+        outbuf.v[idx] = inbuf.v[b * pc.n + a];
+    } else {
+        // a is the row, b is the noise column.
+        outbuf.v[b * pc.n + a] = inbuf.v[idx];
+    }
+}

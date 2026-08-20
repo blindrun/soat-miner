@@ -804,6 +804,24 @@ def emit_vectors(path, m=128, n=128, k=2048, rank=128):
                 + E_BL.astype(np.int32) @ E_BR.astype(np.int32)).astype(np.int8)
 
     bound = cfg.penalized_target(2**232)
+
+    # Tile (0,0)'s transcript and its PoW digest. These two functions decide
+    # whether a share is valid, and nothing in these vectors pinned them until
+    # a mutation test showed tileTranscript could be gutted with only the
+    # tamper-sensitivity checks noticing.
+    tile_h = cfg.rows_pattern.size()
+    tile_w = cfg.cols_pattern.size()
+    ts0 = Transcript()
+    acc_block = np.zeros((rank, rank), dtype=np.int32)
+    reduction = 0
+    for p in range(0, k - k % rank, rank):
+        acc_block = acc_block + (A_noised[0:rank, p:p + rank].astype(np.int32)
+                                 @ B_noised[p:p + rank, 0:rank].astype(np.int32))
+        tile0 = acc_block[0:tile_h, 0:tile_w]
+        ts0.rotl_xor_into(reduction, xor_reduce_tile(np.ascontiguousarray(tile0)))
+        reduction += 1
+    digest0 = blake3_keyed(ca, ts0.to_bytes())
+
     with open(path, "wb") as fh:
         fh.write(VECTOR_MAGIC)
         fh.write(np.array([m, n, k, rank], dtype=np.int32).tobytes())
@@ -820,6 +838,8 @@ def emit_vectors(path, m=128, n=128, k=2048, rank=128):
         fh.write(blake3_unkeyed(B_noised.tobytes()))
         fh.write(struct.pack("<I", len(blob)))
         fh.write(blob)
+        fh.write(ts0.to_bytes())
+        fh.write(digest0)
     print(f"wrote {path}: m={m} n={n} k={k} rank={rank}, "
           f"proof {len(blob)} bytes")
 
