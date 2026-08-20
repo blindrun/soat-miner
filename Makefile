@@ -266,6 +266,9 @@ test-kawpow-device: tests/test_kawpow_device
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS) 8
 
+tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
                            src/core/stratum_kawpow.cpp \
                            src/core/stratum_kawpow.h src/core/json_lite.h \
@@ -278,7 +281,8 @@ tests/test_rvn_address: tests/test_rvn_address.cpp src/core/rvn_address.h \
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
-             tests/test_kawpow_stratum tests/test_rvn_address | dirs
+             tests/test_progpow_stock tests/test_kawpow_stratum \
+             tests/test_rvn_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
 	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
@@ -292,6 +296,13 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
 	@./tests/test_kawpow_block $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS)
+	@echo "--- progpow family: the shared layer vs stock ProgPoW's vectors ---"
+	@./tests/test_progpow_stock
+	@echo "--- progpow family: and those vectors discriminate the parameters ---"
+	@for m in "--period 3" "--period 50" "--math092" "--ops 12 20"; do \
+		printf '  %-14s ' "$$m"; \
+		./tests/test_progpow_stock $$m --expect-fail || exit 1; \
+	done
 	@echo "--- kawpow: stratum, against shapes captured from live pools ---"
 	@./tests/test_kawpow_stratum
 	@echo "--- kawpow: Ravencoin address validation ---"

@@ -33,3 +33,4 @@ tests/test_kawpow_block
 tests/test_kawpow_device
 tests/test_kawpow_stratum
 tests/test_rvn_address
+tests/test_progpow_stock
