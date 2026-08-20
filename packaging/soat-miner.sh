@@ -90,10 +90,19 @@ for a in "$@" "${ALGO:-}"; do
     kawpow)    PREFERS_CUDA_ON_NVIDIA="KawPow" ;;
   esac
 done
-if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" && -x ./soat-miner ]]; then
+if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    BACKEND=cuda
-    echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, it beats Vulkan here"
+    if [[ -x ./soat-miner ]]; then
+      BACKEND=cuda
+      echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, it beats Vulkan here"
+    else
+      # Without this the Blackwell rule below quietly picks Vulkan and the user
+      # mines at roughly half speed with nothing said. Declining to force CUDA
+      # when the binary is absent is right; doing it silently is not.
+      echo "warning: $PREFERS_CUDA_ON_NVIDIA is much faster on CUDA on this GPU,"
+      echo "         but ./soat-miner is not in this directory. Continuing on"
+      echo "         Vulkan, which is the SLOW path for it - get the full archive."
+    fi
   fi
 fi
 

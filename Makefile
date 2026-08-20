@@ -371,6 +371,8 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
 	@./tests/test_kawpow_stratum
 	@echo "--- kawpow: Ravencoin address validation ---"
 	@./tests/test_rvn_address
+	@echo "--- launcher: which backend each algorithm actually gets ---"
+	@./tests/test_launcher_backend.sh
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the

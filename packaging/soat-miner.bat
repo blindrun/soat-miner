@@ -68,14 +68,24 @@ REM does not do this. The 100 W on a 5080 is the tell: stalled, not working.
 REM
 REM So the Blackwell-prefers-Vulkan rule is right in general - it came from
 REM Autolykos being ~22%% faster there - and wrong for this one algorithm.
+REM Exact token match, not a substring of the command line. "kawpow" appears
+REM in real pool hostnames - kawpow.unmineable.com - and a substring test would
+REM force CUDA for an Autolykos user who happened to mine there, costing them
+REM the 22%% Vulkan advantage on Blackwell. The shell launcher matches on whole
+REM arguments and this now does too.
 set "WANT_KAWPOW="
 if /i "%ALGO%"=="kawpow" set "WANT_KAWPOW=1"
-echo %* | findstr /I /C:"kawpow" >nul && set "WANT_KAWPOW=1"
+for %%A in (%*) do if /i "%%~A"=="kawpow" set "WANT_KAWPOW=1"
 if not defined WANT_KAWPOW goto :not_kawpow
 REM Only when the backend is on auto. An explicit BACKEND=vulkan is the user
 REM saying they know; the shell launcher respects that and so does this.
 if /i not "%BACKEND%"=="auto" goto :not_kawpow
+REM `where nvidia-smi` only proves the utilities are installed. A machine with
+REM the card removed, or a switchable-graphics laptop on its AMD side, would
+REM pass that and then be forced onto a CUDA binary with nothing to run it.
+REM `-L` proves a GPU is actually listed, which is what the shell launcher does.
 where nvidia-smi >nul 2>&1 || goto :not_kawpow
+nvidia-smi -L >nul 2>&1 || goto :not_kawpow
 echo auto: KawPow on NVIDIA - CUDA, it beats Vulkan here
 set BACKEND=cuda
 goto :backend_done
@@ -109,9 +119,21 @@ REM confusing "not found" on an NVIDIA machine.
 if not exist "%BIN%" (
   if exist "soat-miner-vk.exe" (
     echo [!] %BIN% not present, using soat-miner-vk.exe ^(Vulkan^)
-    echo [!] On Blackwell ^(RTX 50-series^) that is the faster backend anyway.
-    echo [!] On Ada and older, CUDA is about 34%% faster - re-download the full
-    echo [!] archive, or build it from source with CMake.
+    REM This reassurance was written for Autolykos and is FALSE for KawPow.
+    REM KawPow on NVIDIA Vulkan is far slower at Ravencoin's DAG size - 4.29
+    REM MH/s against 7.38 on CUDA on a 5080, 1.68 against 11.9 on a 4090 -
+    REM which is the exact case the backend rule above exists to prevent. So
+    REM say the opposite when it applies, rather than consoling the user into
+    REM running the slow path.
+    if defined WANT_KAWPOW (
+      echo [!] WARNING: for KawPow on NVIDIA this is the SLOW backend, not a
+      echo [!] fallback. Expect roughly half the hashrate on Blackwell and far
+      echo [!] less on Ada. Get soat-miner.exe from the full archive.
+    ) else (
+      echo [!] On Blackwell ^(RTX 50-series^) that is the faster backend anyway.
+      echo [!] On Ada and older, CUDA is about 34%% faster - re-download the full
+      echo [!] archive, or build it from source with CMake.
+    )
     set BIN=soat-miner-vk.exe
   ) else (
     echo No miner binary found in this folder.
