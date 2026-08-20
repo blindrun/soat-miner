@@ -50,6 +50,36 @@ if not defined WANT_PEARL goto :not_pearl
 set BACKEND=cuda
 goto :backend_done
 :not_pearl
+
+REM KawPow forces CUDA on NVIDIA, INCLUDING Blackwell, which is the one place
+REM the rule below would otherwise send it to Vulkan.
+REM
+REM It has a working Vulkan shader and it runs well on AMD - 34.0 MH/s on a
+REM 7900 XT - so this is not a CUDA-only algorithm like Pearl. It is an
+REM NVIDIA-Vulkan-driver problem, and it is measured:
+REM
+REM   RTX 5080  Vulkan  4.29 MH/s at 100 W     CUDA  7.38 MH/s at 360 W
+REM   RTX 4090  Vulkan  1.68 MH/s at 118 W     CUDA 11.9  MH/s
+REM   RX 7900XT Vulkan 34.0  MH/s at 290 W     (no CUDA, and none needed)
+REM
+REM NVIDIA's Vulkan driver falls off a cliff once the randomly-touched working
+REM set passes roughly 3 GB, and Ravencoin's DAG is 6.11 GB and growing. RADV
+REM does not do this. The 100 W on a 5080 is the tell: stalled, not working.
+REM
+REM So the Blackwell-prefers-Vulkan rule is right in general - it came from
+REM Autolykos being ~22%% faster there - and wrong for this one algorithm.
+set "WANT_KAWPOW="
+if /i "%ALGO%"=="kawpow" set "WANT_KAWPOW=1"
+echo %* | findstr /I /C:"kawpow" >nul && set "WANT_KAWPOW=1"
+if not defined WANT_KAWPOW goto :not_kawpow
+REM Only when the backend is on auto. An explicit BACKEND=vulkan is the user
+REM saying they know; the shell launcher respects that and so does this.
+if /i not "%BACKEND%"=="auto" goto :not_kawpow
+where nvidia-smi >nul 2>&1 || goto :not_kawpow
+echo auto: KawPow on NVIDIA - CUDA, it beats Vulkan here
+set BACKEND=cuda
+goto :backend_done
+:not_kawpow
 if /i not "%BACKEND%"=="auto" goto :backend_done
 
 set BACKEND=vulkan

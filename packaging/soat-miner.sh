@@ -70,10 +70,24 @@ fi
 # carry: BC3 is faster on CUDA on NVIDIA (4090: CUDA 1543 MH/s, Vulkan 1086).
 # BC3 got this wrong the moment it stopped being CUDA-only and fell through to
 # the Autolykos rule, and an NVIDIA card quietly picked the slower backend.
+#
+# KawPow is the second one, and it is not a small margin. NVIDIA's Vulkan
+# driver falls off a cliff once the randomly-touched working set passes roughly
+# 3 GB, and Ravencoin's DAG is 6.11 GB and growing about 8 MB every five days:
+#
+#   RTX 5080   Vulkan  4.29 MH/s at 100 W    CUDA  7.38 MH/s at 360 W
+#   RTX 4090   Vulkan  1.68 MH/s at 118 W    CUDA 11.9  MH/s
+#   RX 7900XT  Vulkan 34.0  MH/s at 290 W    (AMD is unaffected and fine)
+#
+# The 100 W on a 5080 is the tell: stalled, not working. This is an NVIDIA
+# driver property, not a shader problem - the same shader beats CUDA when the
+# working set fits - so KawPow keeps its Vulkan backend for AMD and simply must
+# not be auto-selected onto it on NVIDIA, Blackwell included.
 PREFERS_CUDA_ON_NVIDIA=""
 for a in "$@" "${ALGO:-}"; do
   case "$a" in
     sha3-256t) PREFERS_CUDA_ON_NVIDIA="BC3" ;;
+    kawpow)    PREFERS_CUDA_ON_NVIDIA="KawPow" ;;
   esac
 done
 if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" && -x ./soat-miner ]]; then
