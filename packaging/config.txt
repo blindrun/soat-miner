@@ -10,9 +10,20 @@
 #   Ergo         ALGO=autolykos2  POOL=ergo.herominers.com:1180     WALLET starts with 9
 #   Pearl        ALGO=pearl-pow   POOL=pearl.herominers.com:1200    WALLET starts with prl1
 #   Bitcoin III  ALGO=sha3-256t   POOL=stratum.pythonpool.dev:3357  WALLET starts with 1, 3 or bc1
+#   Ravencoin    ALGO=kawpow      POOL=ravencoin.herominers.com:1140 WALLET starts with R
 #
 # Pearl is NVIDIA only: the Vulkan build cannot mine it. Ergo and Bitcoin III
 # run on either backend, so AMD and Intel cards can mine both.
+#
+# KawPow needs a lot of VRAM and it grows. Ravencoin's dataset is 6.11 GB today
+# and gains about 8 MB every five days, so a card under roughly 7 GB free
+# cannot mine it at all, and the miner will say so rather than start. Building
+# that dataset takes 11-27 seconds each time the epoch turns, about every five
+# days, during which hashing pauses.
+#
+# KawPow also runs far better on CUDA than on Vulkan on NVIDIA - the launcher
+# picks CUDA for you there, including on RTX 50-series where the general rule
+# prefers Vulkan. On AMD, Vulkan is the only option and works well.
 ALGO=autolykos2
 
 WALLET=9YOUR_ERGO_ADDRESS_HERE

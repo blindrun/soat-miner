@@ -181,6 +181,7 @@ if not "%POOL%"=="" (
   set "PLACEHOLDER=9YOUR_ERGO_ADDRESS_HERE"
   set "SCRIPTS=mine_ergo_*.bat"
   if /i "%ALGO%"=="pearl-pow" ( set "COIN=Pearl" & set "PLACEHOLDER=prl1YOUR_PEARL_ADDRESS_HERE" & set "SCRIPTS=mine_pearl_*.bat" )
+  if /i "%ALGO%"=="kawpow" ( set "COIN=Ravencoin" & set "PLACEHOLDER=RYOUR_RAVENCOIN_ADDRESS_HERE" & set "SCRIPTS=mine_rvn_*.bat" )
   if /i "%ALGO%"=="sha3-256t" ( set "COIN=Bitcoin III" & set "PLACEHOLDER=YOUR_BC3_ADDRESS_HERE" & set "SCRIPTS=mine_bc3_*.bat" )
   if "%WALLET%"=="!PLACEHOLDER!" (
     echo Set WALLET in config.txt to YOUR !COIN! address before pool mining.

@@ -157,13 +157,14 @@ elif [[ -n "${POOL:-}" ]]; then
   case "${ALGO:-autolykos2}" in
     pearl-pow) COIN="Pearl";       PLACEHOLDER="prl1YOUR_PEARL_ADDRESS_HERE"; SCRIPTS="mine_pearl_*.sh" ;;
     sha3-256t) COIN="Bitcoin III"; PLACEHOLDER="YOUR_BC3_ADDRESS_HERE";       SCRIPTS="mine_bc3_*.sh" ;;
+    kawpow)    COIN="Ravencoin";   PLACEHOLDER="RYOUR_RAVENCOIN_ADDRESS_HERE"; SCRIPTS="mine_rvn_*.sh" ;;
     *)         COIN="Ergo";        PLACEHOLDER="9YOUR_ERGO_ADDRESS_HERE";     SCRIPTS="mine_ergo_*.sh" ;;
   esac
   # Any coin's placeholder, not just this coin's. Switching ALGO and forgetting
   # to switch WALLET leaves the previous coin's placeholder sitting there, and
   # testing only the current one let that through to a confusing pool error.
   case "$WALLET" in
-    9YOUR_ERGO_ADDRESS_HERE|prl1YOUR_PEARL_ADDRESS_HERE|YOUR_BC3_ADDRESS_HERE) WALLET="" ;;
+    9YOUR_ERGO_ADDRESS_HERE|prl1YOUR_PEARL_ADDRESS_HERE|YOUR_BC3_ADDRESS_HERE|RYOUR_RAVENCOIN_ADDRESS_HERE) WALLET="" ;;
   esac
   if [[ -z "${WALLET:-}" || "$WALLET" == "$PLACEHOLDER" ]]; then
     echo "Set WALLET in config.txt to your $COIN address before pool mining."
