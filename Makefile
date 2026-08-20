@@ -76,11 +76,14 @@ CXXFLAGS = -O3 --std=c++17 -Isrc
 # PTX, which the driver JITs onto newer cards - that is what lets a build from
 # CUDA 12.4 (max sm_90) run on Blackwell at all. Measured: identical hashrate
 # (217.6 vs 217.5 MH/s on a 4090) and the same ~60 s build.
+PROGPOW_DEPS = src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+               src/algos/progpow/progpow.h
+
 CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu \
             src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu \
             src/algos/kawpow/algo.cu
 CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp \
-               src/core/stratum_btc.cpp
+               src/core/stratum_btc.cpp src/core/stratum_kawpow.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
             src/core/stratum.h src/core/blake2b.cuh \
             src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
@@ -90,7 +93,8 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
             src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
             src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
-            src/algos/progpow/progpow.h
+            src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
+            src/core/rvn_address.h
 
 # The Vulkan build carries one object per algorithm plus its embedded SPIR-V
 # module, and vk_common.o holds the registry and the shared device handling.
@@ -100,7 +104,7 @@ VK_SRC    = src/core/vk_common.cpp src/core/vk_registry.cpp \
             src/algos/autolykos2/algo_vk.cpp \
             src/algos/sha3-256t/algo_vk.cpp
 
-VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
+VK_OBJS   = $(BUILD)/stratum_kawpow_vk.o $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
             $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
             $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
@@ -169,6 +173,11 @@ $(BUILD)/run_vk.o: src/core/run.cpp src/core/run.h src/core/telemetry.h | dirs
 $(BUILD)/stratum_vk.o: src/core/stratum.cpp src/core/stratum.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD)/stratum_kawpow_vk.o: src/core/stratum_kawpow.cpp \
+                              src/core/stratum_kawpow.h \
+                              src/algos/kawpow/kawpow.h $(PROGPOW_DEPS) | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 $(BUILD)/stratum_btc_vk.o: src/core/stratum_btc.cpp src/core/stratum_btc.h \
                            src/core/btc_job.h src/core/sha256.h src/core/json_lite.h | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -234,8 +243,6 @@ KAWPOW_BLK_MIX    = 7b1e003a71d7bf9f81d95c0c68126f72876de28b69b175c84e4c11234ad5
 KAWPOW_BLK_HASH   = 000000000001a5a2da8a4a4e8867948fd5958d98dc61521ea5f9906bf4b9e7b5
 KAWPOW_BLK_BITS   = 1b06292b
 
-PROGPOW_DEPS = src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
-               src/algos/progpow/progpow.h
 
 tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
                         $(PROGPOW_DEPS)
@@ -259,7 +266,19 @@ test-kawpow-device: tests/test_kawpow_device
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS) 8
 
-test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block | dirs
+tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
+                           src/core/stratum_kawpow.cpp \
+                           src/core/stratum_kawpow.h src/core/json_lite.h \
+                           src/algos/kawpow/kawpow.h src/algos/kawpow/job.h \
+                           $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< src/core/stratum_kawpow.cpp -lpthread -o $@
+
+tests/test_rvn_address: tests/test_rvn_address.cpp src/core/rvn_address.h \
+                        src/core/sha256.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
+             tests/test_kawpow_stratum tests/test_rvn_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
 	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
@@ -273,6 +292,10 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block | dirs
 	@./tests/test_kawpow_block $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS)
+	@echo "--- kawpow: stratum, against shapes captured from live pools ---"
+	@./tests/test_kawpow_stratum
+	@echo "--- kawpow: Ravencoin address validation ---"
+	@./tests/test_rvn_address
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the
@@ -385,7 +408,8 @@ tests/test_sha3_algo: tests/test_sha3_algo.cu tests/sha3_vectors.h \
             src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
             src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
             src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
-            src/algos/progpow/progpow.h src/algos/sha3-256t/sha3.h \
+            src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
+            src/core/rvn_address.h src/algos/sha3-256t/sha3.h \
                       src/core/algo.h src/core/btc_job.h
 	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
 
