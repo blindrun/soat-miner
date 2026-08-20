@@ -9,9 +9,28 @@ WHAT IS IN HERE
   vcruntime140_1.dll    "
   soat-miner.bat      launcher, reads config.txt, picks the backend for you
   mine_ergo_*.bat     ready-made pool / solo scripts - edit WALLET and run
+  mine_pearl_*.bat    Pearl pool script - edit WALLET and run (CUDA only)
+  mine_bc3_*.bat      Bitcoin III pool scripts - edit WALLET and run.
+                      One per pool, so you are not stuck with ours:
+                        mine_bc3_pythonpool.bat        0%   solo
+                        mine_bc3_axehub.bat            0%   solo
+                        mine_bc3_btc3forge.bat         0.5% proportional
+                        mine_bc3_hashbay.bat           0.5% proportional
+                        mine_bc3_vexta.bat             0.5% PPLNS
+                        mine_bc3_argfamining_solo.bat  1%   solo
+                        mine_bc3_argfamining_prop.bat  1%   proportional
+                        mine_bc3_rplant.bat            1%   proportional
+                        mine_bc3_cryptoeire.bat        1%   solo
+                        mine_bc3_hashforge.bat         1%   solo
+                      pythonpool and axehub are the only 0% ones. Every
+                      endpoint above was checked by hand: it answers
+                      mining.subscribe, accepts a BC3 address and sends real
+                      work on the live chain.
   benchmark.bat       benchmark, no pool or node needed
 
 WHICH ONE RUNS
+  Pearl is CUDA only, so mine_pearl_*.bat calls soat-miner.exe directly and
+  says so if it is missing. Ergo and Bitcoin III both have Vulkan shaders, so
   soat-miner.bat picks by GPU, not by brand, and you do not choose:
     - AMD and Intel            -> Vulkan (soat-miner-vk.exe)
     - NVIDIA 50-series         -> Vulkan, ~22% faster than CUDA on Blackwell

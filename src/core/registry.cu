@@ -12,6 +12,7 @@ namespace om {
 
 Algorithm *makeAutolykos2();
 Algorithm *makePearlPow();
+Algorithm *makeSha3_256t();
 // Algorithm *makeKawpow();     // <- add here
 // Algorithm *makeEthash();
 
@@ -24,6 +25,7 @@ struct Entry {
 const Entry kRegistry[] = {
     {"autolykos2", &makeAutolykos2},
     {"pearl-pow", &makePearlPow},
+    {"sha3-256t", &makeSha3_256t},
 };
 }  // namespace
 

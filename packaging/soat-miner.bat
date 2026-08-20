@@ -19,6 +19,37 @@ REM gets parsed as an argument separator and nvidia-smi fails with
 REM "Option noheader is not recognized" - which then silently falls through to
 REM whatever the default was.
 if "%BACKEND%"=="" set BACKEND=auto
+REM Backend choice is PER ALGORITHM. The Blackwell-prefers-Vulkan rule below was
+REM measured on Autolykos and does not carry to BC3, which is faster on CUDA on
+REM NVIDIA (4090: CUDA 1543 MH/s, Vulkan 1086). Without this an NVIDIA card
+REM silently picks the slower backend for BC3.
+REM Read the algorithm from BOTH config.txt and the command line. The
+REM mine_bc3_*.bat scripts pass --algo on the command line and never set ALGO,
+REM so testing %ALGO% alone missed every launcher-driven run and NVIDIA quietly
+REM got Vulkan. Labels, not parenthesised blocks: cmd expands %VAR% when it
+REM parses a block, so a `set` inside one is invisible to the lines after it -
+REM the same trap this file already documents for LITHOS_ADDR.
+set "WANT_BC3="
+if /i "%ALGO%"=="sha3-256t" set "WANT_BC3=1"
+echo %* | findstr /I /C:"sha3-256t" >nul && set "WANT_BC3=1"
+if not defined WANT_BC3 goto :not_bc3
+if not exist "soat-miner.exe" goto :not_bc3
+where nvidia-smi >nul 2>&1 || goto :not_bc3
+echo auto: BC3 on NVIDIA - CUDA, it beats Vulkan here
+set BACKEND=cuda
+goto :backend_done
+:not_bc3
+REM Pearl is CUDA only. Without this an ALGO set in config.txt falls through
+REM to the Blackwell rule below and picks the Vulkan binary, which does not
+REM have it. Bitcoin III used to be on this list and is not any more: it has
+REM its own Vulkan shader now and runs on AMD.
+set "WANT_PEARL="
+if /i "%ALGO%"=="pearl-pow" set "WANT_PEARL=1"
+echo %* | findstr /I /C:"pearl-pow" >nul && set "WANT_PEARL=1"
+if not defined WANT_PEARL goto :not_pearl
+set BACKEND=cuda
+goto :backend_done
+:not_pearl
 if /i not "%BACKEND%"=="auto" goto :backend_done
 
 set BACKEND=vulkan
@@ -91,20 +122,35 @@ if /I "%LITHOS%"=="yes" (
 if not "%POOL%"=="" (
   REM Refuse the unedited placeholder so nobody mines to it by accident. The
   REM C++ guard catches it too, but check here so the message is clear on Windows.
-  if "%WALLET%"=="9YOUR_ERGO_ADDRESS_HERE" (
-    echo Set WALLET in config.txt to YOUR Ergo address before pool mining.
-    echo   ^(or edit WALLET in one of the mine_ergo_*.bat scripts^)
+  REM Per algorithm: the placeholder and the address shape are different for
+  REM each coin, and this used to test the Ergo one whatever you were mining.
+  if "%ALGO%"=="" set ALGO=autolykos2
+  set "COIN=Ergo"
+  set "PLACEHOLDER=9YOUR_ERGO_ADDRESS_HERE"
+  set "SCRIPTS=mine_ergo_*.bat"
+  if /i "%ALGO%"=="pearl-pow" ( set "COIN=Pearl" & set "PLACEHOLDER=prl1YOUR_PEARL_ADDRESS_HERE" & set "SCRIPTS=mine_pearl_*.bat" )
+  if /i "%ALGO%"=="sha3-256t" ( set "COIN=Bitcoin III" & set "PLACEHOLDER=YOUR_BC3_ADDRESS_HERE" & set "SCRIPTS=mine_bc3_*.bat" )
+  if "%WALLET%"=="!PLACEHOLDER!" (
+    echo Set WALLET in config.txt to YOUR !COIN! address before pool mining.
+    echo   ^(or edit WALLET in one of the !SCRIPTS! scripts^)
     pause
     goto :eof
   )
   if "%WALLET%"=="" (
-    echo Set WALLET in config.txt to your Ergo address before pool mining.
+    echo Set WALLET in config.txt to your !COIN! address before pool mining.
     pause
     goto :eof
   )
-  echo SOAT Miner -^> pool %POOL% as %WORKER% paying %WALLET% [%BACKEND%]
-  %BIN% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
+  echo SOAT Miner -^> !COIN! on %POOL% as %WORKER% paying %WALLET% [%BACKEND%]
+  %BIN% --algo %ALGO% --pool %POOL% --wallet %WALLET% --worker %WORKER% --pass %PASSWORD% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
 ) else (
   echo SOAT Miner -^> solo via node %NODE%:%NODE_PORT% [%BACKEND%]
   %BIN% --node %NODE% --port %NODE_PORT% --batch %BATCH% --interval %INTERVAL% %CACHEARG% %*
 )
+
+REM Ctrl+C is delivered to every process on this console, so cmd starts asking
+REM "Terminate batch job (Y/N)?" while the miner is still printing its shutdown.
+REM The miner flushes and clears its line first; this newline guarantees the
+REM prompt begins on a fresh row instead of halfway through a word. Answering
+REM either Y or N is safe - the miner has already stopped and put the card back.
+echo.

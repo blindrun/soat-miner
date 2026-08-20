@@ -1,0 +1,26 @@
+# Bitcoin III local-regtest template. It is documentation only: do not install,
+# start, or copy it into a running node without an approved rollout plan.
+#
+# This is the selected safest usable validation shape: disposable local regtest,
+# loopback RPC, wallet disabled, no listener, no DNS discovery, no peer
+# connections, no pool, and no mining. Confirm these option names against the
+# exact Bitcoin III daemon/version before rollout; this repository does not
+# mutate node configuration.
+
+regtest=1
+server=1
+disablewallet=1
+
+# RPC must remain loopback-only and use an owner-assigned unused port. Do not
+# place credentials/cookie paths here; Control supplies an out-of-band,
+# least-privilege chain-read-only authentication reference at rollout.
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+rpcport=<CONTROL_ASSIGNED_REGTEST_RPC_PORT>
+
+# No public or private peer traffic and no inbound P2P listener.
+listen=0
+dnsseed=0
+discover=0
+listenonion=0
+connect=0

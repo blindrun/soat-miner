@@ -50,6 +50,9 @@ jobs:
       - name: Build
         run: cmake --build build-rel
 
+      - name: Offline Bitcoin Stratum protocol gate
+        run: ctest --test-dir build-rel --output-on-failure
+
       - name: Bundle VC++ runtime and stage the package
         shell: pwsh
         run: |

@@ -3,8 +3,10 @@
 // "test these nonces".
 
 #include "run.h"
+#include "bc3_destination.h"
 #include "pearl_gateway.h"
 #include "pearl_pool.h"
+#include "stratum_btc.h"
 #include "stratum.h"
 #include <thread>
 
@@ -149,9 +151,18 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         logLine(tty, "warn",
                 "benchmark mode: measuring hashrate only. No pool, no wallet, "
                 "no shares, no payouts.");
+        // Name the script for the algorithm actually selected. This said
+        // mine_ergo_* for every algorithm, so benchmarking BC3 told you to go
+        // and mine Ergo.
+        const char *script = "mine_ergo_*";
+        if (algo && algo->name()) {
+            if (!strcmp(algo->name(), "pearl-pow")) script = "mine_pearl_*";
+            else if (!strcmp(algo->name(), "sha3-256t")) script = "mine_bc3_*";
+        }
         logLine(tty, "info",
-                "to actually mine, use a mine_ergo_* script (edit WALLET first) "
-                "or pass --pool HOST:PORT --wallet <address>");
+                std::string("to actually mine, use a ") + script +
+                    " script (edit WALLET first) or pass --pool HOST:PORT "
+                    "--wallet <address>");
     }
 
     algo->setPrefetch(opt.prefetch);
@@ -159,6 +170,11 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     // Which transport a Pearl job comes over depends on whether the user has
     // a node. Both end in the same PlainProof.
     const bool isPearl = algo && algo->name() && !strcmp(algo->name(), "pearl-pow");
+
+    // BC3 speaks Bitcoin stratum, not Ergo stratum: the pool hands out job
+    // parts and the miner assembles the header itself. Different protocol,
+    // different JobSource - see stratum_btc.h.
+    const bool isBc3 = algo && algo->name() && !strcmp(algo->name(), "sha3-256t");
 
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
@@ -179,6 +195,78 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                                        opt.worker);
         source.reset(pp);
         stats.source = source->describe();
+    } else if (isBc3) {
+        // BitcoinIII to a pool. There is no solo path yet: solo would mean
+        // getblocktemplate against a bitcoinIII node and assembling the
+        // coinbase ourselves, which is a different job again.
+        if (opt.poolHost.empty()) {
+            logLine(tty, "error",
+                    "--algo sha3-256t is pool-only for now; pass --pool "
+                    "HOST:PORT (e.g. stratum.pythonpool.dev:3357).");
+            return 1;
+        }
+        const std::string &w = opt.wallet;
+        // A pool login is a public payout address, never a recovery secret,
+        // private key, or Control-only secret reference.  Keep the acceptance
+        // rule in the side-effect-free destination schema so it is covered by
+        // the offline host test before this networking path is ever reached.
+        if (!bc3AddressShape(w)) {
+            logLine(tty, "error",
+                    w.empty() ? "no --wallet given; pool mining needs your BC3 "
+                                "payout address"
+                              : "'" + w + "' is not a usable BC3 address");
+            logLine(tty, "error",
+                    "BC3 uses a payout-address form starting with 1, 3 or bc1; "
+                    "do not pass a seed, key, or secret reference.");
+            return 1;
+        }
+        logLine(tty, "info", "payout address: " + w);
+        logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
+                                 std::to_string(opt.poolPort) + " ...");
+        auto *bs = new BitcoinStratumSource(opt.poolHost, opt.poolPort, w,
+                                            opt.worker, opt.password, opt.batch);
+        std::string err;
+        if (!bs->start(&err)) {
+            fprintf(stderr, "pool connect failed: %s\n", err.c_str());
+            delete bs;
+            return 1;
+        }
+        source.reset(bs);
+        stats.source = source->describe();
+        logLine(tty, "ok", "TCP connected, waiting for first job...");
+        bool gotJob = false;
+        for (int i = 0; i < 200; i++) {
+            Job probe;
+            if (bs->fetch(&probe)) { gotJob = true; break; }
+            if (bs->loginRejected()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (bs->loginRejected()) {
+            logLine(tty, "error",
+                    "pool REJECTED the login: " + bs->loginError());
+            logLine(tty, "error",
+                    "check --wallet is a real BC3 address and that the port is "
+                    "the pool's sha3-256t port.");
+            return 1;
+        }
+        if (!gotJob) {
+            const std::string jw = bs->takeJobWarning();
+            if (!jw.empty()) {
+                logLine(tty, "warn", jw);
+                return 1;
+            }
+            logLine(tty, "error",
+                    "connected to the pool but it sent no job in 20s. The "
+                    "socket is open, so this is not a firewall - the port may "
+                    "be for a different algorithm.");
+            return 1;
+        }
+        // A warning can be set on a job that is still perfectly mineable (a
+        // pool that forgot version bit 12, say), so surface it and carry on.
+        const std::string jw = bs->takeJobWarning();
+        if (!jw.empty()) logLine(tty, "warn", jw);
+        noncePrefix = bs->noncePrefix();
+        nonceBits = bs->nonceBitsOwned();
     } else if (!opt.pearlHost.empty()) {
         // Pearl straight to your own node, through pearl-gateway.
         auto *pg = new PearlGatewaySource(opt.pearlHost, opt.pearlPort);
@@ -479,9 +567,19 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                 // the verdict comes back on the reader thread. Only solo, which
                 // cannot report counters, can call it accepted here.
                 if (source->poolCounters(&a, &r, &p, &le)) {
-                    snprintf(buf, sizeof(buf), "share submitted   nonce=%016llx",
-                             (unsigned long long)s.nonce);
-                    logLine(tty, "info", buf);
+                    // Deliberately silent. A share per second is normal on an
+                    // easy pool target - BC3 at difficulty 0.01 submitted 537 in
+                    // one minute - and a line each buries the readout, the
+                    // rejections and the connection messages that actually need
+                    // reading. The periodic report already carries accepted,
+                    // rejected, hashrate and watts. Set SOAT_LOG_SHARES=1 to get
+                    // the per-share line back for diagnosis.
+                    static const bool logShares = getenv("SOAT_LOG_SHARES") != nullptr;
+                    if (logShares) {
+                        snprintf(buf, sizeof(buf), "share submitted   nonce=%016llx",
+                                 (unsigned long long)s.nonce);
+                        logLine(tty, "info", buf);
+                    }
                 } else {
                     stats.accepted++;
                     snprintf(buf, sizeof(buf), "SOLUTION ACCEPTED  nonce=%016llx",
@@ -525,20 +623,29 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // Surface each pool rejection once, with the pool's own words. Without
         // this a miner that is being refused every share looks identical to
         // one that is being paid for every share.
+        //
+        // Both stratum sources are handled here. BitcoinStratumSource is a
+        // JobSource, not a StratumSource, so the single cast this used to do
+        // returned null for BC3: the pool accepted 367 shares in a minute and
+        // the readout sat at "accepted 0, rejected 0" the whole time, which is
+        // the exact confusion the paragraph above exists to prevent.
         {
-            auto *st = dynamic_cast<StratumSource *>(source.get());
-            if (st) {
-                const std::string v = st->takeSubmitVerdict();
+            auto drain = [&](auto *src) {
+                if (!src) return false;
+                const std::string v = src->takeSubmitVerdict();
                 if (!v.empty())
                     logLine(tty, "error", "pool REJECTED the share: " + v);
-                const std::string jw = st->takeJobWarning();
+                const std::string jw = src->takeJobWarning();
                 if (!jw.empty()) logLine(tty, "warn", jw);
                 uint64_t a = 0, r = 0, p = 0;
                 std::string le;
-                st->poolCounters(&a, &r, &p, &le);
+                src->poolCounters(&a, &r, &p, &le);
                 stats.accepted = a;
                 stats.rejected = hostRejected + r;
-            }
+                return true;
+            };
+            if (!drain(dynamic_cast<StratumSource *>(source.get())))
+                drain(dynamic_cast<BitcoinStratumSource *>(source.get()));
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -558,8 +665,22 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         }
     }
 
-    if (tty) printf("\n");
+    // Shutdown output, ordered so it does not collide with whatever the shell
+    // draws next. Ctrl+C is delivered to every process sharing the console, so
+    // the shell starts redrawing its prompt - and cmd.exe starts asking
+    // "Terminate batch job (Y/N)?" - while this is still printing. Without a
+    // flush and a clear line break the two interleave and the prompt lands in
+    // the middle of a word.
+    //
+    // On a TTY, \r plus erase-to-end-of-line clears the partially drawn
+    // readout row first, so the last thing on screen is a whole line rather
+    // than a stump with a prompt hanging off it.
+    if (tty) {
+        printf("\r\033[K\n");
+        fflush(stdout);
+    }
     logLine(tty, "info", "stopping");
+    fflush(stdout);
     // Put the card back the way it was found.
     if (opt.memOffsetMhz != 0) gpu.applyMemOffsetMhz(0);
     algo->release();

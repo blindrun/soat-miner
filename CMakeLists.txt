@@ -119,14 +119,17 @@ set(SOAT_CUDA_SOURCES
   src/core/registry.cu
   src/algos/autolykos2/algo.cu
   src/algos/pearl-pow/algo.cu
+  src/algos/sha3-256t/algo.cu
   src/core/run.cpp
   src/core/stratum.cpp
+  src/core/stratum_btc.cpp
 )
 
 # Push the two .cpp files through nvcc, matching the Makefile's `-x cu`.
 set_source_files_properties(
   src/core/run.cpp
   src/core/stratum.cpp
+  src/core/stratum_btc.cpp
   PROPERTIES LANGUAGE CUDA
 )
 
@@ -158,3 +161,26 @@ if(WIN32)
 endif()
 
 install(TARGETS soat-miner RUNTIME DESTINATION bin)
+
+# Offline protocol gate. It uses a checked-in transcript only: no network,
+# wallet, pool, GPU, or miner process. Keep it in CTest so the Windows CUDA
+# workflow proves that its CMake build includes the BC3 client sources.
+include(CTest)
+if(BUILD_TESTING)
+  find_package(Threads REQUIRED)
+  add_executable(test-btc-stratum
+    tests/test_btc_stratum.cpp
+    src/core/stratum_btc.cpp
+  )
+  target_include_directories(test-btc-stratum PRIVATE src)
+  target_link_libraries(test-btc-stratum PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(test-btc-stratum PRIVATE ws2_32)
+  endif()
+  add_test(NAME btc-stratum-offline
+           COMMAND test-btc-stratum
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/btc_stratum_v1.jsonl)
+  add_executable(test-bc3-destination tests/test_bc3_destination.cpp)
+  target_include_directories(test-bc3-destination PRIVATE src)
+  add_test(NAME bc3-destination-schema COMMAND test-bc3-destination)
+endif()

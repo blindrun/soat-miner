@@ -5,6 +5,16 @@
 
 # ---------------------------------------------------------------- POOL MODE
 # Your Ergo payout address. REQUIRED for pool mining.
+# Which coin to mine. Change ALGO, POOL and WALLET together.
+#
+#   Ergo         ALGO=autolykos2  POOL=ergo.herominers.com:1180     WALLET starts with 9
+#   Pearl        ALGO=pearl-pow   POOL=pearl.herominers.com:1200    WALLET starts with prl1
+#   Bitcoin III  ALGO=sha3-256t   POOL=stratum.pythonpool.dev:3357  WALLET starts with 1, 3 or bc1
+#
+# Pearl is NVIDIA only: the Vulkan build cannot mine it. Ergo and Bitcoin III
+# run on either backend, so AMD and Intel cards can mine both.
+ALGO=autolykos2
+
 WALLET=9YOUR_ERGO_ADDRESS_HERE
 
 # Pool to mine to. Some known Ergo pools:
@@ -69,8 +79,9 @@ CACHE_DAG=auto
 
 # Backend: auto | cuda | vulkan
 #   auto   - use CUDA if an NVIDIA GPU is present, else Vulkan
-#   cuda   - NVIDIA only, currently much faster (217 vs 2.9 MH/s on a 4090)
-#   vulkan - AMD, Intel, or NVIDIA. Correct, but see the README: the search
-#            kernel is heavily underperforming on NVIDIA and the cause is not
-#            yet found. Untested on AMD - that is what this build is for.
+#   cuda   - NVIDIA only. Faster for Ergo on Ada, and for Bitcoin III on every
+#            NVIDIA card measured so far (1543 vs 1086 MH/s on a 4090)
+#   vulkan - AMD, Intel, or NVIDIA. The only backend on AMD.
+#            Ergo and Bitcoin III both have Vulkan shaders; Pearl does not yet.
+#            Measured on an RX 7900 XT: Bitcoin III 540 MH/s at 289 W.
 BACKEND=auto

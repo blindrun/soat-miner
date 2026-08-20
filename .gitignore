@@ -21,3 +21,10 @@ soat-miner-13
 tests/test_pearl_mining_shape
 tests/measure_launch_gap
 tests/test_pearl_vk
+tests/test_btc_stratum
+tests/test_bc3_destination
+tests/test_sha3_algo
+tests/test_sha3_vulkan
+
+scratchpad/
+tools/__pycache__/

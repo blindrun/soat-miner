@@ -478,6 +478,16 @@ inline std::string formatCount(double n) {
     return buf;
 }
 
+// A four-frame activity pulse. Deliberately blocky rather than a spinner:
+// it reads at a glance from across a room, matches the ASCII banner, and does
+// not look like a "loading" throbber, which would imply the miner is waiting
+// on something.
+static const char *const kPulse[] = {"\u25B0\u25B1\u25B1\u25B1",
+                                     "\u25B1\u25B0\u25B1\u25B1",
+                                     "\u25B1\u25B1\u25B0\u25B1",
+                                     "\u25B1\u25B1\u25B1\u25B0"};
+static const unsigned kPulseFrames = 4;
+
 /** A unicode sparkline of recent hashrate, scaled to its own min/max. */
 inline std::string sparkline(const std::vector<double> &v) {
     static const char *uni[] = {"\u2581", "\u2582", "\u2583", "\u2584",
@@ -598,15 +608,42 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     printf("\r  %s%s%s\n", C_DIM, rule.c_str(), C_RESET);
     lines++;
 
-    printf("   " C_BOLD C_GREEN "%9.2f MH/s" C_RESET "   " C_DIM "avg" C_RESET
-           " %7.2f   %s%s" C_RESET "\033[K\n",
-           s.hashrate, s.hashrateAvg, C_BLUE, sparkline(s.history).c_str());
+    // The sparkline that used to live here is gone. It scaled to its OWN
+    // min/max, so a rock-steady hashrate drew a wild jagged graph - it
+    // amplified sampling noise to full height and made healthy mining look
+    // broken. A chart whose y-axis is invisible and self-scaling tells the
+    // reader nothing.
+    //
+    // What replaces it answers the question people actually have while
+    // watching this: is it still working? The pulse advances every readout, so
+    // motion means alive; the count is what the pool has actually taken.
+    // Deliberately NOT the accepted count: that already has its own line lower
+    // down, and printing it twice on one screen makes the reader check whether
+    // the two disagree. This says one thing - the loop is turning.
+    // Pearl does not hash. A candidate is a 16x16 tile of a matrix product, and
+    // calling a million of them a megahash invites a straight comparison with
+    // Ergo and BC3 that means nothing - Pearl's 66 MC/s and BC3's 1543 MH/s are
+    // different units, and labelling both "MH/s" makes Pearl look broken and slow.
+    // This labelling exists on algo/pearl and was missing from this tree.
+    const bool candidates = s.algo.rfind("pearl", 0) == 0;
+    const char *rateUnit = candidates ? "MC/s" : "MH/s";
+    const char *effUnit = candidates ? "MC/W" : "MH/W";
+
+    static unsigned pulse = 0;
+    pulse++;
+    char act[64];
+    snprintf(act, sizeof(act), "%s%s MINING%s",
+             C_ORANGE, kPulse[pulse % kPulseFrames], C_RESET);
+    printf("   " C_BOLD C_GREEN "%9.2f %s" C_RESET "   " C_DIM "avg" C_RESET
+           " %7.2f   %s\033[K\n",
+           s.hashrate, rateUnit, s.hashrateAvg, act);
     lines++;
 
     if (t.valid) {
         printf("   %6.0f W   %s%3u C" C_RESET "   fan %3u%%   " C_DIM "eff" C_RESET
-               " %5.2f MH/W\033[K\n",
-               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff);
+               " " C_ORANGE "%5.2f" C_RESET " %s\033[K\n",
+               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff,
+               effUnit);
         lines++;
         if (t.smClockMhz || t.memClockMhz) {
             printf("   " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET
@@ -624,7 +661,11 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
            formatCount((double)s.totalNonces).c_str());
     lines++;
 
-    printf("   " C_GREEN "%llu accepted" C_RESET, (unsigned long long)s.accepted);
+    // Colour carries meaning here, one job each: ORANGE is what you earned,
+    // GREEN is raw speed, RED is trouble and nothing else. Before this, green
+    // did both speed and accepted, so nothing on screen distinguished "fast"
+    // from "paid".
+    printf("   " C_ORANGE "%llu accepted" C_RESET, (unsigned long long)s.accepted);
     if (s.rejected)
         printf("   " C_RED "%llu rejected" C_RESET, (unsigned long long)s.rejected);
     printf("   " C_DIM "up" C_RESET " %s\033[K\n", formatDuration(s.uptimeSeconds).c_str());

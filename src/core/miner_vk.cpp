@@ -12,14 +12,7 @@
 #include <string>
 
 #include "run.h"
-
-namespace om {
-Algorithm *makeAutolykos2VK(int deviceIndex);
-void vkListDevices();
-const char *vkDeviceName();
-double vkDeviceMemGB();
-const char *vkDriverVersion();
-}  // namespace om
+#include "vk_common.h"
 
 static volatile sig_atomic_t g_stop = 0;
 static void onSignal(int) { g_stop = 1; }
@@ -40,6 +33,9 @@ int main(int argc, char **argv) {
     RunOptions opt;
     opt.backendLabel = "Vulkan";
     int deviceIndex = -1;
+    // Autolykos was the only algorithm this backend had, so it stays the
+    // default: every existing launcher and config.txt omits --algo entirely.
+    std::string algoName = "autolykos2";
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -87,15 +83,24 @@ int main(int argc, char **argv) {
             // silently mined Ergo instead: the launcher picks Vulkan on
             // Blackwell, this binary ignored the flag, and the user got
             // "'prl1...' is not a valid Ergo address" with no clue why.
-            // Refuse instead. This build has one algorithm.
-            const std::string want = next();
-            if (want != "autolykos2") {
+            // Refuse instead, and say which algorithms this build actually has
+            // rather than naming one - the registry is the source of truth now.
+            algoName = next();
+            bool known = false;
+            for (const auto &n : availableVulkanAlgorithms())
+                if (n == algoName) { known = true; break; }
+            if (!known) {
                 fprintf(stderr,
-                        "this is the Vulkan build and it only has autolykos2, "
-                        "not '%s'.\n", want.c_str());
-                if (want == "pearl-pow")
+                        "the Vulkan build does not have '%s'.\n"
+                        "  it has:", algoName.c_str());
+                for (const auto &n : availableVulkanAlgorithms())
+                    fprintf(stderr, " %s", n.c_str());
+                fprintf(stderr, "\n");
+                // Pearl is still CUDA-only, so name the way out rather than
+                // leaving the user to guess which binary to run.
+                if (algoName == "pearl-pow")
                     fprintf(stderr,
-                            "Pearl is CUDA only. Run ./soat-miner (or set "
+                            "  Pearl is CUDA only. Run ./soat-miner (or set "
                             "BACKEND=cuda in config.txt) instead of the Vulkan "
                             "binary.\n");
                 return 1;
@@ -103,12 +108,18 @@ int main(int argc, char **argv) {
         }
         else if (a == "--device") deviceIndex = atoi(next().c_str());
         else if (a == "--list-devices") { vkListDevices(); return 0; }
-        else if (a == "--list-algos") { printf("autolykos2\n"); return 0; }
+        else if (a == "--list-algos") {
+            for (const auto &n : availableVulkanAlgorithms())
+                printf("%s\n", n.c_str());
+            return 0;
+        }
         else if (a == "--help" || a == "-h") {
             printf(
                 "SOAT Miner (Vulkan) - open-source GPU miner\n\n"
                 "  --device N        GPU index (default: largest VRAM)\n"
                 "  --list-devices    list Vulkan GPUs and exit\n"
+                "  --algo NAME       algorithm (default autolykos2)\n"
+                "  --list-algos      list this build's algorithms and exit\n"
                 "  --pool HOST:PORT  stratum pool (omit for solo via node)\n"
                 "  --wallet ADDR     payout address (pool mode)\n"
                 "  --worker NAME     worker name (default soat)\n"
@@ -174,9 +185,11 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 #endif
 
-    std::unique_ptr<Algorithm> algo(makeAutolykos2VK(deviceIndex));
+    std::unique_ptr<Algorithm> algo(
+        createVulkanAlgorithm(algoName, deviceIndex));
     if (!algo) {
-        fprintf(stderr, "failed to initialise Vulkan backend\n");
+        fprintf(stderr, "failed to initialise the Vulkan backend for %s\n",
+                algoName.c_str());
         return 1;
     }
 
