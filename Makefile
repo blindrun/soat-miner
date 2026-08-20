@@ -101,7 +101,7 @@ VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
             $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-kawpow test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -239,6 +239,20 @@ tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
 tests/test_kawpow_block: tests/test_kawpow_block.cpp src/algos/kawpow/kawpow.h \
                          $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_kawpow_device: tests/test_kawpow_device.cu \
+                          src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+                          src/algos/progpow/mine.cuh $(PROGPOW_DEPS)
+	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
+
+# The device gate needs a card and enough VRAM for the real 6.1 GB DAG, so it
+# is its own target rather than part of test-kawpow, which must pass on a build
+# machine with no GPU at all. It skips itself politely on a small card.
+test-kawpow-device: tests/test_kawpow_device
+	@echo "--- kawpow: CUDA kernels vs the host reference, on a real DAG ---"
+	@./tests/test_kawpow_device $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
+		$(KAWPOW_BLK_BITS) 8
 
 test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"

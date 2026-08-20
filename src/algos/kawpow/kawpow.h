@@ -71,14 +71,20 @@ KP_HD Params params() {
  * of the first Keccak-f[800] is wrong - which looks like a broken keccak
  * rather than a wrong input.
  */
+// A namespace-scope array is host-only under nvcc, so the tail lives inside a
+// function both sides can call rather than in two copies that could drift.
+KP_HD uint32_t ravenWord(int i) {
 #if KAWPOW_RAVEN_TAIL
-static const uint32_t kRavencoinKawpow[15] = {
-    0x00000072u, 0x00000041u, 0x00000056u, 0x00000045u, 0x0000004Eu,
-    0x00000043u, 0x0000004Fu, 0x00000049u, 0x0000004Eu, 0x0000004Bu,
-    0x00000041u, 0x00000057u, 0x00000050u, 0x0000004Fu, 0x00000057u};
+    const uint32_t t[15] = {
+        0x00000072u, 0x00000041u, 0x00000056u, 0x00000045u, 0x0000004Eu,
+        0x00000043u, 0x0000004Fu, 0x00000049u, 0x0000004Eu, 0x0000004Bu,
+        0x00000041u, 0x00000057u, 0x00000050u, 0x0000004Fu, 0x00000057u};
+    return t[i];
 #else
-static const uint32_t kRavencoinKawpow[15] = {0};  // mutation: stock ProgPoW
+    (void)i;
+    return 0u;  // mutation: stock ProgPoW, no private tail
 #endif
+}
 
 /**
  * The first Keccak-f[800]: header hash, nonce and the Ravencoin words go in,
@@ -94,7 +100,7 @@ KP_HD void initialKeccak(const uint32_t headerHash[8], uint64_t nonce,
     for (int i = 0; i < 8; i++) st[i] = headerHash[i];
     st[8] = (uint32_t)nonce;
     st[9] = (uint32_t)(nonce >> 32);
-    for (int i = 10; i < 25; i++) st[i] = kRavencoinKawpow[i - 10];
+    for (int i = 10; i < 25; i++) st[i] = ravenWord(i - 10);
     keccakf800(st);
     for (int i = 0; i < 8; i++) state2[i] = st[i];
 }
@@ -106,7 +112,7 @@ KP_HD void finalKeccak(const uint32_t state2[8], const uint32_t mixHash[8],
     uint32_t st[25];
     for (int i = 0; i < 8; i++) st[i] = state2[i];
     for (int i = 8; i < 16; i++) st[i] = mixHash[i - 8];
-    for (int i = 16; i < 25; i++) st[i] = kRavencoinKawpow[i - 16];
+    for (int i = 16; i < 25; i++) st[i] = ravenWord(i - 16);
     keccakf800(st);
     for (int i = 0; i < 8; i++) out[i] = st[i];
 }
