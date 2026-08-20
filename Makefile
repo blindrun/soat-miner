@@ -110,7 +110,7 @@ VK_OBJS   = $(BUILD)/stratum_kawpow_vk.o $(BUILD)/miner_vk.o $(BUILD)/vk_common.
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
             $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-kawpow-vulkan test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -265,6 +265,18 @@ test-kawpow-device: tests/test_kawpow_device
 	@./tests/test_kawpow_device $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS) 8
+
+$(BUILD)/dag.spv: src/algos/progpow/dag.comp | dirs
+	glslangValidator -V --target-env vulkan1.2 $< -o $@
+
+tests/test_kawpow_vulkan: tests/test_kawpow_vulkan.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -lvulkan -o $@
+
+# Needs a Vulkan GPU, so it is its own target like the CUDA device gate. It
+# skips itself politely when there is no usable device.
+test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv
+	@echo "--- kawpow: the Vulkan DAG shader vs the host reference ---"
+	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv
 
 tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
