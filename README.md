@@ -10,6 +10,12 @@ Get one from Nautilus or the Ergo desktop wallet.
 You will also need a GPU with 8GB or more.
 The dataset is 7.27GB right now and it grows every few days.
 
+![The SOAT Miner window, mining Bitcoin III on an RTX 5080](docs/soat-miner-gui.png)
+
+There is a window now, for Linux and Windows, and it carries the miner inside it.
+Pick a coin, pick a pool, paste your address, click Mine. The terminal miner is
+unchanged if you prefer it.
+
 ## Get it
 
 Download the release for your os.

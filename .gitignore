@@ -8,9 +8,12 @@ tests/__pycache__/
 tests/test_vulkan
 tests/test_algo
 
-# build-binary variants and experiment scratch binaries (never commit these)
-soat-miner-*
-sm-*
+# build-binary variants and experiment scratch binaries (never commit these).
+# Anchored to the repo root on purpose: unanchored, `soat-miner-*` matches at
+# any depth and silently swallowed docs/soat-miner-gui.png, which is an asset
+# we DO want committed.
+/soat-miner-*
+/sm-*
 tests/test_pearl_job
 tests/test_pearl_gateway
 tests/test_pearl_prepare
