@@ -112,8 +112,8 @@ class KawpowStratumSource : public JobSource {
     Mode mode() const { return mode_; }
 
     /** Pops a one-off warning about an unusable job, so it is logged once. */
-    std::string takeJobWarning();
-    std::string takeSubmitVerdict();
+    std::string takeJobWarning() override;
+    std::string takeSubmitVerdict() override;
 
     bool poolCounters(uint64_t *accepted, uint64_t *rejected, uint64_t *pending,
                       std::string *lastError) const override;

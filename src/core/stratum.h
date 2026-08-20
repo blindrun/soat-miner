@@ -107,14 +107,14 @@ class StratumSource : public JobSource {
     uint64_t extranonceGeneration() const { return extranonceGen_.load(); }
 
     /** Pops a one-off warning about an unusable job, so it is logged once. */
-    std::string takeJobWarning();
+    std::string takeJobWarning() override;
 
     /** What the POOL said about our shares, not what we hoped it said. */
     bool poolCounters(uint64_t *accepted, uint64_t *rejected, uint64_t *pending,
                       std::string *lastError) const override;
 
     /** Pops the most recent rejection reason, so it is logged exactly once. */
-    std::string takeSubmitVerdict();
+    std::string takeSubmitVerdict() override;
 
    private:
     void readerLoop();

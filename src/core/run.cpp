@@ -687,28 +687,24 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // this a miner that is being refused every share looks identical to
         // one that is being paid for every share.
         //
-        // Both stratum sources are handled here. BitcoinStratumSource is a
-        // JobSource, not a StratumSource, so the single cast this used to do
-        // returned null for BC3: the pool accepted 367 shares in a minute and
-        // the readout sat at "accepted 0, rejected 0" the whole time, which is
-        // the exact confusion the paragraph above exists to prevent.
+        // Straight through the JobSource interface, no casts. This used to be
+        // a dynamic_cast chain naming each stratum type, and adding a type
+        // without extending the chain left its counters at zero while the pool
+        // credited shares - which happened for BC3 (367 shares, readout said
+        // zero) and then again for KawPow (263 shares, readout said zero). A
+        // cast chain is a hand-maintained list of types; the interface is not.
         {
-            auto drain = [&](auto *src) {
-                if (!src) return false;
-                const std::string v = src->takeSubmitVerdict();
-                if (!v.empty())
-                    logLine(tty, "error", "pool REJECTED the share: " + v);
-                const std::string jw = src->takeJobWarning();
-                if (!jw.empty()) logLine(tty, "warn", jw);
-                uint64_t a = 0, r = 0, p = 0;
-                std::string le;
-                src->poolCounters(&a, &r, &p, &le);
+            const std::string v = source->takeSubmitVerdict();
+            if (!v.empty())
+                logLine(tty, "error", "pool REJECTED the share: " + v);
+            const std::string jw = source->takeJobWarning();
+            if (!jw.empty()) logLine(tty, "warn", jw);
+            uint64_t a = 0, r = 0, p = 0;
+            std::string le;
+            if (source->poolCounters(&a, &r, &p, &le)) {
                 stats.accepted = a;
                 stats.rejected = hostRejected + r;
-                return true;
-            };
-            if (!drain(dynamic_cast<StratumSource *>(source.get())))
-                drain(dynamic_cast<BitcoinStratumSource *>(source.get()));
+            }
         }
 
         const auto now = std::chrono::steady_clock::now();

@@ -39,6 +39,24 @@ class JobSource {
      * Returning false means "this source cannot tell you" - which is the
      * honest answer for solo, where the node's HTTP reply is synchronous.
      */
+    /**
+     * A one-off human-readable note about the last submission, or the last
+     * unusable job, popped so it is logged exactly once.
+     *
+     * These are on the INTERFACE rather than on each stratum class, and that
+     * is the point. The run loop used to reach them through a chain of
+     * dynamic_casts naming every source type it knew about, so adding a source
+     * and forgetting the chain left its counters reading zero for ever while
+     * the pool happily credited shares. That has now happened twice - once for
+     * BC3, once for KawPow - and a cast chain is a hand-maintained list of
+     * types, which is the same failure as a hand-maintained list of files.
+     *
+     * The defaults are empty, so a source that has nothing to say says nothing
+     * and needs no code at all.
+     */
+    virtual std::string takeSubmitVerdict() { return std::string(); }
+    virtual std::string takeJobWarning() { return std::string(); }
+
     virtual bool poolCounters(uint64_t *accepted, uint64_t *rejected,
                               uint64_t *pending, std::string *lastError) const {
         (void)accepted; (void)rejected; (void)pending; (void)lastError;

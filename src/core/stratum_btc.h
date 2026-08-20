@@ -102,8 +102,8 @@ class BitcoinStratumSource : public JobSource {
         return loginError_;
     }
 
-    std::string takeJobWarning();
-    std::string takeSubmitVerdict();
+    std::string takeJobWarning() override;
+    std::string takeSubmitVerdict() override;
 
    private:
     friend struct BitcoinStratumTestAccess;

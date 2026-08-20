@@ -316,6 +316,18 @@ $(BUILD)/kawpow.spv: src/algos/kawpow/kernel.comp | dirs
 tests/test_kawpow_vulkan: tests/test_kawpow_vulkan.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -lvulkan -o $@
 
+# The whole path, against a mock pool built from replies captured off live
+# pools: binary, run loop, job parsing, dataset build, search, verify, submit.
+# Needs a GPU; uses height 100 so the dataset is ~1 GB rather than 6.11.
+#
+# This is the one that found the counter bug: 263 shares submitted and the
+# readout stuck at "accepted 0", because the run loop reached the counters
+# through a dynamic_cast chain that did not name KawPow's source.
+.PHONY: test-kawpow-pool
+test-kawpow-pool: cuda
+	@echo "--- kawpow: the real binary against a mock pool, end to end ---"
+	@python3 tests/test_kawpow_pool.py ./soat-miner
+
 # Needs a Vulkan GPU, so it is its own target like the CUDA device gate. It
 # skips itself politely when there is no usable device.
 test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
