@@ -101,7 +101,7 @@ VK_OBJS   = $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
             $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-kawpow test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -206,6 +206,33 @@ test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-p
 	@python3 tests/test_lithos.py
 	@echo "--- vulkan backend against the same pinned vector ---"
 	@./tests/test_vulkan $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
+
+# --- kawpow gates ---------------------------------------------------------
+# The host reference is the anchor for everything else in this algorithm: the
+# CUDA and Vulkan kernels are checked against it, so it is checked against
+# Ravencoin's own published vectors first.
+#
+# The mutants matter as much as the vectors. Four constants, each of which
+# produces a miner that runs at full speed and has every share rejected, are
+# overridable at compile time; each broken build must fail the same test. A
+# gate nobody has watched fail is not a gate.
+KAWPOW_MUTANTS = KAWPOW_PERIOD_LENGTH=50 KAWPOW_EPOCH_LENGTH=30000 \
+                 KAWPOW_RAVEN_TAIL=0 KAWPOW_KECCAK_PAD=0x06u
+
+tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
+                        src/algos/kawpow/keccak.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+test-kawpow: tests/test_kawpow_hash | dirs
+	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
+	@./tests/test_kawpow_hash
+	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
+	@for m in $(KAWPOW_MUTANTS); do \
+		$(CXX) $(CXXFLAGS) -D$$m tests/test_kawpow_hash.cpp \
+		  -o $(BUILD)/mutant_kawpow || exit 1; \
+		printf '  %-26s ' "$$m"; \
+		$(BUILD)/mutant_kawpow --expect-fail || exit 1; \
+	done
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the
