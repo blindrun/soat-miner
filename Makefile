@@ -369,7 +369,9 @@ tests/test_kawpow_address: tests/test_kawpow_address.cpp src/core/kawpow_address
                         src/core/sha256.h
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
+# test_algo_registry compares the binaries against the launcher, so both
+# binaries have to exist for it to say anything.
+test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
              tests/test_progpow_stock tests/test_progpow_ops \
              tests/test_kawpow_stratum tests/test_kawpow_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
@@ -400,6 +402,8 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
 	@./tests/test_kawpow_address
 	@echo "--- launcher: which backend each algorithm actually gets ---"
 	@./tests/test_launcher_backend.sh
+	@echo "--- registries: do the four lists describing an algorithm agree? ---"
+	@./tests/test_algo_registry.sh
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the
