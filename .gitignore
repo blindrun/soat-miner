@@ -36,3 +36,4 @@ tests/test_rvn_address
 tests/test_progpow_stock
 tests/test_kawpow_vulkan
 tests/test_kawpow_vk_real
+tests/test_progpow_ops

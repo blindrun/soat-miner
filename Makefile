@@ -333,6 +333,9 @@ test-kawpow-vulkan-real: tests/test_kawpow_vk_real
 tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+tests/test_progpow_ops: tests/test_progpow_ops.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
                            src/core/stratum_kawpow.cpp \
                            src/core/stratum_kawpow.h src/core/json_lite.h \
@@ -345,8 +348,8 @@ tests/test_rvn_address: tests/test_rvn_address.cpp src/core/rvn_address.h \
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
-             tests/test_progpow_stock tests/test_kawpow_stratum \
-             tests/test_rvn_address | dirs
+             tests/test_progpow_stock tests/test_progpow_ops \
+             tests/test_kawpow_stratum tests/test_rvn_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
 	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
@@ -360,6 +363,8 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
 	@./tests/test_kawpow_block $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
 		$(KAWPOW_BLK_BITS)
+	@echo "--- progpow family: every operation, named, both revisions ---"
+	@./tests/test_progpow_ops
 	@echo "--- progpow family: the shared layer vs stock ProgPoW's vectors ---"
 	@./tests/test_progpow_stock
 	@echo "--- progpow family: and those vectors discriminate the parameters ---"
