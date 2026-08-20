@@ -98,8 +98,10 @@ struct MixPush {
     uint32_t numItems2048;
     uint32_t wordsPerBufShift;
     uint32_t dumpMode;
+    uint32_t spreadBufs;
+    uint32_t spreadSlice;
 };
-static_assert(sizeof(MixPush) == 92, "the shader's push block must match");
+static_assert(sizeof(MixPush) == 100, "the shader's push block must match");
 
 class KawPowVK : public Algorithm {
    public:
@@ -381,6 +383,16 @@ class KawPowVK : public Algorithm {
         }
         p.wordsPerBufShift = wordsPerBufShift_;
         p.dumpMode = 0;
+        p.spreadBufs = 0;
+        p.spreadSlice = 0;
+        if (const char *sb = getenv("SOAT_SPREAD_BUFS")) {
+            const uint32_t n = (uint32_t)strtoul(sb, nullptr, 10);
+            const char *sl = getenv("SOAT_SPREAD_SLICE");
+            if (n > 0 && sl) {
+                p.spreadBufs = n;
+                p.spreadSlice = (uint32_t)strtoul(sl, nullptr, 10);
+            }
+        }
 
         const uint32_t hashesPerGroup = kLocalSize / kLanes;
         uint64_t groups = (count + hashesPerGroup - 1) / hashesPerGroup;

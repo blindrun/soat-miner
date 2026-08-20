@@ -201,6 +201,11 @@ layout(push_constant) uniform PC {
     uint numItems2048;
     uint wordsPerBufShift;  // log2, so the split costs a shift and not a divide
     uint dumpMode;          // 1 = write every hash, tests only
+    // DIAGNOSTIC: spread a fixed number of touched items evenly across
+    // spreadBufs buffers instead of packing them into the first few. Separates
+    // "how much is touched" from "how many buffers are touched". Wrong results.
+    uint spreadBufs;        // 0 = normal
+    uint spreadSlice;       // items per buffer when spreading
 } pc;
 
 const uint FNV_PRIME = 0x01000193u;
@@ -541,7 +546,14 @@ void main() {
         const uint seedReg = xlane[group * 16u + (r % 16u)];
         barrier();
 
-        const uint item = seedReg % pc.numItems2048;
+        uint item;
+        if (pc.spreadBufs != 0u) {
+            const uint b = seedReg % pc.spreadBufs;
+            const uint within = (seedReg / pc.spreadBufs) % pc.spreadSlice;
+            item = b * (1u << (pc.wordsPerBufShift - 6u)) + within;
+        } else {
+            item = seedReg % pc.numItems2048;
+        }
         const uint chunk = (lane ^ r) % 16u;
         const uint dbase = item * 64u + chunk * 4u;
         uint d[4];

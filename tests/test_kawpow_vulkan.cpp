@@ -512,7 +512,7 @@ int main(int argc, char **argv) {
 
     Harness::Pipeline dagPipe, mixPipe;
     if (!h.buildPipeline(dagCode, 1 + Harness::kNumBufs, 16, 64, &dagPipe)) return 1;
-    if (!h.buildPipeline(mixCode, 3 + Harness::kNumBufs, 92, 64, &mixPipe)) return 1;
+    if (!h.buildPipeline(mixCode, 3 + Harness::kNumBufs, 100, 64, &mixPipe)) return 1;
 
     // Epoch 0's light cache: 16 MB, and the smallest real one there is.
     const int epoch = 0;
@@ -640,7 +640,7 @@ int main(int argc, char **argv) {
         h.writeDescriptors(mixPipe, bufs);
     }
 
-    uint32_t mp[23]{};
+    uint32_t mp[25]{};
     uint32_t hdr[8];
     hexToWords("8dc2a5086848cb872bb610d1a06294e3c41196bb04b041c8fe84da0153ba5db7",
                hdr, 8);
@@ -704,7 +704,7 @@ int main(int argc, char **argv) {
         }
         Harness::Pipeline specPipe;
         // Binding 0 is gone with the program, so everything shifts down one.
-        if (!h.buildPipelineSpec(specCode, 2 + Harness::kNumBufs, 92, vals, ids,
+        if (!h.buildPipelineSpec(specCode, 2 + Harness::kNumBufs, 100, vals, ids,
                                  &specPipe))
             return 1;
         std::vector<Buffer *> sbufs;
