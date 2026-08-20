@@ -114,7 +114,7 @@ VK_OBJS   = $(BUILD)/algo_vk_kawpow.o $(BUILD)/spirv_kawpow.o \
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
             $(BUILD)/stratum_btc_vk.o
 
-.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-kawpow-vulkan test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -315,6 +315,20 @@ test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.sp
 	@echo "--- kawpow: the Vulkan DAG and mix shaders vs the host reference ---"
 	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
 		$(BUILD)/kawpow_spec.spv
+
+# The Vulkan backend at the geometry the miner really uses - a 6.11 GB DAG in
+# 2 GiB device-local buffers - rather than the harness's 16 MB. Needs ~7 GB of
+# VRAM; skips politely without it.
+tests/test_kawpow_vk_real: tests/test_kawpow_vk_real.cpp $(VK_OBJS) \
+                           src/algos/kawpow/kawpow.h src/algos/kawpow/job.h
+	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk_kawpow.o $(BUILD)/spirv_kawpow.o \
+	  $(BUILD)/spirv_kawpow_spec.o $(BUILD)/spirv_dag.o $(BUILD)/vk_common.o \
+	  -lvulkan -lpthread -o $@
+
+test-kawpow-vulkan-real: tests/test_kawpow_vk_real
+	@echo "--- kawpow: Vulkan at the real 6.11 GB geometry, vs a mainnet block ---"
+	@./tests/test_kawpow_vk_real $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_BITS)
 
 tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@

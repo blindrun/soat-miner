@@ -35,3 +35,4 @@ tests/test_kawpow_stratum
 tests/test_rvn_address
 tests/test_progpow_stock
 tests/test_kawpow_vulkan
+tests/test_kawpow_vk_real
