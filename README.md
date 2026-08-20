@@ -457,7 +457,7 @@ Ravencoin is the largest of them.
 
 Call this testing, and mean it more than for the others. The algorithm is
 pinned to Ravencoin's own thirteen published hash vectors and to real mainnet
-block 4,501,650 - header, mix hash, proof-of-work hash and target - reproduced
+block 4,501,000 - header, mix hash, proof-of-work hash and target - reproduced
 on the host, on CUDA, and on Vulkan at the full 6.11 GB dataset. The stratum
 client is covered by twenty-two offline protocol checks built from replies
 captured off live pools. **But no share from this miner has been accepted by
