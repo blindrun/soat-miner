@@ -26,6 +26,29 @@
 //   3. random_math, all twelve rows of the document's math table.
 //   4. The program KISS99 seeding for period 600 (block 30,000).
 //
+// WHERE THE DIFFERENCE IS, measured rather than argued
+//   The document also publishes all sixteen lanes of the mix after loop 1 for
+//   block 30,000. Running exactly one loop iteration against it:
+//
+//     12 cache / 20 math ops     177 of 512 words match
+//     11 cache / 18 math ops     144 of 512
+//     DAG item zeroed            177 of 512  <- unchanged
+//
+//   177 is far above chance, so most of the loop is right. Zeroing the DAG
+//   item does NOT change the count, and the ablation was checked to actually
+//   take effect (the mix fingerprint changes, 0x5B922BA0 -> 0x36FD880F), so
+//   this is not a dispatch that quietly did nothing.
+//
+//   Read together: the words that match are the DAG-independent ones, and
+//   every DAG-touched register is wrong whatever the DAG contains. The
+//   difference is therefore in how the DAG is ACCESSED or MERGED - the words
+//   per lane, the destination registers, or the chunk mapping - and not in
+//   the dataset, the parameters, or any progPowInit layer.
+//
+//   Deliberately NOT stated: which of those it is. PROGPOW_DAG_LOADS is the
+//   obvious suspect and remains a guess; "not the content" is not "therefore
+//   the load count".
+//
 // NOT REPRODUCED, and this is the honest state of ProgPowZ
 //   The end-to-end progPowHash still matches 0 of 13. Run with --e2e to see
 //   it. Since 1-4 pass, whatever differs is INSIDE the loop body - the DAG or
@@ -324,6 +347,23 @@ int main(int argc, char **argv) {
         ck(s.rng.z == 0x6535921Cu && s.rng.w == 0x29345B16u &&
            s.rng.jsr == 0xC0DD7F78u && s.rng.jcong == 0x1165D7EBu,
            "program KISS99 state for period 600 matches");
+    }
+
+    // --- 5. the register permutations for period 600 ----------------------
+    {
+        const uint32_t wantSrc[32]={
+          0x1A,0x1E,0x01,0x13,0x0B,0x15,0x0F,0x12,0x03,0x11,0x1F,0x10,
+          0x1C,0x04,0x16,0x17,0x02,0x0D,0x1D,0x18,0x0A,0x0C,0x05,0x14,
+          0x07,0x08,0x0E,0x1B,0x06,0x19,0x09,0x00};
+        const uint32_t wantDst[32]={
+          0x00,0x04,0x1B,0x1A,0x0D,0x0F,0x11,0x07,0x0E,0x08,0x09,0x0C,
+          0x03,0x0A,0x01,0x0B,0x06,0x10,0x1C,0x1F,0x02,0x13,0x1E,0x16,
+          0x1D,0x05,0x18,0x12,0x19,0x17,0x15,0x14};
+        MixRngState st600 = makeMixRngState(600);
+        ck(memcmp(st600.srcSeq, wantSrc, sizeof wantSrc) == 0,
+           "the src register permutation for period 600 matches");
+        ck(memcmp(st600.dstSeq, wantDst, sizeof wantDst) == 0,
+           "the dst register permutation for period 600 matches");
     }
 
     if (!e2e) {
