@@ -131,6 +131,12 @@ VK_SRC_GEN  = $(BUILD)/spirv.cpp $(BUILD)/spirv_sha3.cpp \
 # names that do not exist.
 VK_SRC      = src/core/vk_common.cpp src/core/vk_registry.cpp $(VK_SRC_ALGO)
 
+# Where a given Vulkan source's object lands. Test targets that link one or two
+# of them use this rather than spelling out the layout, so the mirroring stays
+# an implementation detail of this file.
+vkobj = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(1))
+vkgen = $(BUILD)/lin/gen/$(1).o
+
 # Object paths MIRROR the source path rather than being flattened, because
 # there are three different files called algo_vk.cpp and a flat scheme needs
 # hand-picked names - which is the drift this change exists to remove.
@@ -293,11 +299,13 @@ test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.sp
 # The Vulkan backend at the geometry the miner really uses - a 6.11 GB DAG in
 # 2 GiB device-local buffers - rather than the harness's 16 MB. Needs ~7 GB of
 # VRAM; skips politely without it.
-tests/test_kawpow_vk_real: tests/test_kawpow_vk_real.cpp $(VK_OBJS) \
+VK_T_KAWPOW = $(call vkobj,src/algos/kawpow/algo_vk.cpp) \
+              $(call vkgen,spirv_kawpow) $(call vkgen,spirv_kawpow_spec) \
+              $(call vkgen,spirv_dag) $(call vkobj,src/core/vk_common.cpp)
+
+tests/test_kawpow_vk_real: tests/test_kawpow_vk_real.cpp $(VK_T_KAWPOW) \
                            src/algos/kawpow/kawpow.h src/algos/kawpow/job.h
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk_kawpow.o $(BUILD)/spirv_kawpow.o \
-	  $(BUILD)/spirv_kawpow_spec.o $(BUILD)/spirv_dag.o $(BUILD)/vk_common.o \
-	  -lvulkan -lpthread -o $@
+	$(CXX) $(CXXFLAGS) $< $(VK_T_KAWPOW) -lvulkan -lpthread -o $@
 
 test-kawpow-vulkan-real: tests/test_kawpow_vk_real
 	@echo "--- kawpow: Vulkan at the real 6.11 GB geometry, vs a mainnet block ---"
@@ -426,10 +434,11 @@ tests/test_pearl_gateway: tests/test_pearl_gateway.cpp src/core/pearl_gateway.h 
 
 # The Vulkan gate needs only the algorithm and the embedded SPIR-V, not the
 # miner's job/stratum plumbing.
-tests/test_vulkan: tests/test_vulkan.cpp $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
-                   $(BUILD)/vk_common.o src/core/algo.h
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
-	    $(BUILD)/vk_common.o -lvulkan -ldl -lpthread -o $@
+VK_T_AUTO = $(call vkobj,src/algos/autolykos2/algo_vk.cpp) $(call vkgen,spirv) \
+            $(call vkobj,src/core/vk_common.cpp)
+
+tests/test_vulkan: tests/test_vulkan.cpp $(VK_T_AUTO) src/core/algo.h
+	$(CXX) $(CXXFLAGS) $< $(VK_T_AUTO) -lvulkan -ldl -lpthread -o $@
 
 # The Vulkan BC3 gate. This is the one that decides whether the shader is
 # trusted at all: NVIDIA's Vulkan compiler miscompiled the Autolykos kernel in
@@ -440,12 +449,12 @@ tests/test_vulkan: tests/test_vulkan.cpp $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
 # it also runs its own bare pipeline against the embedded module so a bug in
 # algo_vk.cpp's push-constant layout and a bug in the shader cannot mask each
 # other.
-tests/test_sha3_vulkan: tests/test_sha3_vulkan.cpp tests/sha3_vectors.h \
-                        $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
-                        $(BUILD)/vk_common.o src/algos/sha3-256t/sha3.h \
-                        src/core/algo.h src/core/btc_job.h
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
-	    $(BUILD)/vk_common.o -lvulkan -ldl -lpthread -o $@
+VK_T_SHA3 = $(call vkobj,src/algos/sha3-256t/algo_vk.cpp) \
+            $(call vkgen,spirv_sha3) $(call vkobj,src/core/vk_common.cpp)
+
+tests/test_sha3_vulkan: tests/test_sha3_vulkan.cpp $(VK_T_SHA3) \
+                        src/algos/sha3-256t/sha3.h src/core/algo.h
+	$(CXX) $(CXXFLAGS) $< $(VK_T_SHA3) -lvulkan -ldl -lpthread -o $@
 
 # Opt-in like test-bc3-device: it puts real load on a GPU, so it runs after a
 # purpose-specific gpulock claim rather than as part of a plain `make test`.
