@@ -219,11 +219,25 @@ test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-p
 KAWPOW_MUTANTS = KAWPOW_PERIOD_LENGTH=50 KAWPOW_EPOCH_LENGTH=30000 \
                  KAWPOW_RAVEN_TAIL=0 KAWPOW_KECCAK_PAD=0x06u
 
+# A real Ravencoin mainnet block, at a height whose DAG is the 6.1 GB one a
+# miner actually builds today. Regenerate with:
+#   python3 tests/kawpow_block.py <height>
+KAWPOW_BLK_HEADER = 8dc2a5086848cb872bb610d1a06294e3c41196bb04b041c8fe84da0153ba5db7
+KAWPOW_BLK_HEIGHT = 4501000
+KAWPOW_BLK_NONCE  = 329dd53ca526c2cd
+KAWPOW_BLK_MIX    = 7b1e003a71d7bf9f81d95c0c68126f72876de28b69b175c84e4c11234ad5d7c7
+KAWPOW_BLK_HASH   = 000000000001a5a2da8a4a4e8867948fd5958d98dc61521ea5f9906bf4b9e7b5
+KAWPOW_BLK_BITS   = 1b06292b
+
 tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
                         src/algos/kawpow/keccak.h
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-test-kawpow: tests/test_kawpow_hash | dirs
+tests/test_kawpow_block: tests/test_kawpow_block.cpp src/algos/kawpow/kawpow.h \
+                         src/algos/kawpow/keccak.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
 	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
@@ -233,6 +247,10 @@ test-kawpow: tests/test_kawpow_hash | dirs
 		printf '  %-26s ' "$$m"; \
 		$(BUILD)/mutant_kawpow --expect-fail || exit 1; \
 	done
+	@echo "--- kawpow: end to end against a real Ravencoin mainnet block ---"
+	@./tests/test_kawpow_block $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
+		$(KAWPOW_BLK_BITS)
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the

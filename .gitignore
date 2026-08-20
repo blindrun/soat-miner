@@ -29,3 +29,4 @@ tests/test_sha3_vulkan
 scratchpad/
 tools/__pycache__/
 tests/test_kawpow_hash
+tests/test_kawpow_block
