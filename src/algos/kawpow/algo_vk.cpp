@@ -43,6 +43,8 @@ extern const uint32_t kProgpowDagSpirv[];
 extern const size_t kProgpowDagSpirvWords;
 extern const uint32_t kKawpowSpirv[];
 extern const size_t kKawpowSpirvWords;
+extern const uint32_t kKawpowSpecSpirv[];
+extern const size_t kKawpowSpecSpirvWords;
 
 namespace om {
 namespace {
@@ -56,7 +58,7 @@ const uint32_t kMaxSolutions = 256;
 const uint32_t kSolutionWords = 18;
 /** Lanes per hash, fixed by the algorithm, and the workgroup is a multiple. */
 const uint32_t kLanes = 16;
-const uint32_t kLocalSize = 64;
+const uint32_t kLocalSize = 256;   // 16 hashes per workgroup, not 4
 
 struct Buffer {
     VkBuffer buf = VK_NULL_HANDLE;
@@ -76,7 +78,7 @@ struct Pipeline {
 
 /** Push constants for dag.comp: start, numItems512, numCacheItems, wordsPerBuf. */
 struct DagPush {
-    uint32_t start, numItems512, numCacheItems, wordsPerBuf;
+    uint32_t start, numItems512, numCacheItems, wordsPerBufShift;
 };
 
 /** Push constants for kernel.comp. 92 bytes, inside the 128 every device has. */
@@ -86,7 +88,7 @@ struct MixPush {
     uint32_t countLo, countHi;
     uint32_t t[8];
     uint32_t numItems2048;
-    uint32_t wordsPerBuf;
+    uint32_t wordsPerBufShift;
     uint32_t dumpMode;
 };
 static_assert(sizeof(MixPush) == 92, "the shader's push block must match");
@@ -180,11 +182,11 @@ class KawPowVK : public Algorithm {
             return false;
 
         if (!makePipeline(kProgpowDagSpirv, kProgpowDagSpirvWords, 1 + kMaxDagBufs,
-                          sizeof(DagPush), false, &dagPipe_))
+                          sizeof(DagPush), {}, {}, &dagPipe_))
             return false;
-        if (!makePipeline(kKawpowSpirv, kKawpowSpirvWords, 3 + kMaxDagBufs,
-                          sizeof(MixPush), true, &mixPipe_))
-            return false;
+        // The mix pipeline is NOT built here. It carries the period's program
+        // as specialisation constants, so it is rebuilt when the period turns
+        // - see makeMixPipeline().
         return true;
     }
 
@@ -220,24 +222,37 @@ class KawPowVK : public Algorithm {
             return false;
         }
 
-        // Split so every buffer is inside the device's own limit AND a
-        // multiple of 256 bytes, which is what stops a 2048-bit dataset item
-        // straddling two buffers.
-        uint64_t perBuf = maxStorageRange_;
-        if (perBuf > (3ull << 30)) perBuf = 3ull << 30;   // headroom under 4 GiB
-        perBuf &= ~(uint64_t)255;
-        dagBufs_ = (uint32_t)((dagBytes + perBuf - 1) / perBuf);
-        if (dagBufs_ > kMaxDagBufs) {
+        // Split so every buffer is inside the device's own limit, and size it
+        // to a POWER OF TWO number of words.
+        //
+        // The power of two is not tidiness. The shader locates a word with
+        // wordIndex >> shift, and a runtime divide there was measured holding
+        // the whole mix at 1.67 MH/s: four words per lane per round, sixty-four
+        // rounds, sixteen lanes is 4096 integer divisions per hash, and a GPU
+        // has no integer divide unit. Neither specialisation constants nor
+        // removing the per-round barriers moved that number at all.
+        //
+        // A power of two is also a multiple of 64 words, which is separately
+        // required so a 2048-bit dataset item never straddles two buffers.
+        uint64_t capWords = maxStorageRange_ / 4;
+        if (capWords > (3ull << 28)) capWords = 3ull << 28;   // under 4 GiB
+        const uint64_t totalWords = (dagBytes + 3) / 4;
+        uint32_t shift = 16;
+        while ((1ull << shift) < ((totalWords + kMaxDagBufs - 1) / kMaxDagBufs))
+            shift++;
+        while ((1ull << shift) > capWords && shift > 16) shift--;
+        if ((1ull << shift) * kMaxDagBufs < totalWords) {
             fprintf(stderr,
-                    "[kawpow] a %.2f GB DAG needs %u buffers and this build has "
-                    "%u.\n", dagBytes / 1e9, dagBufs_, kMaxDagBufs);
+                    "[kawpow] a %.2f GB DAG will not fit in %u buffers of at "
+                    "most %.2f GB on this device.\n",
+                    dagBytes / 1e9, kMaxDagBufs, capWords * 4 / 1e9);
             return false;
         }
+        wordsPerBufShift_ = shift;
+        wordsPerBuf_ = 1u << shift;
+        dagBufs_ = (uint32_t)((totalWords + wordsPerBuf_ - 1) / wordsPerBuf_);
         if (dagBufs_ < 1) dagBufs_ = 1;
-        // Every buffer the same size, so the shader's division is exact.
-        const uint64_t bytesPerBuf =
-            (((dagBytes + dagBufs_ - 1) / dagBufs_) + 255ull) & ~255ull;
-        wordsPerBuf_ = (uint32_t)(bytesPerBuf / 4);
+        const uint64_t bytesPerBuf = (uint64_t)wordsPerBuf_ * 4;
 
         // The light cache goes on the device: the DAG build reads a random
         // 64-byte item 512 times per output item, and doing that over PCIe
@@ -288,20 +303,13 @@ class KawPowVK : public Algorithm {
         for (uint32_t start = 0; start < numItems512; start += slice) {
             const uint32_t n =
                 (numItems512 - start) < slice ? (numItems512 - start) : slice;
-            DagPush p{start, numItems512, (uint32_t)numCacheItems_, wordsPerBuf_};
+            DagPush p{start, numItems512, (uint32_t)numCacheItems_,
+                      wordsPerBufShift_};
             if (!dispatch(dagPipe_, &p, (n + kLocalSize - 1) / kLocalSize))
                 return false;
         }
 
         if (!ensureScratch()) return false;
-        {
-            std::vector<Buffer *> bufs{&progBuf_};
-            for (uint32_t i = 0; i < kMaxDagBufs; i++) bufs.push_back(&dag_[i]);
-            bufs.push_back(&outBuf_);
-            bufs.push_back(&cntBuf_);
-            writeDescriptors(mixPipe_, bufs);
-        }
-
         builtEpoch_ = epoch;
         builtPeriod_ = -1;   // force the program to be re-uploaded
         return true;
@@ -314,7 +322,7 @@ class KawPowVK : public Algorithm {
 
         const int period = height / kPeriodLength;
         if (period != builtPeriod_) {
-            if (!uploadProgram(height)) return false;
+            if (!makeMixPipeline(height)) return false;
             builtPeriod_ = period;
         }
 
@@ -332,7 +340,7 @@ class KawPowVK : public Algorithm {
             p.t[2 * i + 1] = (uint32_t)(job.target[i] >> 32);
         }
         p.numItems2048 = numItems2048_;
-        p.wordsPerBuf = wordsPerBuf_;
+        p.wordsPerBufShift = wordsPerBufShift_;
         p.dumpMode = 0;
 
         const uint32_t hashesPerGroup = kLocalSize / kLanes;
@@ -385,7 +393,6 @@ class KawPowVK : public Algorithm {
 
     ~KawPowVK() override {
         releaseDag();
-        destroyBuffer(&progBuf_);
         destroyBuffer(&outBuf_);
         destroyBuffer(&cntBuf_);
         destroyPipeline(&dagPipe_);
@@ -486,7 +493,8 @@ class KawPowVK : public Algorithm {
     }
 
     bool makePipeline(const uint32_t *code, size_t words, uint32_t nBindings,
-                      uint32_t pushBytes, bool wantMaxOut, Pipeline *out) {
+                      uint32_t pushBytes, const std::vector<uint32_t> &specIds,
+                      const std::vector<uint32_t> &specVals, Pipeline *out) {
         out->pushBytes = pushBytes;
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -524,22 +532,30 @@ class KawPowVK : public Algorithm {
             VK_SUCCESS)
             return false;
 
-        // Workgroup size is a specialization constant so the host dispatch and
-        // the shader can never disagree - that drifted once in this repo and
-        // silently ran half the work while crediting all of it.
-        const uint32_t spec[2] = {kLocalSize, kMaxSolutions};
-        VkSpecializationMapEntry sme[2]{};
-        sme[0].constantID = 0;
-        sme[0].offset = 0;
-        sme[0].size = sizeof(uint32_t);
-        sme[1].constantID = 1;
-        sme[1].offset = sizeof(uint32_t);
-        sme[1].size = sizeof(uint32_t);
+        // Workgroup size is always a specialization constant so the host
+        // dispatch and the shader can never disagree - that drifted once in
+        // this repo and silently ran half the work while crediting all of it.
+        // The mix pipeline adds 131 more: the period's whole program.
+        std::vector<uint32_t> ids{0};
+        std::vector<uint32_t> vals{kLocalSize};
+        if (!specIds.empty()) {
+            ids.push_back(1);
+            vals.push_back(kMaxSolutions);
+            ids.insert(ids.end(), specIds.begin(), specIds.end());
+            vals.insert(vals.end(), specVals.begin(), specVals.end());
+        }
+        std::vector<VkSpecializationMapEntry> sme(ids.size());
+        for (size_t i = 0; i < ids.size(); i++) {
+            sme[i] = {};
+            sme[i].constantID = ids[i];
+            sme[i].offset = (uint32_t)(i * sizeof(uint32_t));
+            sme[i].size = sizeof(uint32_t);
+        }
         VkSpecializationInfo si{};
-        si.mapEntryCount = wantMaxOut ? 2 : 1;
-        si.pMapEntries = sme;
-        si.dataSize = si.mapEntryCount * sizeof(uint32_t);
-        si.pData = spec;
+        si.mapEntryCount = (uint32_t)sme.size();
+        si.pMapEntries = sme.data();
+        si.dataSize = vals.size() * sizeof(uint32_t);
+        si.pData = vals.data();
 
         VkPipelineShaderStageCreateInfo ssci{};
         ssci.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -649,9 +665,6 @@ class KawPowVK : public Algorithm {
     }
 
     bool ensureScratch() {
-        if (progBuf_.buf == VK_NULL_HANDLE &&
-            !createBuffer(kProgramWords * 4, hostVisible(), &progBuf_))
-            return false;
         if (outBuf_.buf == VK_NULL_HANDLE &&
             !createBuffer((VkDeviceSize)kMaxSolutions * kSolutionWords * 4,
                           hostVisible(), &outBuf_))
@@ -662,16 +675,25 @@ class KawPowVK : public Algorithm {
         return true;
     }
 
-    /** The shader's Prog block is a std430 run of plain uint arrays, so only
-     *  the tables are copied - not the three counts the host struct carries in
-     *  front of them, which the shader does not have. */
-    bool uploadProgram(int height) {
+    /**
+     * Rebuild the mix pipeline with this period's program folded in.
+     *
+     * The program is 131 specialisation constants, which the driver resolves
+     * at pipeline-creation time. That is what turns mix[dst] from a dynamic
+     * index into a local array - the GLSL trap that costs this repository a
+     * 75x slowdown - into a register. The cost is one shader compile every
+     * three blocks, which on Ravencoin is about three minutes.
+     *
+     * The value order here must match scripts/gen_kawpow_spec.py's table
+     * order, which is also src/algos/progpow/progpow.h's declaration order.
+     */
+    bool makeMixPipeline(int height) {
         const om::progpow::Program prog =
             om::progpow::buildProgram(height, params());
-        uint32_t w[kProgramWords];
-        uint32_t *p = w;
-        auto put = [&p](const uint32_t *a, int n) {
-            for (int i = 0; i < n; i++) *p++ = a[i];
+        std::vector<uint32_t> vals;
+        vals.reserve(kProgramWords);
+        auto put = [&vals](const uint32_t *a, int n) {
+            for (int i = 0; i < n; i++) vals.push_back(a[i]);
         };
         put(prog.cacheSrc, 11);
         put(prog.cacheDst, 11);
@@ -683,7 +705,24 @@ class KawPowVK : public Algorithm {
         put(prog.mathSel2, 18);
         put(prog.dagDst, 4);
         put(prog.dagSel, 4);
-        return upload(&progBuf_, w, sizeof(w));
+        if (vals.size() != kProgramWords) return false;
+
+        std::vector<uint32_t> ids(vals.size());
+        for (size_t i = 0; i < ids.size(); i++) ids[i] = (uint32_t)(10 + i);
+
+        // The old pipeline is finished with: every dispatch waits on its own
+        // fence before returning, so nothing is in flight here.
+        destroyPipeline(&mixPipe_);
+        if (!makePipeline(kKawpowSpecSpirv, kKawpowSpecSpirvWords,
+                          2 + kMaxDagBufs, sizeof(MixPush), ids, vals, &mixPipe_))
+            return false;
+
+        std::vector<Buffer *> bufs;
+        for (uint32_t i = 0; i < kMaxDagBufs; i++) bufs.push_back(&dag_[i]);
+        bufs.push_back(&outBuf_);
+        bufs.push_back(&cntBuf_);
+        writeDescriptors(mixPipe_, bufs);
+        return true;
     }
 
     void releaseDag() {
@@ -710,9 +749,10 @@ class KawPowVK : public Algorithm {
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
 
     Pipeline dagPipe_, mixPipe_;
-    Buffer cacheBuf_, dag_[kMaxDagBufs], progBuf_, outBuf_, cntBuf_;
+    Buffer cacheBuf_, dag_[kMaxDagBufs], outBuf_, cntBuf_;
     uint32_t dagBufs_ = 0;
     uint32_t wordsPerBuf_ = 0;
+    uint32_t wordsPerBufShift_ = 0;
 
     std::vector<uint32_t> cache_, l1_;
     int numCacheItems_ = 0;

@@ -78,7 +78,8 @@ class Harness {
     // Deliberately small: the split arithmetic is what is under test, not the
     // allocator. 1<<20 words is 4 MB and a multiple of 64 words, which is the
     // property that stops a 16-word item straddling a boundary.
-    static const uint32_t kWordsPerBuf = 1u << 20;
+    static const uint32_t kWordsPerBufShift = 20;
+    static const uint32_t kWordsPerBuf = 1u << kWordsPerBufShift;
     static const uint32_t kNumBufs = 4;
     static const uint32_t kItems512 = (kWordsPerBuf * kNumBufs) / 16;
 
@@ -169,6 +170,94 @@ class Harness {
         uint32_t pushBytes = 0;
         uint32_t local = 64;
     };
+
+    /** The fast shader needs 131 more specialisation constants than the
+     *  others, so the general form takes the whole record. */
+    bool buildPipelineSpec(const std::vector<uint32_t> &spirv,
+                           uint32_t nBindings, uint32_t pushBytes,
+                           const std::vector<uint32_t> &specValues,
+                           const std::vector<uint32_t> &specIds, Pipeline *out) {
+        out->bindings = nBindings;
+        out->pushBytes = pushBytes;
+        out->local = specValues.empty() ? 64 : specValues[0];
+
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = spirv.size() * 4;
+        smci.pCode = spirv.data();
+        VKOK(vkCreateShaderModule(dev_, &smci, nullptr, &out->module),
+             "shader module");
+
+        std::vector<VkDescriptorSetLayoutBinding> binds(nBindings);
+        for (uint32_t i = 0; i < nBindings; i++) {
+            binds[i] = {};
+            binds[i].binding = i;
+            binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            binds[i].descriptorCount = 1;
+            binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dslci{};
+        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = nBindings;
+        dslci.pBindings = binds.data();
+        VKOK(vkCreateDescriptorSetLayout(dev_, &dslci, nullptr, &out->setLayout),
+             "set layout");
+
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.size = pushBytes;
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &out->setLayout;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &pcr;
+        VKOK(vkCreatePipelineLayout(dev_, &plci, nullptr, &out->layout),
+             "pipeline layout");
+
+        std::vector<VkSpecializationMapEntry> sme(specIds.size());
+        for (size_t i = 0; i < specIds.size(); i++) {
+            sme[i].constantID = specIds[i];
+            sme[i].offset = (uint32_t)(i * sizeof(uint32_t));
+            sme[i].size = sizeof(uint32_t);
+        }
+        VkSpecializationInfo si{};
+        si.mapEntryCount = (uint32_t)sme.size();
+        si.pMapEntries = sme.data();
+        si.dataSize = specValues.size() * sizeof(uint32_t);
+        si.pData = specValues.data();
+
+        VkPipelineShaderStageCreateInfo ssci{};
+        ssci.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ssci.module = out->module;
+        ssci.pName = "main";
+        ssci.pSpecializationInfo = &si;
+        VkComputePipelineCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage = ssci;
+        cpci.layout = out->layout;
+        VKOK(vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpci, nullptr,
+                                      &out->pipe),
+             "compute pipeline");
+
+        VkDescriptorPoolSize ps{};
+        ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ps.descriptorCount = nBindings;
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 1;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &ps;
+        VKOK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &out->pool), "desc pool");
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = out->pool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &out->setLayout;
+        VKOK(vkAllocateDescriptorSets(dev_, &dsai, &out->set), "desc set");
+        return true;
+    }
 
     bool buildPipeline(const std::vector<uint32_t> &spirv, uint32_t nBindings,
                        uint32_t pushBytes, uint32_t local, Pipeline *out) {
@@ -408,7 +497,8 @@ std::string wordsToHex(const uint32_t *w, int words) {
 int main(int argc, char **argv) {
     const char *dagSpv = argc > 1 ? argv[1] : "build/dag.spv";
     const char *mixSpv = argc > 2 ? argv[2] : "build/kawpow.spv";
-    const int deviceIndex = argc > 3 ? atoi(argv[3]) : -1;
+    const char *specSpv = argc > 3 ? argv[3] : "build/kawpow_spec.spv";
+    const int deviceIndex = argc > 4 ? atoi(argv[4]) : -1;
 
     const std::vector<uint32_t> dagCode = readSpirv(dagSpv);
     const std::vector<uint32_t> mixCode = readSpirv(mixSpv);
@@ -448,7 +538,7 @@ int main(int argc, char **argv) {
     printf("  building %u dataset items into %u buffers of %u words\n", items,
            Harness::kNumBufs, Harness::kWordsPerBuf);
     const uint32_t push[4] = {0u, items, (uint32_t)numCacheItems,
-                              Harness::kWordsPerBuf};
+                              Harness::kWordsPerBufShift};
     if (!h.dispatch(dagPipe, push, (items + 63) / 64)) return 1;
 
     // --- 1. the DAG shader vs the host --------------------------------------
@@ -541,7 +631,7 @@ int main(int argc, char **argv) {
     mp[11] = 0;
     for (int i = 12; i < 20; i++) mp[i] = 0;   // target, unused in dump mode
     mp[20] = numItems2048;
-    mp[21] = Harness::kWordsPerBuf;
+    mp[21] = Harness::kWordsPerBufShift;
     mp[22] = 1;   // dump every hash
 
     if (!h.dispatch(mixPipe, mp, (kNonces + 3) / 4)) return 1;
@@ -573,6 +663,42 @@ int main(int argc, char **argv) {
     check(mixBad == 0,
           std::to_string(kNonces) +
               " consecutive nonces hash identically on the shader and the host");
+
+    // --- 3. the specialisation-constant shader, same answers ----------------
+    //
+    // The fast shader is GENERATED from the one just verified, differing only
+    // in where the program comes from. That makes this a check on the
+    // substitution and on the driver's constant folding, which is exactly the
+    // part that could be wrong - and it is the part no amount of reading
+    // catches, because both files look right.
+    const std::vector<uint32_t> specCode = readSpirv(specSpv);
+    if (specCode.empty()) {
+        printf("  SKIP  no %s; the fast shader was not built\n", specSpv);
+    } else {
+        std::vector<uint32_t> vals{64u, 256u};
+        std::vector<uint32_t> ids{0u, 1u};
+        for (size_t i = 0; i < progWords.size(); i++) {
+            vals.push_back(progWords[i]);
+            ids.push_back((uint32_t)(10 + i));
+        }
+        Harness::Pipeline specPipe;
+        // Binding 0 is gone with the program, so everything shifts down one.
+        if (!h.buildPipelineSpec(specCode, 6, 92, vals, ids, &specPipe)) return 1;
+        h.writeDescriptors(specPipe, {&dag[0], &dag[1], &dag[2], &dag[3],
+                                      &outBuf, &cntBuf});
+        std::vector<uint32_t> zeros(kNonces * 18, 0);
+        h.upload(&outBuf, zeros.data(), zeros.size() * 4);
+        if (!h.dispatch(specPipe, mp, (kNonces + 3) / 4)) return 1;
+
+        std::vector<uint32_t> sgot(kNonces * 18);
+        if (!h.download(&outBuf, 0, sgot.data(), sgot.size() * 4)) return 1;
+        int specBad = 0;
+        for (uint32_t i = 0; i < kNonces; i++)
+            if (memcmp(&sgot[i * 18 + 2], &got[i * 18 + 2], 64) != 0) specBad++;
+        check(specBad == 0,
+              "the specialisation-constant shader agrees with the interpreted "
+              "one on every nonce");
+    }
 
     if (g_fail == 0) printf("KawPow Vulkan: DAG and mix both match the host\n");
     return g_fail == 0 ? 0 : 1;

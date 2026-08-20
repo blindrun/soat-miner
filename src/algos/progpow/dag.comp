@@ -51,7 +51,7 @@ layout(push_constant) uniform PC {
     uint start;          // first 512-bit item this dispatch owns
     uint numItems512;    // total, so the tail dispatch can stop
     uint numCacheItems;  // 64-byte items in the light cache
-    uint wordsPerBuf;    // multiple of 64, so an item never straddles
+    uint wordsPerBufShift;  // log2; a shift, not a divide
 } pc;
 
 const uint FNV_PRIME = 0x01000193u;
@@ -218,8 +218,8 @@ void keccak512_64(inout uint w[16]) {
 
 void writeItem(uint item, uint w[16]) {
     const uint wordIndex = item * 16u;
-    const uint buf = wordIndex / pc.wordsPerBuf;
-    const uint idx = wordIndex - buf * pc.wordsPerBuf;
+    const uint buf = wordIndex >> pc.wordsPerBufShift;
+    const uint idx = wordIndex & ((1u << pc.wordsPerBufShift) - 1u);
     // Branch rather than a descriptor array. The value is the same for every
     // invocation in a subgroup that is writing neighbouring items, so this is
     // very nearly free.

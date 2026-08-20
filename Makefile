@@ -106,6 +106,7 @@ VK_SRC    = src/core/vk_common.cpp src/core/vk_registry.cpp \
             src/algos/kawpow/algo_vk.cpp
 
 VK_OBJS   = $(BUILD)/algo_vk_kawpow.o $(BUILD)/spirv_kawpow.o \
+            $(BUILD)/spirv_kawpow_spec.o \
             $(BUILD)/spirv_dag.o \
             $(BUILD)/stratum_kawpow_vk.o $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
             $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
@@ -169,6 +170,15 @@ $(BUILD)/spirv_dag.cpp: $(BUILD)/dag.spv scripts/embed_spirv.py | dirs
 	python3 scripts/embed_spirv.py $< $@ kProgpowDagSpirv
 
 $(BUILD)/spirv_dag.o: $(BUILD)/spirv_dag.cpp | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/kawpow_spec.spv: src/algos/kawpow/kernel_spec.comp | dirs
+	glslangValidator -V --target-env vulkan1.2 $< -o $@
+
+$(BUILD)/spirv_kawpow_spec.cpp: $(BUILD)/kawpow_spec.spv scripts/embed_spirv.py | dirs
+	python3 scripts/embed_spirv.py $< $@ kKawpowSpecSpirv
+
+$(BUILD)/spirv_kawpow_spec.o: $(BUILD)/spirv_kawpow_spec.cpp | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/spirv_kawpow.cpp: $(BUILD)/kawpow.spv scripts/embed_spirv.py | dirs
@@ -300,9 +310,11 @@ tests/test_kawpow_vulkan: tests/test_kawpow_vulkan.cpp $(PROGPOW_DEPS)
 
 # Needs a Vulkan GPU, so it is its own target like the CUDA device gate. It
 # skips itself politely when there is no usable device.
-test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv
+test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
+                    $(BUILD)/kawpow_spec.spv
 	@echo "--- kawpow: the Vulkan DAG and mix shaders vs the host reference ---"
-	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv
+	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
+		$(BUILD)/kawpow_spec.spv
 
 tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@

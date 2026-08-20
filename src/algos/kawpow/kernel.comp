@@ -69,8 +69,8 @@ layout(push_constant) uniform PC {
     uint countLo, countHi; // how many nonces this dispatch owns
     uint t[8];             // 256-bit target as word pairs, t[0..1] = limb 0
     uint numItems2048;
-    uint wordsPerBuf;
-    uint dumpMode;         // 1 = write every hash, tests only
+    uint wordsPerBufShift;  // log2, so the split costs a shift and not a divide
+    uint dumpMode;          // 1 = write every hash, tests only
 } pc;
 
 const uint FNV_PRIME = 0x01000193u;
@@ -325,13 +325,35 @@ void randomMerge(inout uint a, uint b, uint sel) {
     }
 }
 
+/**
+ * One word out of the split DAG.
+ *
+ * The buffer count is a power of two words on purpose. A divide by a runtime
+ * value here was the actual cost of this shader: four words per lane per
+ * round, sixty-four rounds, sixteen lanes is 4096 integer divisions per hash,
+ * and a GPU has no integer divide. Measured, it held the whole shader at 1.67
+ * MH/s while neither specialisation constants nor removing the per-round
+ * barriers moved it at all.
+ */
 uint dagWord(uint wordIndex) {
-    const uint buf = wordIndex / pc.wordsPerBuf;
-    const uint idx = wordIndex - buf * pc.wordsPerBuf;
+    const uint buf = wordIndex >> pc.wordsPerBufShift;
+    const uint idx = wordIndex & ((1u << pc.wordsPerBufShift) - 1u);
     if (buf == 0u) return dag0.w[idx];
     if (buf == 1u) return dag1.w[idx];
     if (buf == 2u) return dag2.w[idx];
     return dag3.w[idx];
+}
+
+/** The four words a lane reads in a round are contiguous and, because every
+ *  buffer is a multiple of 64 words, always in the same buffer - so the
+ *  selection is done once rather than four times. */
+void dagQuad(uint wordIndex, out uint d[4]) {
+    const uint buf = wordIndex >> pc.wordsPerBufShift;
+    const uint idx = wordIndex & ((1u << pc.wordsPerBufShift) - 1u);
+    if (buf == 0u)      { d[0] = dag0.w[idx]; d[1] = dag0.w[idx + 1u]; d[2] = dag0.w[idx + 2u]; d[3] = dag0.w[idx + 3u]; }
+    else if (buf == 1u) { d[0] = dag1.w[idx]; d[1] = dag1.w[idx + 1u]; d[2] = dag1.w[idx + 2u]; d[3] = dag1.w[idx + 3u]; }
+    else if (buf == 2u) { d[0] = dag2.w[idx]; d[1] = dag2.w[idx + 1u]; d[2] = dag2.w[idx + 2u]; d[3] = dag2.w[idx + 3u]; }
+    else                { d[0] = dag3.w[idx]; d[1] = dag3.w[idx + 1u]; d[2] = dag3.w[idx + 2u]; d[3] = dag3.w[idx + 3u]; }
 }
 
 void main() {
@@ -369,6 +391,13 @@ void main() {
     for (int i = 0; i < 32; i++) mix[i] = kissNext(rng);
 
     for (uint r = 0u; r < 64u; r++) {
+        // Lane (r % 16)'s register zero, through shared memory.
+        //
+        // A subgroup shuffle does this without the two barriers and was tried:
+        // it measured 1.67 MH/s against 1.67. It is not kept, because it would
+        // add a GL_KHR_shader_subgroup_shuffle requirement to every device for
+        // no measured gain, and an unused requirement is a device this miner
+        // refuses to run on for nothing.
         xlane[gl_LocalInvocationID.x] = mix[0];
         barrier();
         const uint seedReg = xlane[group * 16u + (r % 16u)];
@@ -378,7 +407,7 @@ void main() {
         const uint chunk = (lane ^ r) % 16u;
         const uint dbase = item * 64u + chunk * 4u;
         uint d[4];
-        for (int i = 0; i < 4; i++) d[i] = dagWord(dbase + uint(i));
+        dagQuad(dbase, d);
 
         for (int i = 0; i < 18; i++) {
             if (i < 11) {
