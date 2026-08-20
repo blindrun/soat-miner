@@ -52,8 +52,15 @@ namespace {
 
 using namespace om::kawpow;
 
-/** Four covers a 16 GiB DAG, which is past what any target card can hold. */
-const uint32_t kMaxDagBufs = 4;
+/**
+ * Eight buffers of under 2 GiB each, which covers a 16 GiB DAG.
+ *
+ * Eight rather than four is not about capacity. A storage buffer of 2 GiB or
+ * more measured 2x slower on device-local memory than the same data in a 1 GiB
+ * buffer, and 2 GiB is exactly the signed-32-bit boundary. Four buffers forced
+ * 2 GiB pieces for a 6 GB DAG; eight lets every piece stay under it.
+ */
+const uint32_t kMaxDagBufs = 8;
 const uint32_t kMaxSolutions = 256;
 /** 18 words per solution: nonce (2), final hash (8), mix hash (8). */
 const uint32_t kSolutionWords = 18;
@@ -235,8 +242,10 @@ class KawPowVK : public Algorithm {
         //
         // A power of two is also a multiple of 64 words, which is separately
         // required so a 2048-bit dataset item never straddles two buffers.
+        // Cap a buffer at 1 GiB of words. Not a device limit - a measured
+        // one: at or above 2 GiB the same data reads half as fast.
         uint64_t capWords = maxStorageRange_ / 4;
-        if (capWords > (3ull << 28)) capWords = 3ull << 28;   // under 4 GiB
+        if (capWords > (1ull << 28)) capWords = 1ull << 28;
         const uint64_t totalWords = (dagBytes + 3) / 4;
         uint32_t shift = 16;
         while ((1ull << shift) < ((totalWords + kMaxDagBufs - 1) / kMaxDagBufs))
@@ -286,13 +295,29 @@ class KawPowVK : public Algorithm {
         }
         destroyBuffer(&staging);
 
-        for (uint32_t i = 0; i < dagBufs_; i++)
-            if (!createBuffer(bytesPerBuf, deviceLocal(), &dag_[i])) {
-                fprintf(stderr,
-                        "[kawpow] cannot allocate DAG buffer %u of %u (%.2f GB "
-                        "each)\n", i + 1, dagBufs_, bytesPerBuf / 1e9);
-                return false;
-            }
+        // Two ways to back the split, because which one the driver maps well
+        // is a question about the driver, not about us.
+        //
+        // SOAT_DAG_ONEALLOC=1 takes ONE VkDeviceMemory for the whole DAG and
+        // suballocates the buffers into it at offsets, so the six buffers are
+        // one contiguous virtual range. wF:p1's reasoning for trying it: a
+        // hardware page-walk ceiling would bind CUDA equally over the same
+        // 6.11 GB and the same random gathers, and CUDA runs at 60.3 MH/s, so
+        // the cliff is how the VULKAN allocation is mapped rather than the GPU.
+        // If large-page promotion is keyed to allocation size, six 1 GiB
+        // allocations may each be getting small pages.
+        const bool oneAlloc = getenv("SOAT_DAG_ONEALLOC") != nullptr;
+        if (oneAlloc) {
+            if (!allocDagContiguous(bytesPerBuf)) return false;
+        } else {
+            for (uint32_t i = 0; i < dagBufs_; i++)
+                if (!createBuffer(bytesPerBuf, deviceLocal(), &dag_[i])) {
+                    fprintf(stderr,
+                            "[kawpow] cannot allocate DAG buffer %u of %u (%.2f "
+                            "GB each)\n", i + 1, dagBufs_, bytesPerBuf / 1e9);
+                    return false;
+                }
+        }
         // Unused bindings still need a real buffer bound, so they alias the
         // first one. The shader never indexes them: wordsPerBuf * dagBufs_
         // covers the whole DAG by construction.
@@ -346,7 +371,14 @@ class KawPowVK : public Algorithm {
             p.t[2 * i] = (uint32_t)job.target[i];
             p.t[2 * i + 1] = (uint32_t)(job.target[i] >> 32);
         }
+        // Diagnostic override: shrink the RANDOMLY TOUCHED region without
+        // changing the allocation, the buffers or anything else. Results are
+        // wrong when set. It is what separates "footprint" from "geometry".
         p.numItems2048 = numItems2048_;
+        if (const char *ov = getenv("SOAT_ITEMS_CLAMP")) {
+            const uint32_t v = (uint32_t)strtoul(ov, nullptr, 10);
+            if (v > 0 && v < numItems2048_) p.numItems2048 = v;
+        }
         p.wordsPerBufShift = wordsPerBufShift_;
         p.dumpMode = 0;
 
@@ -732,10 +764,61 @@ class KawPowVK : public Algorithm {
         return true;
     }
 
+    /** One allocation, six buffers bound into it at offsets. */
+    bool allocDagContiguous(VkDeviceSize bytesPerBuf) {
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytesPerBuf;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkMemoryRequirements req{};
+        {
+            VkBuffer probe = VK_NULL_HANDLE;
+            if (vkCreateBuffer(dev_, &bci, nullptr, &probe) != VK_SUCCESS)
+                return false;
+            vkGetBufferMemoryRequirements(dev_, probe, &req);
+            vkDestroyBuffer(dev_, probe, nullptr);
+        }
+        // Round the stride up to the required alignment; 1 GiB already is.
+        VkDeviceSize stride = bytesPerBuf;
+        if (req.alignment && (stride % req.alignment))
+            stride += req.alignment - (stride % req.alignment);
+
+        const uint32_t type = findMemType(req.memoryTypeBits, deviceLocal());
+        if (type == UINT32_MAX) return false;
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = stride * dagBufs_;
+        mai.memoryTypeIndex = type;
+        if (vkAllocateMemory(dev_, &mai, nullptr, &dagMem_) != VK_SUCCESS) {
+            fprintf(stderr, "[kawpow] one-allocation DAG of %.2f GB refused\n",
+                    (double)mai.allocationSize / 1e9);
+            dagMem_ = VK_NULL_HANDLE;
+            return false;
+        }
+        for (uint32_t i = 0; i < dagBufs_; i++) {
+            if (vkCreateBuffer(dev_, &bci, nullptr, &dag_[i].buf) != VK_SUCCESS)
+                return false;
+            if (vkBindBufferMemory(dev_, dag_[i].buf, dagMem_, stride * i) !=
+                VK_SUCCESS)
+                return false;
+            dag_[i].mem = VK_NULL_HANDLE;   // owned by dagMem_, not per-buffer
+            dag_[i].size = bytesPerBuf;
+        }
+        return true;
+    }
+
     void releaseDag() {
         // The unused bindings alias buffer 0, so only the real ones are freed.
         for (uint32_t i = 0; i < dagBufs_ && i < kMaxDagBufs; i++)
             destroyBuffer(&dag_[i]);
+        if (dagMem_) {
+            vkFreeMemory(dev_, dagMem_, nullptr);
+            dagMem_ = VK_NULL_HANDLE;
+        }
         for (uint32_t i = 0; i < kMaxDagBufs; i++) dag_[i] = Buffer{};
         destroyBuffer(&cacheBuf_);
         dagBufs_ = 0;
@@ -757,6 +840,7 @@ class KawPowVK : public Algorithm {
 
     Pipeline dagPipe_, mixPipe_;
     Buffer cacheBuf_, dag_[kMaxDagBufs], outBuf_, cntBuf_;
+    VkDeviceMemory dagMem_ = VK_NULL_HANDLE;   // set only in one-alloc mode
     uint32_t dagBufs_ = 0;
     uint32_t wordsPerBuf_ = 0;
     uint32_t wordsPerBufShift_ = 0;

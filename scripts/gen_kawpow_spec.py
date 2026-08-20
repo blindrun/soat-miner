@@ -97,7 +97,7 @@ def main():
     text = text.replace(loop.group(0), round_body() + "\n")
 
     # 3. Bindings shift down by one now that binding 0 is gone.
-    for old in range(1, 7):
+    for old in range(1, 11):
         text = text.replace(f"binding = {old})", f"binding = {old - 1})")
 
     # 4. Say what this file is, at the top, since it is generated.

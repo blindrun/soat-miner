@@ -80,7 +80,7 @@ class Harness {
     // property that stops a 16-word item straddling a boundary.
     static const uint32_t kWordsPerBufShift = 20;
     static const uint32_t kWordsPerBuf = 1u << kWordsPerBufShift;
-    static const uint32_t kNumBufs = 4;
+    static const uint32_t kNumBufs = 8;
     static const uint32_t kItems512 = (kWordsPerBuf * kNumBufs) / 16;
 
     bool init(int deviceIndex) {
@@ -511,8 +511,8 @@ int main(int argc, char **argv) {
     if (!h.init(deviceIndex)) return 0;   // skip, politely
 
     Harness::Pipeline dagPipe, mixPipe;
-    if (!h.buildPipeline(dagCode, 5, 16, 64, &dagPipe)) return 1;
-    if (!h.buildPipeline(mixCode, 7, 92, 64, &mixPipe)) return 1;
+    if (!h.buildPipeline(dagCode, 1 + Harness::kNumBufs, 16, 64, &dagPipe)) return 1;
+    if (!h.buildPipeline(mixCode, 3 + Harness::kNumBufs, 92, 64, &mixPipe)) return 1;
 
     // Epoch 0's light cache: 16 MB, and the smallest real one there is.
     const int epoch = 0;
@@ -540,7 +540,11 @@ int main(int argc, char **argv) {
                             &dag[i]))
             return 1;
 
-    h.writeDescriptors(dagPipe, {&cacheBuf, &dag[0], &dag[1], &dag[2], &dag[3]});
+    {
+        std::vector<Buffer *> bufs{&cacheBuf};
+        for (uint32_t i = 0; i < Harness::kNumBufs; i++) bufs.push_back(&dag[i]);
+        h.writeDescriptors(dagPipe, bufs);
+    }
 
     const uint32_t items = Harness::kItems512;
     printf("  building %u dataset items into %u buffers of %u words\n", items,
@@ -551,10 +555,14 @@ int main(int argc, char **argv) {
 
     // --- 1. the DAG shader vs the host --------------------------------------
     const uint32_t perBuf = Harness::kWordsPerBuf / 16;
-    std::vector<uint32_t> probes = {0,      1,           17,
-                                    perBuf - 1, perBuf,  perBuf + 1,
-                                    2 * perBuf - 1, 2 * perBuf,
-                                    3 * perBuf - 1, 3 * perBuf, items - 1};
+    std::vector<uint32_t> probes = {0, 1, 17};
+    // Both sides of every buffer boundary - that is where straddle arithmetic
+    // breaks and nowhere else.
+    for (uint32_t b = 1; b < Harness::kNumBufs; b++) {
+        probes.push_back(b * perBuf - 1);
+        probes.push_back(b * perBuf);
+    }
+    probes.push_back(items - 1);
     int mismatched = 0;
     for (uint32_t idx : probes) {
         uint32_t host[16];
@@ -574,7 +582,7 @@ int main(int argc, char **argv) {
         }
     }
     check(mismatched == 0,
-          "every sampled DAG item matches the host, across all four buffers");
+          "every sampled DAG item matches the host, across every buffer");
 
     uint32_t first[16];
     h.download(&dag[0], 0, first, sizeof(first));
@@ -624,8 +632,13 @@ int main(int argc, char **argv) {
     const uint32_t zero = 0;
     h.upload(&cntBuf, &zero, 4);
 
-    h.writeDescriptors(mixPipe, {&progBuf, &dag[0], &dag[1], &dag[2], &dag[3],
-                                 &outBuf, &cntBuf});
+    {
+        std::vector<Buffer *> bufs{&progBuf};
+        for (uint32_t i = 0; i < Harness::kNumBufs; i++) bufs.push_back(&dag[i]);
+        bufs.push_back(&outBuf);
+        bufs.push_back(&cntBuf);
+        h.writeDescriptors(mixPipe, bufs);
+    }
 
     uint32_t mp[23]{};
     uint32_t hdr[8];
@@ -691,9 +704,14 @@ int main(int argc, char **argv) {
         }
         Harness::Pipeline specPipe;
         // Binding 0 is gone with the program, so everything shifts down one.
-        if (!h.buildPipelineSpec(specCode, 6, 92, vals, ids, &specPipe)) return 1;
-        h.writeDescriptors(specPipe, {&dag[0], &dag[1], &dag[2], &dag[3],
-                                      &outBuf, &cntBuf});
+        if (!h.buildPipelineSpec(specCode, 2 + Harness::kNumBufs, 92, vals, ids,
+                                 &specPipe))
+            return 1;
+        std::vector<Buffer *> sbufs;
+        for (uint32_t i = 0; i < Harness::kNumBufs; i++) sbufs.push_back(&dag[i]);
+        sbufs.push_back(&outBuf);
+        sbufs.push_back(&cntBuf);
+        h.writeDescriptors(specPipe, sbufs);
         std::vector<uint32_t> zeros(kNonces * 18, 0);
         h.upload(&outBuf, zeros.data(), zeros.size() * 4);
         if (!h.dispatch(specPipe, mp, (kNonces + 3) / 4)) return 1;

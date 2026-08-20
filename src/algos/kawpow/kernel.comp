@@ -58,10 +58,14 @@ layout(std430, binding = 1) readonly buffer Dag0 { uint w[]; } dag0;
 layout(std430, binding = 2) readonly buffer Dag1 { uint w[]; } dag1;
 layout(std430, binding = 3) readonly buffer Dag2 { uint w[]; } dag2;
 layout(std430, binding = 4) readonly buffer Dag3 { uint w[]; } dag3;
+layout(std430, binding = 5) readonly buffer Dag4 { uint w[]; } dag4;
+layout(std430, binding = 6) readonly buffer Dag5 { uint w[]; } dag5;
+layout(std430, binding = 7) readonly buffer Dag6 { uint w[]; } dag6;
+layout(std430, binding = 8) readonly buffer Dag7 { uint w[]; } dag7;
 
 // 18 words per solution: nonce (2), final hash (8), mix hash (8).
-layout(std430, binding = 5) buffer Out { uint v[]; } outbuf;
-layout(std430, binding = 6) buffer Cnt { uint n; } cnt;
+layout(std430, binding = 9) buffer Out { uint v[]; } outbuf;
+layout(std430, binding = 10) buffer Cnt { uint n; } cnt;
 
 layout(push_constant) uniform PC {
     uint h[8];             // header hash, little-endian words
@@ -341,7 +345,11 @@ uint dagWord(uint wordIndex) {
     if (buf == 0u) return dag0.w[idx];
     if (buf == 1u) return dag1.w[idx];
     if (buf == 2u) return dag2.w[idx];
-    return dag3.w[idx];
+    if (buf == 3u) return dag3.w[idx];
+    if (buf == 4u) return dag4.w[idx];
+    if (buf == 5u) return dag5.w[idx];
+    if (buf == 6u) return dag6.w[idx];
+    return dag7.w[idx];
 }
 
 /** The four words a lane reads in a round are contiguous and, because every
@@ -350,10 +358,14 @@ uint dagWord(uint wordIndex) {
 void dagQuad(uint wordIndex, out uint d[4]) {
     const uint buf = wordIndex >> pc.wordsPerBufShift;
     const uint idx = wordIndex & ((1u << pc.wordsPerBufShift) - 1u);
-    if (buf == 0u)      { d[0] = dag0.w[idx]; d[1] = dag0.w[idx + 1u]; d[2] = dag0.w[idx + 2u]; d[3] = dag0.w[idx + 3u]; }
+    if (buf == 0u) { d[0] = dag0.w[idx]; d[1] = dag0.w[idx + 1u]; d[2] = dag0.w[idx + 2u]; d[3] = dag0.w[idx + 3u]; }
     else if (buf == 1u) { d[0] = dag1.w[idx]; d[1] = dag1.w[idx + 1u]; d[2] = dag1.w[idx + 2u]; d[3] = dag1.w[idx + 3u]; }
     else if (buf == 2u) { d[0] = dag2.w[idx]; d[1] = dag2.w[idx + 1u]; d[2] = dag2.w[idx + 2u]; d[3] = dag2.w[idx + 3u]; }
-    else                { d[0] = dag3.w[idx]; d[1] = dag3.w[idx + 1u]; d[2] = dag3.w[idx + 2u]; d[3] = dag3.w[idx + 3u]; }
+    else if (buf == 3u) { d[0] = dag3.w[idx]; d[1] = dag3.w[idx + 1u]; d[2] = dag3.w[idx + 2u]; d[3] = dag3.w[idx + 3u]; }
+    else if (buf == 4u) { d[0] = dag4.w[idx]; d[1] = dag4.w[idx + 1u]; d[2] = dag4.w[idx + 2u]; d[3] = dag4.w[idx + 3u]; }
+    else if (buf == 5u) { d[0] = dag5.w[idx]; d[1] = dag5.w[idx + 1u]; d[2] = dag5.w[idx + 2u]; d[3] = dag5.w[idx + 3u]; }
+    else if (buf == 6u) { d[0] = dag6.w[idx]; d[1] = dag6.w[idx + 1u]; d[2] = dag6.w[idx + 2u]; d[3] = dag6.w[idx + 3u]; }
+    else                { d[0] = dag7.w[idx]; d[1] = dag7.w[idx + 1u]; d[2] = dag7.w[idx + 2u]; d[3] = dag7.w[idx + 3u]; }
 }
 
 void main() {
