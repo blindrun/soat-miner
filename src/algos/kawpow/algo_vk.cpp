@@ -24,6 +24,7 @@
 // pool, a descriptor set and a push-constant range.
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -247,6 +248,12 @@ class KawPowVK : public Algorithm {
                     "most %.2f GB on this device.\n",
                     dagBytes / 1e9, kMaxDagBufs, capWords * 4 / 1e9);
             return false;
+        }
+        // Debug knob for the buffer-size investigation. Not a tuning option:
+        // it exists so the split can be varied without a rebuild.
+        if (const char *ov = getenv("SOAT_DAG_SHIFT")) {
+            const int v = atoi(ov);
+            if (v >= 16 && v <= 30) shift = (uint32_t)v;
         }
         wordsPerBufShift_ = shift;
         wordsPerBuf_ = 1u << shift;
