@@ -589,17 +589,33 @@ $(WINDIR)/libvulkan-1.a: $(VK_SRC) | $(WINDIR)/include/vulkan
 	   | sed 's/^/    /'; } > $(WINDIR)/vulkan-1.def
 	x86_64-w64-mingw32-dlltool -d $(WINDIR)/vulkan-1.def -l $@
 
-# stratum_btc.cpp is here because run.cpp references BitcoinStratumSource
-# unconditionally. The Linux Vulkan target already links stratum_btc_vk.o; this
-# one did not, so adding BC3 broke the Windows cross-build at link time with an
-# undefined symbol and nothing else changed.
-windows: $(BUILD)/spirv.cpp $(BUILD)/spirv_sha3.cpp $(WINDIR)/libvulkan-1.a
+# EVERY object in the Linux Vulkan build must appear here too, including the
+# per-algorithm stratum sources, because run.cpp and vk_registry.cpp reference
+# them unconditionally.
+#
+# This list has now been forgotten TWICE. Adding BC3 broke the cross-build with
+# an undefined BitcoinStratumSource; adding KawPow broke it again with
+# makeKawpowVK and KawpowStratumSource, in a session where the comment warning
+# about the first one was directly above the target. A warning nothing checks
+# does not prevent anything.
+#
+# So when adding an algorithm: build this target. `make windows` is the check,
+# it needs only mingw and takes seconds, and it is the ONLY thing that catches
+# this - the Linux build is perfectly happy either way.
+windows: $(BUILD)/spirv.cpp $(BUILD)/spirv_sha3.cpp $(BUILD)/spirv_kawpow.cpp \
+         $(BUILD)/spirv_kawpow_spec.cpp $(BUILD)/spirv_dag.cpp \
+         $(WINDIR)/libvulkan-1.a
 	$(WINCXX) $(WINFLAGS) -c src/core/vk_common.cpp          -o $(WINDIR)/vk_common.o
 	$(WINCXX) $(WINFLAGS) -c src/core/vk_registry.cpp        -o $(WINDIR)/vk_registry.o
 	$(WINCXX) $(WINFLAGS) -c src/algos/autolykos2/algo_vk.cpp -o $(WINDIR)/algo_vk.o
 	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv.cpp              -o $(WINDIR)/spirv.o
 	$(WINCXX) $(WINFLAGS) -c src/algos/sha3-256t/algo_vk.cpp -o $(WINDIR)/algo_vk_sha3.o
 	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv_sha3.cpp         -o $(WINDIR)/spirv_sha3.o
+	$(WINCXX) $(WINFLAGS) -c src/algos/kawpow/algo_vk.cpp    -o $(WINDIR)/algo_vk_kawpow.o
+	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv_kawpow.cpp       -o $(WINDIR)/spirv_kawpow.o
+	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv_kawpow_spec.cpp  -o $(WINDIR)/spirv_kawpow_spec.o
+	$(WINCXX) $(WINFLAGS) -c $(BUILD)/spirv_dag.cpp          -o $(WINDIR)/spirv_dag.o
+	$(WINCXX) $(WINFLAGS) -c src/core/stratum_kawpow.cpp     -o $(WINDIR)/stratum_kawpow.o
 	$(WINCXX) $(WINFLAGS) -c src/core/run.cpp                -o $(WINDIR)/run.o
 	$(WINCXX) $(WINFLAGS) -c src/core/stratum.cpp            -o $(WINDIR)/stratum.o
 	$(WINCXX) $(WINFLAGS) -c src/core/stratum_btc.cpp        -o $(WINDIR)/stratum_btc.o
@@ -608,6 +624,9 @@ windows: $(BUILD)/spirv.cpp $(BUILD)/spirv_sha3.cpp $(WINDIR)/libvulkan-1.a
 	    $(WINDIR)/vk_registry.o \
 	    $(WINDIR)/algo_vk.o $(WINDIR)/spirv.o \
 	    $(WINDIR)/algo_vk_sha3.o $(WINDIR)/spirv_sha3.o \
+	    $(WINDIR)/algo_vk_kawpow.o $(WINDIR)/spirv_kawpow.o \
+	    $(WINDIR)/spirv_kawpow_spec.o $(WINDIR)/spirv_dag.o \
+	    $(WINDIR)/stratum_kawpow.o \
 	    $(WINDIR)/run.o $(WINDIR)/stratum.o $(WINDIR)/stratum_btc.o \
 	    $(WINDIR)/libvulkan-1.a -lws2_32 \
 	    -o $(WINDIR)/soat-miner-vk.exe
