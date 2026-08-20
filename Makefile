@@ -77,7 +77,8 @@ CXXFLAGS = -O3 --std=c++17 -Isrc
 # CUDA 12.4 (max sm_90) run on Blackwell at all. Measured: identical hashrate
 # (217.6 vs 217.5 MH/s on a 4090) and the same ~60 s build.
 CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu \
-            src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu
+            src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu \
+            src/algos/kawpow/algo.cu
 CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp \
                src/core/stratum_btc.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
@@ -85,7 +86,11 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
             src/core/stratum_btc.h src/core/btc_job.h src/core/sha256.h \
             src/core/btc_protocol.h src/core/bc3_destination.h src/core/json_lite.h src/algos/sha3-256t/sha3.h \
-            src/algos/sha3-256t/mine.cuh
+            src/algos/sha3-256t/mine.cuh \
+            src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+            src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
+            src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+            src/algos/progpow/progpow.h
 
 # The Vulkan build carries one object per algorithm plus its embedded SPIR-V
 # module, and vk_common.o holds the registry and the shared device handling.
@@ -376,7 +381,11 @@ tests/test_hit: tests/test_hit.cu src/algos/autolykos2/mine.cuh src/core/blake2b
 
 tests/test_sha3_algo: tests/test_sha3_algo.cu tests/sha3_vectors.h \
                       src/algos/sha3-256t/algo.cu \
-                      src/algos/sha3-256t/mine.cuh src/algos/sha3-256t/sha3.h \
+                      src/algos/sha3-256t/mine.cuh \
+            src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+            src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
+            src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+            src/algos/progpow/progpow.h src/algos/sha3-256t/sha3.h \
                       src/core/algo.h src/core/btc_job.h
 	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
 
