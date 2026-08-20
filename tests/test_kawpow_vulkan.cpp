@@ -522,6 +522,14 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> cache((size_t)numCacheItems * 16, 0);
     buildLightCache(cache.data(), numCacheItems, seed);
 
+    // HOST_VISIBLE on purpose, and NEVER time anything with this harness
+    // because of it. On a discrete GPU that is system RAM across PCIe, which
+    // is exactly the trap that made another lane's Merkle stage look 27x
+    // slower than CUDA when it was 1.29x. This is a correctness harness: it
+    // compares words, it does not measure rates, and mapping the buffers
+    // directly is what makes the comparison simple. The miner itself asks for
+    // DEVICE_LOCAL - src/algos/kawpow/algo_vk.cpp - and that is where the
+    // numbers come from.
     Buffer cacheBuf, dag[Harness::kNumBufs];
     const VkMemoryPropertyFlags hostVisible =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
