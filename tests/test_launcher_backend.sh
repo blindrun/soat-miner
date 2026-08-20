@@ -36,20 +36,45 @@ fail=0
 # $3 = BACKEND
 # $4 = compute capability nvidia-smi should report, or "none" for no GPU
 # rest = extra command-line arguments
-pick() {
-    local stubs="$1" algo="$2" backend="$3" cap="$4"; shift 4
-    local dir
-    dir="$(mktemp -d)"
+# Builds a fake mining rig in a temp dir: a stubbed nvidia-smi, both miner
+# binaries, and a config.txt. Defined ONCE and used by both pick() and
+# pick_output(); it started as two copies that had to agree and immediately
+# did not - the multi-GPU stub was added to one of them and the warning cases
+# silently kept testing a single-GPU machine.
+#
+# $1 = dir, $2 = stubs ("both"|"vk-only"), $3 = ALGO, $4 = BACKEND
+# $5 = rig: "none" for no NVIDIA GPU, "8.9" for one card, or a
+#      comma-separated list of memMiB:cap pairs for several.
+build_rig() {
+    local dir="$1" stubs="$2" algo="$3" backend="$4" cap="$5"
     mkdir -p "$dir/bin"
     if [ "$cap" = "none" ]; then
         printf '#!/bin/sh\nexit 1\n' > "$dir/bin/nvidia-smi"
     else
+        local spec="$cap"
+        case "$spec" in
+            *:*) : ;;
+            *)   spec="16376:$cap" ;;
+        esac
         cat > "$dir/bin/nvidia-smi" <<STUB
 #!/bin/sh
+# The two-field query must be matched BEFORE the one-field query, or the
+# caps-only call returns "mem, cap" and every capability parses as VRAM.
+spec="$spec"
+emit() {
+  printf '%s\n' "\$spec" | tr ',' '\n' | while IFS=: read -r mem c; do
+    case "\$1" in
+      pair) echo "\$mem, \$c" ;;
+      cap)  echo "\$c" ;;
+      list) echo "GPU: STUB (UUID: GPU-x)" ;;
+    esac
+  done
+}
 case "\$*" in
-  *-L*)            echo "GPU 0: STUB (UUID: GPU-0)" ;;
-  *compute_cap*)   echo "16376, $cap" ;;
-  *)               echo "STUB" ;;
+  *-L*)                       emit list ;;
+  *memory.total,compute_cap*) emit pair ;;
+  *compute_cap*)              emit cap ;;
+  *)                          echo "STUB" ;;
 esac
 STUB
     fi
@@ -61,6 +86,14 @@ STUB
     printf '#!/bin/sh\necho VULKAN\n' > "$dir/soat-miner-vk"
     chmod +x "$dir/soat-miner" "$dir/soat-miner-vk" "$dir/soat-miner.sh"
     [ "$stubs" = "vk-only" ] && rm -f "$dir/soat-miner"
+    return 0
+}
+
+pick() {
+    local stubs="$1" algo="$2" backend="$3" cap="$4"; shift 4
+    local dir
+    dir="$(mktemp -d)"
+    build_rig "$dir" "$stubs" "$algo" "$backend" "$cap"
     ( cd "$dir" && PATH="$dir/bin:$PATH" ./soat-miner.sh --bench "$@" 2>&1 ) \
         | grep -Eo '^(CUDA|VULKAN)$' | head -1
     rm -rf "$dir"
@@ -78,23 +111,7 @@ pick_output() {
     local stubs="$1" algo="$2" backend="$3" cap="$4"; shift 4
     local dir
     dir="$(mktemp -d)"
-    mkdir -p "$dir/bin"
-    cat > "$dir/bin/nvidia-smi" <<STUB
-#!/bin/sh
-case "\$*" in
-  *-L*)          echo "GPU 0: STUB (UUID: GPU-0)" ;;
-  *compute_cap*) echo "16376, $cap" ;;
-  *)             echo "STUB" ;;
-esac
-STUB
-    chmod +x "$dir/bin/nvidia-smi"
-    cp "$LAUNCHER" "$dir/soat-miner.sh"
-    cp "$HERE/packaging/config.txt" "$dir/"
-    sed -i "s/^ALGO=.*/ALGO=$algo/; s/^BACKEND=.*/BACKEND=$backend/" "$dir/config.txt"
-    printf '#!/bin/sh\necho CUDA\n' > "$dir/soat-miner"
-    printf '#!/bin/sh\necho VULKAN\n' > "$dir/soat-miner-vk"
-    chmod +x "$dir/soat-miner" "$dir/soat-miner-vk" "$dir/soat-miner.sh"
-    [ "$stubs" = "vk-only" ] && rm -f "$dir/soat-miner"
+    build_rig "$dir" "$stubs" "$algo" "$backend" "$cap"
     ( cd "$dir" && PATH="$dir/bin:$PATH" ./soat-miner.sh --bench "$@" 2>&1 )
     rm -rf "$dir"
 }
@@ -145,6 +162,30 @@ check "kawpow on a non-NVIDIA machine picks Vulkan" VULKAN \
 warned="$(pick_output vk-only kawpow auto 12.0 | grep -ci 'slow path')"
 check "kawpow warns rather than silently running Vulkan with no CUDA binary" \
       1 "$warned"
+
+# --- mixed rigs ---------------------------------------------------------
+# A homogeneous multi-GPU rig is not ambiguous and must behave exactly like a
+# single card of that generation - no warning, same backend.
+check "two identical Blackwells still pick Vulkan" VULKAN \
+      "$(pick both autolykos2 auto 32000:12.0,32000:12.0)"
+check "a homogeneous rig does not warn about mixed capabilities" 0 \
+      "$(pick_output both autolykos2 auto 32000:12.0,32000:12.0 |
+         grep -ci 'different compute')"
+
+# The one that used to be wrong. Largest VRAM is the Ada card, so the launcher
+# read 8.9 and chose CUDA - but the CUDA binary mines on device 0, which here
+# is the Blackwell. Whichever card ran, one of the two rules was wrong about
+# it, and nothing said so.
+check "a mixed Blackwell/Ada rig does not silently guess a backend" 1 \
+      "$(pick_output both autolykos2 auto 16376:12.0,24564:8.9 |
+         grep -ci 'not well defined')"
+check "and it names both capabilities so the user can tell which cards" 1 \
+      "$(pick_output both autolykos2 auto 16376:12.0,24564:8.9 |
+         grep -c '8.9' | head -1)"
+# CUDA is the backend that works on every NVIDIA generation present, so an
+# ambiguous rig takes it rather than the one that is merely faster on some.
+check "an ambiguous rig falls back to the backend that works on all of them" \
+      CUDA "$(pick both autolykos2 auto 16376:12.0,24564:8.9)"
 
 if [ "$fail" -eq 0 ]; then
     echo "launcher backend selection: all checks passed"

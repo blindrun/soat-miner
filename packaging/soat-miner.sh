@@ -108,13 +108,37 @@ fi
 
 if [[ "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    # Largest VRAM wins, which is the same rule the binaries use to pick a
-    # device - so the launcher and the miner agree which GPU this is about.
-    cap=$(nvidia-smi --query-gpu=memory.total,compute_cap \
-            --format=csv,noheader,nounits 2>/dev/null |
-          sort -t, -k1 -n | tail -1 | cut -d, -f2 | tr -d '[:space:]')
+    # This used to say largest VRAM wins, "the same rule the binaries use", and
+    # that was not true. The Vulkan build defaults to the largest-VRAM device;
+    # the CUDA build defaults to device 0. On a rig where those are different
+    # cards of different generations, the launcher read one card's capability
+    # and the miner then ran on the other - silently, and looking fine.
+    #
+    # Passing --device to force agreement is NOT the fix and must not be added
+    # later: nvidia-smi enumerates by PCI bus order while CUDA defaults to
+    # fastest-first, so an index handed across that boundary can name a
+    # different card again. Vulkan enumerates in its own order on top of that.
+    #
+    # So: only decide automatically when every NVIDIA GPU present reports the
+    # same capability, which is every single-GPU machine and every homogeneous
+    # rig. When they differ the automatic answer is not well defined, and the
+    # honest move is to say so and take the backend that works on all of them.
+    caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits \
+             2>/dev/null | tr -d '[:blank:]' | grep . | sort -u)
+    ncaps=$(printf '%s\n' "$caps" | grep -c . || true)
+    cap=$(printf '%s\n' "$caps" | head -1)
     major="${cap%%.*}"
-    if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )); then
+
+    if [[ "$ncaps" =~ ^[0-9]+$ ]] && (( ncaps > 1 )); then
+      BACKEND=cuda
+      echo "warning: this machine has NVIDIA GPUs of different compute"
+      echo "         capabilities ($(printf '%s' "$caps" | tr '\n' ' '))."
+      echo "         The CUDA build would mine on device 0 and the Vulkan"
+      echo "         build on the largest-VRAM card, which may not be the"
+      echo "         same GPU, so the automatic backend is not well defined."
+      echo "         Using CUDA, which is correct on all of them. Set"
+      echo "         BACKEND= and DEVICE= in config.txt to choose properly."
+    elif [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )); then
       BACKEND=vulkan
       echo "auto: compute capability $cap (Blackwell) - Vulkan, ~22% faster than CUDA here"
     else
