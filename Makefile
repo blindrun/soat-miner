@@ -358,6 +358,9 @@ tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 tests/test_progpow_ops: tests/test_progpow_ops.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+tests/test_progpow_092: tests/test_progpow_092.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
                            src/core/stratum_kawpow.cpp \
                            src/core/stratum_kawpow.h src/core/json_lite.h \
@@ -373,6 +376,7 @@ tests/test_kawpow_address: tests/test_kawpow_address.cpp src/core/kawpow_address
 # binaries have to exist for it to say anything.
 test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
              tests/test_progpow_stock tests/test_progpow_ops \
+             tests/test_progpow_092 \
              tests/test_kawpow_stratum tests/test_kawpow_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
@@ -396,6 +400,8 @@ test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
 		printf '  %-14s ' "$$m"; \
 		./tests/test_progpow_stock $$m --expect-fail || exit 1; \
 	done
+	@echo "--- progpow 0.9.2: the layers ProgPowZ needs, vs published vectors ---"
+	@./tests/test_progpow_092
 	@echo "--- kawpow: stratum, against shapes captured from live pools ---"
 	@./tests/test_kawpow_stratum
 	@echo "--- kawpow: Ravencoin address validation ---"
