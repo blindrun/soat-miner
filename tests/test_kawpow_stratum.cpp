@@ -278,6 +278,39 @@ int main() {
         delete c;
     }
 
+    // A pool is free to put whitespace anywhere JSON allows and to order its
+    // keys however it likes. A client that matches the bytes "result":true
+    // gets both of these wrong and silently miscounts every share.
+    {
+        auto *c = make();
+        c->feedLineForTest("{\"id\": 10, \"result\": true, \"error\": null}");
+        c->feedLineForTest("{\"id\":11,\"error\":null,\"result\":true}");
+        c->feedLineForTest("{\"id\"\t:\n12,\"result\"  :  false,\"error\":null}");
+        uint64_t a = 0, r = 0, p = 0;
+        std::string e;
+        c->poolCounters(&a, &r, &p, &e);
+        check(a == 2 && r == 1,
+              "spacing and key order do not change the verdict");
+        delete c;
+    }
+
+    // The dangerous direction is optimistic. A reply whose result we cannot
+    // read must not be counted as an accepted share - that is a number that
+    // disagrees with the payout, and it disagrees in the direction that looks
+    // like everything is fine.
+    {
+        auto *c = make();
+        c->feedLineForTest("{\"id\":10,\"error\":null}");
+        c->feedLineForTest("{\"id\":11,\"result\":null,\"error\":null}");
+        uint64_t a = 0, r = 0, p = 0;
+        std::string e;
+        c->poolCounters(&a, &r, &p, &e);
+        check(a == 0, "an unreadable submit reply is not counted as accepted");
+        check(!c->takeJobWarning().empty(),
+              "an unreadable submit reply warns rather than passing silently");
+        delete c;
+    }
+
     if (g_fail == 0) printf("KawPow stratum: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

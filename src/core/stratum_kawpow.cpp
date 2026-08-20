@@ -410,16 +410,43 @@ void KawpowStratumSource::handleLine(const std::string &line) {
         return;
     }
     if (id >= kFirstSubmitId) {
-        std::lock_guard<std::mutex> lk(submitMu_);
-        std::string result;
-        jsonRawValue(line, "result", &result);
-        if (isErr || result == "false") {
-            rejected_++;
-            lastSubmitError_ = isErr ? errRaw : std::string("pool said false");
-            verdict_ = "share rejected: " + lastSubmitError_;
-        } else {
-            accepted_++;
-            verdict_ = "share accepted";
+        // Both verdicts are read out of the parsed `result` value, never
+        // matched as bytes in the line: a pool is free to space and order its
+        // JSON however it likes, and "result": true is the same reply as
+        // "result":true.
+        std::string warn;
+        {
+            std::lock_guard<std::mutex> lk(submitMu_);
+            std::string result;
+            const bool haveResult = jsonRawValue(line, "result", &result);
+            if (isErr || (haveResult && result == "false")) {
+                rejected_++;
+                lastSubmitError_ =
+                    isErr ? errRaw : std::string("pool said false");
+                verdict_ = "share rejected: " + lastSubmitError_;
+            } else if (haveResult && result == "true") {
+                accepted_++;
+                verdict_ = "share accepted";
+            } else {
+                // Neither. This pool answered a submission in a shape this
+                // client cannot read, and there is no safe way to guess.
+                //
+                // Guessing "accepted" is the tempting default and the worst
+                // one: it is a share count that disagrees with the payout,
+                // and it disagrees in the direction that looks like nothing
+                // is wrong. Leaving it uncounted parks it in `pending`, which
+                // then climbs and stays climbing, and says so once - loudly -
+                // rather than letting the operator find out from the payout.
+                warn = "pool answered a share submission in a shape this "
+                       "miner cannot read, so it counts as neither accepted "
+                       "nor rejected: " + line;
+            }
+        }
+        // Deliberately outside the submitMu_ scope. Nothing else in this file
+        // holds both locks at once and this is not the place to start.
+        if (!warn.empty()) {
+            std::lock_guard<std::mutex> lk(mu_);
+            jobWarning_ = warn;
         }
     }
 }
