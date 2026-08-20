@@ -16,7 +16,7 @@ Download the release for your os.
 
 https://github.com/blindrun/soat-miner/releases
 
-Unpack it on Linux with command tar xzf soat-miner_v0.1.2_Lin64.tar.gz
+Unpack it on Linux with command tar xzf soat-miner_v0.2.17_Lin64.tar.gz
 
 On Windows just unzip it.
 

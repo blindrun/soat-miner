@@ -367,7 +367,7 @@ clean:
 	       tests/test_sha3_algo tests/test_sha3_vulkan
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
-VERSION ?= 0.1.2
+VERSION ?= 0.2.17
 PKGNAME  = soat-miner_v$(VERSION)_Lin64
 package: cuda vulkan
 	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)
