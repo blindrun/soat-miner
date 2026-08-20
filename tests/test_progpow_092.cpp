@@ -45,9 +45,22 @@
 //   per lane, the destination registers, or the chunk mapping - and not in
 //   the dataset, the parameters, or any progPowInit layer.
 //
-//   Deliberately NOT stated: which of those it is. PROGPOW_DAG_LOADS is the
-//   obvious suspect and remains a guess; "not the content" is not "therefore
-//   the load count".
+//   CORRECTION, from testing that instead of believing it: the DAG is NOT
+//   where the divergence starts. Sweeping the merge structure - 1, 2 or 4
+//   words per lane crossed with strides of 1, 2, 4 - gives 177/512 in all
+//   nine cases, as does zeroing the DAG. If the wrong registers were the
+//   DAG-touched ones, changing which registers the merge writes would move
+//   the count. It does not move at all.
+//
+//   Two further properties of the 177: the expected state differs from the
+//   initial fill_mix state in all 512 words, so the matches are genuine and
+//   not untouched registers; and every one of the 32 registers is written
+//   during the round, so there is no untouched class at all.
+//
+//   Correct primitives, correct program, correct DAG handling, and the loop
+//   still lands ~35% right. What remains untested: the L1 cache (c_dag)
+//   contents, for which this document publishes no anchor, and the order the
+//   ops are applied in. Candidates, not findings.
 //
 // NOT REPRODUCED, and this is the honest state of ProgPowZ
 //   The end-to-end progPowHash still matches 0 of 13. Run with --e2e to see
@@ -349,7 +362,27 @@ int main(int argc, char **argv) {
            "program KISS99 state for period 600 matches");
     }
 
-    // --- 5. the register permutations for period 600 ----------------------
+    // --- 5. random_merge, every row of the document's merge table ---------
+    // Untested when I first claimed the remaining gap was in the DAG access.
+    // It is correct, which is part of why that claim did not survive.
+    {
+        struct R { uint32_t a, b, r, want; };
+        const R rows[] = {
+          {0x3B0BB37Du,0xA0212004u,0x9BD26AB0u,0x3CA34321u},
+          {0x10C02F0Du,0x870FA227u,0xD4F45515u,0x91C1326Au},
+          {0x24D2BAE4u,0x0FFB4C9Bu,0x7FDBC2F2u,0x2EDDD94Cu},
+          {0xDA39E821u,0x089C4008u,0x8B6CD8C3u,0x8A81E396u},
+        };
+        size_t ok = 0;
+        for (const R &x : rows) {
+            uint32_t a = x.a;
+            randomMerge(&a, x.b, x.r);
+            if (a == x.want) ok++;
+        }
+        ck(ok == 4, "random_merge matches all four rows of the merge table");
+    }
+
+    // --- 6. the register permutations for period 600 ----------------------
     {
         const uint32_t wantSrc[32]={
           0x1A,0x1E,0x01,0x13,0x0B,0x15,0x0F,0x12,0x03,0x11,0x1F,0x10,
