@@ -620,20 +620,30 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     // Deliberately NOT the accepted count: that already has its own line lower
     // down, and printing it twice on one screen makes the reader check whether
     // the two disagree. This says one thing - the loop is turning.
+    // Pearl does not hash. A candidate is a 16x16 tile of a matrix product, and
+    // calling a million of them a megahash invites a straight comparison with
+    // Ergo and BC3 that means nothing - Pearl's 66 MC/s and BC3's 1543 MH/s are
+    // different units, and labelling both "MH/s" makes Pearl look broken and slow.
+    // This labelling exists on algo/pearl and was missing from this tree.
+    const bool candidates = s.algo.rfind("pearl", 0) == 0;
+    const char *rateUnit = candidates ? "MC/s" : "MH/s";
+    const char *effUnit = candidates ? "MC/W" : "MH/W";
+
     static unsigned pulse = 0;
     pulse++;
     char act[64];
     snprintf(act, sizeof(act), "%s%s MINING%s",
              C_ORANGE, kPulse[pulse % kPulseFrames], C_RESET);
-    printf("   " C_BOLD C_GREEN "%9.2f MH/s" C_RESET "   " C_DIM "avg" C_RESET
+    printf("   " C_BOLD C_GREEN "%9.2f %s" C_RESET "   " C_DIM "avg" C_RESET
            " %7.2f   %s\033[K\n",
-           s.hashrate, s.hashrateAvg, act);
+           s.hashrate, rateUnit, s.hashrateAvg, act);
     lines++;
 
     if (t.valid) {
         printf("   %6.0f W   %s%3u C" C_RESET "   fan %3u%%   " C_DIM "eff" C_RESET
-               " " C_ORANGE "%5.2f" C_RESET " MH/W\033[K\n",
-               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff);
+               " " C_ORANGE "%5.2f" C_RESET " %s\033[K\n",
+               watts, tempColor(t.temperatureC), t.temperatureC, t.fanPercent, eff,
+               effUnit);
         lines++;
         if (t.smClockMhz || t.memClockMhz) {
             printf("   " C_DIM "core" C_RESET " %5u MHz   " C_DIM "mem" C_RESET
