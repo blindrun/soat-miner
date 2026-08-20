@@ -102,9 +102,12 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
 # copied, and two lines in src/core/vk_common.cpp.
 VK_SRC    = src/core/vk_common.cpp src/core/vk_registry.cpp \
             src/algos/autolykos2/algo_vk.cpp \
-            src/algos/sha3-256t/algo_vk.cpp
+            src/algos/sha3-256t/algo_vk.cpp \
+            src/algos/kawpow/algo_vk.cpp
 
-VK_OBJS   = $(BUILD)/stratum_kawpow_vk.o $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
+VK_OBJS   = $(BUILD)/algo_vk_kawpow.o $(BUILD)/spirv_kawpow.o \
+            $(BUILD)/spirv_dag.o \
+            $(BUILD)/stratum_kawpow_vk.o $(BUILD)/miner_vk.o $(BUILD)/vk_common.o $(BUILD)/vk_registry.o \
             $(BUILD)/algo_vk.o $(BUILD)/spirv.o \
             $(BUILD)/algo_vk_sha3.o $(BUILD)/spirv_sha3.o \
             $(BUILD)/run_vk.o $(BUILD)/stratum_vk.o \
@@ -157,6 +160,26 @@ $(BUILD)/spirv_sha3.o: $(BUILD)/spirv_sha3.cpp | dirs
 $(BUILD)/algo_vk_sha3.o: src/algos/sha3-256t/algo_vk.cpp src/core/algo.h \
                          src/core/vk_common.h src/core/btc_job.h \
                          src/algos/sha3-256t/sha3.h | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# --- kawpow on Vulkan ------------------------------------------------------
+# Two shaders, not one: the DAG build is shared with every future ProgPoW coin
+# and the mix is Ravencoin's.
+$(BUILD)/spirv_dag.cpp: $(BUILD)/dag.spv scripts/embed_spirv.py | dirs
+	python3 scripts/embed_spirv.py $< $@ kProgpowDagSpirv
+
+$(BUILD)/spirv_dag.o: $(BUILD)/spirv_dag.cpp | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/spirv_kawpow.cpp: $(BUILD)/kawpow.spv scripts/embed_spirv.py | dirs
+	python3 scripts/embed_spirv.py $< $@ kKawpowSpirv
+
+$(BUILD)/spirv_kawpow.o: $(BUILD)/spirv_kawpow.cpp | dirs
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/algo_vk_kawpow.o: src/algos/kawpow/algo_vk.cpp src/core/algo.h \
+                           src/core/vk_common.h src/algos/kawpow/kawpow.h \
+                           src/algos/kawpow/job.h $(PROGPOW_DEPS) | dirs
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/vk_common.o: src/core/vk_common.cpp src/core/vk_common.h \

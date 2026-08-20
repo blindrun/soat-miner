@@ -21,6 +21,7 @@ namespace om {
 
 Algorithm *makeAutolykos2VK(int deviceIndex);
 Algorithm *makeSha3_256tVK(int deviceIndex);
+Algorithm *makeKawpowVK(int deviceIndex);
 // Algorithm *makePearlPowVK(int deviceIndex);   // <- add here
 
 namespace {
@@ -33,6 +34,7 @@ struct Entry {
 const Entry kVulkanRegistry[] = {
     {"autolykos2", &makeAutolykos2VK},
     {"sha3-256t", &makeSha3_256tVK},
+    {"kawpow", &makeKawpowVK},
 };
 
 }  // namespace
