@@ -153,18 +153,21 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         logLine(tty, "warn",
                 "benchmark mode: measuring hashrate only. No pool, no wallet, "
                 "no shares, no payouts.");
-        // Name the script for the algorithm actually selected. This said
-        // mine_ergo_* for every algorithm, so benchmarking BC3 told you to go
-        // and mine Ergo.
-        const char *script = "mine_ergo_*";
-        if (algo && algo->name()) {
-            if (!strcmp(algo->name(), "pearl-pow")) script = "mine_pearl_*";
-            else if (!strcmp(algo->name(), "sha3-256t")) script = "mine_bc3_*";
+        // The algorithm names its own scripts. This used to be an if-chain
+        // over algorithm names here, which told BC3 users to go and mine
+        // Ergo; that was fixed by adding a branch, and it then told KawPow
+        // users to go and mine Ergo. A list you have to remember to extend
+        // fails the same way every time it is extended.
+        const std::string script = algo ? algo->launcherGlob() : std::string();
+        if (script.empty()) {
+            logLine(tty, "info",
+                    "to actually mine, pass --pool HOST:PORT --wallet <address>");
+        } else {
+            logLine(tty, "info",
+                    "to actually mine, use a " + script +
+                        " script (edit WALLET first) or pass --pool HOST:PORT "
+                        "--wallet <address>");
         }
-        logLine(tty, "info",
-                std::string("to actually mine, use a ") + script +
-                    " script (edit WALLET first) or pass --pool HOST:PORT "
-                    "--wallet <address>");
     }
 
     algo->setPrefetch(opt.prefetch);

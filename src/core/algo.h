@@ -108,6 +108,22 @@ class Algorithm {
     /** One line on what prefetch is doing, or empty if it is not running. */
     virtual std::string prefetchNote() const { return std::string(); }
 
+    /**
+     * The launcher scripts that mine this algorithm, e.g. "mine_rvn_*", or
+     * empty if it has none. Benchmark mode points the user at these.
+     *
+     * This lives here, and not as a name lookup in the run loop, because it
+     * was a name lookup in the run loop and it went wrong twice: an if-chain
+     * over algorithm names told BC3 users to go and mine Ergo, was fixed by
+     * adding a branch, and then told KawPow users the same thing.
+     *
+     * The default is DELIBERATELY empty rather than a guess. An algorithm
+     * that forgets to answer gets no script name, which reads as incomplete;
+     * defaulting to some other coin's script reads as correct and sends the
+     * user to mine the wrong chain.
+     */
+    virtual std::string launcherGlob() const { return std::string(); }
+
     /** Release device memory. */
     virtual void release() = 0;
 };

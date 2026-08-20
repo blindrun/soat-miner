@@ -92,6 +92,31 @@ for a in $cuda_algos; do
     esac
 done
 
+# --- every algorithm names its own launcher scripts, and they exist -------
+# Benchmark mode tells the user which scripts mine what they just benchmarked.
+# That used to be an if-chain over algorithm names in run.cpp: it told BC3
+# users to go and mine Ergo, was fixed by adding a branch, and then told
+# KawPow users to go and mine Ergo. It is now Algorithm::launcherGlob().
+#
+# Checked at source level rather than by running --bench, because benchmarking
+# KawPow allocates a 6.11 GB DAG before it prints anything useful.
+for f in $(grep -rl 'const char \*name() const override' "$HERE/src/algos/"); do
+    if ! grep -q 'launcherGlob() const override' "$f"; then
+        check 1 "$(basename "$(dirname "$f")") names its launcher scripts" \
+              "no launcherGlob() in $f - benchmarking it would name no script"
+        continue
+    fi
+    glob="$(sed -n 's/.*launcherGlob() const override { return "\([^"]*\)".*/\1/p' "$f")"
+    # The glob has to match real files, or it points users at nothing.
+    n=$(ls "$HERE"/packaging/$glob 2>/dev/null | wc -l)
+    if [ "$n" -eq 0 ]; then
+        check 1 "$(basename "$(dirname "$f")") launcher glob '$glob' matches real scripts" \
+              "matched no files in packaging/"
+    else
+        check 0 "$(basename "$(dirname "$f")")/$(basename "$f") points at $glob ($n file(s))"
+    fi
+done
+
 if [ "$fail" -eq 0 ]; then
     echo "algorithm registries and launcher metadata agree ($(echo "$cuda_algos" | wc -l) algorithms)"
 fi

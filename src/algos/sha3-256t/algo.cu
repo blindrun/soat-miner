@@ -25,6 +25,7 @@ class Sha3_256t : public Algorithm {
     Sha3_256t() { cudaStreamCreateWithFlags(&mine_, cudaStreamNonBlocking); }
 
     const char *name() const override { return "sha3-256t"; }
+    std::string launcherGlob() const override { return "mine_bc3_*"; }
 
     size_t memoryBytes(const Job &) const override {
         return sizeof(S3Solution) * kMaxSolutions + sizeof(uint32_t);

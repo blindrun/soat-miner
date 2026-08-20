@@ -187,8 +187,14 @@ elif [[ -n "${POOL:-}" ]]; then
   # Any coin's placeholder, not just this coin's. Switching ALGO and forgetting
   # to switch WALLET leaves the previous coin's placeholder sitting there, and
   # testing only the current one let that through to a confusing pool error.
+  #
+  # Matched by SHAPE, not by listing them. The list version needed every new
+  # coin added here as well as above, and a coin whose placeholder was
+  # forgotten would be caught only when it was the coin being mined - which
+  # is the one case that was already covered. No real address contains an
+  # underscore, so this cannot reject one.
   case "$WALLET" in
-    9YOUR_ERGO_ADDRESS_HERE|prl1YOUR_PEARL_ADDRESS_HERE|YOUR_BC3_ADDRESS_HERE|RYOUR_RAVENCOIN_ADDRESS_HERE) WALLET="" ;;
+    *YOUR_*ADDRESS_HERE) WALLET="" ;;
   esac
   if [[ -z "${WALLET:-}" || "$WALLET" == "$PLACEHOLDER" ]]; then
     echo "Set WALLET in config.txt to your $COIN address before pool mining."

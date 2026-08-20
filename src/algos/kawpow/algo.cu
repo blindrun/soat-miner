@@ -34,6 +34,7 @@ class KawPow : public Algorithm {
     KawPow() { cudaStreamCreateWithFlags(&mine_, cudaStreamNonBlocking); }
 
     const char *name() const override { return "kawpow"; }
+    std::string launcherGlob() const override { return "mine_rvn_*"; }
 
     size_t memoryBytes(const Job &job) const override {
         const int height = jobHeight(job.extra, job.epoch);

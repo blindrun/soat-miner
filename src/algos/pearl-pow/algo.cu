@@ -261,6 +261,7 @@ class PearlPow : public Algorithm {
     }
 
     const char *name() const override { return "pearl-pow"; }
+    std::string launcherGlob() const override { return "mine_pearl_*"; }
 
     size_t memoryBytes(const Job &job) const override {
         (void)job;
