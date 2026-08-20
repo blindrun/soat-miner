@@ -1,5 +1,8 @@
-// Keccak for KawPow: the f[800] permutation the ProgPoW hash is built on, and
-// the f[1600] hashes the Ethash DAG underneath it is built on.
+// Keccak for the ProgPoW family: the f[800] permutation the ProgPoW hash is
+// built on, and the f[1600] hashes the Ethash DAG underneath it is built on.
+//
+// Shared verbatim by KawPow and ProgPowZ. Nothing in this file differs between
+// them, which is more than can be said for the layer above it.
 //
 // Two traps live in this file, both of which produce a miner that runs at full
 // speed and has every share rejected:
@@ -38,7 +41,7 @@
 #endif
 
 namespace om {
-namespace kawpow {
+namespace progpow {
 
 KP_HD uint64_t rotl64(uint64_t x, int n) {
     return (x << n) | (x >> (64 - n));
@@ -175,5 +178,5 @@ KP_HD void keccak256_32(const uint32_t in[8], uint32_t out[8]) {
         out[i] = (uint32_t)(st[i >> 1] >> ((i & 1) ? 32 : 0));
 }
 
-}  // namespace kawpow
+}  // namespace progpow
 }  // namespace om

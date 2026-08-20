@@ -175,10 +175,10 @@ int main(int argc, char **argv) {
         }
         const uint64_t nonce = strtoull(v.nonce, nullptr, 16);
 
-        st.build(epochNumber(v.blockNumber));
+        st.build(epochOf(v.blockNumber));
 
         uint32_t gotFinal[8], gotMix[8];
-        kawpowHashLight(st.cache.data(), st.numCacheItems, st.l1.data(),
+        hashLight(st.cache.data(), st.numCacheItems, st.l1.data(),
                         st.numItems2048, v.blockNumber, header, nonce, gotFinal,
                         gotMix);
 

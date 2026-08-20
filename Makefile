@@ -229,12 +229,15 @@ KAWPOW_BLK_MIX    = 7b1e003a71d7bf9f81d95c0c68126f72876de28b69b175c84e4c11234ad5
 KAWPOW_BLK_HASH   = 000000000001a5a2da8a4a4e8867948fd5958d98dc61521ea5f9906bf4b9e7b5
 KAWPOW_BLK_BITS   = 1b06292b
 
+PROGPOW_DEPS = src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+               src/algos/progpow/progpow.h
+
 tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
-                        src/algos/kawpow/keccak.h
+                        $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 tests/test_kawpow_block: tests/test_kawpow_block.cpp src/algos/kawpow/kawpow.h \
-                         src/algos/kawpow/keccak.h
+                         $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block | dirs

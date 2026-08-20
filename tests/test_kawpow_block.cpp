@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
     const uint64_t nonce = strtoull(argv[3], nullptr, 16);
     const uint32_t bits = (uint32_t)strtoul(argv[6], nullptr, 16);
 
-    const int epoch = epochNumber(height);
+    const int epoch = epochOf(height);
     const int numCacheItems = lightCacheNumItems(epoch);
     printf("  block %d, epoch %d, light cache %.1f MB, real DAG %.2f GB\n",
            height, epoch, numCacheItems * 64 / 1e6, fullDatasetBytes(epoch) / 1e9);
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
         datasetItem2048(cache.data(), numCacheItems, i, l1.data() + i * 64);
 
     uint32_t gotFinal[8], gotMix[8];
-    kawpowHashLight(cache.data(), numCacheItems, l1.data(),
+    hashLight(cache.data(), numCacheItems, l1.data(),
                     (uint32_t)(fullDatasetNumItems(epoch) / 2), height, header,
                     nonce, gotFinal, gotMix);
 
