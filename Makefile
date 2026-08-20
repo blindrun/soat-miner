@@ -269,14 +269,17 @@ test-kawpow-device: tests/test_kawpow_device
 $(BUILD)/dag.spv: src/algos/progpow/dag.comp | dirs
 	glslangValidator -V --target-env vulkan1.2 $< -o $@
 
+$(BUILD)/kawpow.spv: src/algos/kawpow/kernel.comp | dirs
+	glslangValidator -V --target-env vulkan1.2 $< -o $@
+
 tests/test_kawpow_vulkan: tests/test_kawpow_vulkan.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -lvulkan -o $@
 
 # Needs a Vulkan GPU, so it is its own target like the CUDA device gate. It
 # skips itself politely when there is no usable device.
-test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv
-	@echo "--- kawpow: the Vulkan DAG shader vs the host reference ---"
-	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv
+test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv
+	@echo "--- kawpow: the Vulkan DAG and mix shaders vs the host reference ---"
+	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv
 
 tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@

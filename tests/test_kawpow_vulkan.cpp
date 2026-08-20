@@ -28,7 +28,9 @@
 #include <string>
 #include <vector>
 
+#include "algos/kawpow/kawpow.h"
 #include "algos/progpow/ethash.h"
+#include "algos/progpow/progpow.h"
 
 using namespace om::progpow;
 
@@ -80,7 +82,7 @@ class Harness {
     static const uint32_t kNumBufs = 4;
     static const uint32_t kItems512 = (kWordsPerBuf * kNumBufs) / 16;
 
-    bool init(int deviceIndex, const std::vector<uint32_t> &spirv) {
+    bool init(int deviceIndex) {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.apiVersion = VK_API_VERSION_1_2;
@@ -150,85 +152,110 @@ class Harness {
         cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         VKOK(vkCreateCommandPool(dev_, &cpci, nullptr, &pool_), "command pool");
 
+        return true;
+    }
+
+    /** One compute pipeline plus the descriptor set it owns. Two shaders means
+     *  two of these, and keeping them separate is simpler than one set layout
+     *  that has to satisfy both. */
+    struct Pipeline {
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        uint32_t bindings = 0;
+        uint32_t pushBytes = 0;
+        uint32_t local = 64;
+    };
+
+    bool buildPipeline(const std::vector<uint32_t> &spirv, uint32_t nBindings,
+                       uint32_t pushBytes, uint32_t local, Pipeline *out) {
+        out->bindings = nBindings;
+        out->pushBytes = pushBytes;
+        out->local = local;
+
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         smci.codeSize = spirv.size() * 4;
         smci.pCode = spirv.data();
-        VKOK(vkCreateShaderModule(dev_, &smci, nullptr, &module_), "shader module");
-        return true;
-    }
+        VKOK(vkCreateShaderModule(dev_, &smci, nullptr, &out->module),
+             "shader module");
 
-    bool buildPipeline() {
-        VkDescriptorSetLayoutBinding binds[5]{};
-        for (int i = 0; i < 5; i++) {
-            binds[i].binding = (uint32_t)i;
+        std::vector<VkDescriptorSetLayoutBinding> binds(nBindings);
+        for (uint32_t i = 0; i < nBindings; i++) {
+            binds[i] = {};
+            binds[i].binding = i;
             binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             binds[i].descriptorCount = 1;
             binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 5;
-        dslci.pBindings = binds;
-        VKOK(vkCreateDescriptorSetLayout(dev_, &dslci, nullptr, &setLayout_),
+        dslci.bindingCount = nBindings;
+        dslci.pBindings = binds.data();
+        VKOK(vkCreateDescriptorSetLayout(dev_, &dslci, nullptr, &out->setLayout),
              "set layout");
 
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.size = 16;   // four uints
+        pcr.size = pushBytes;
         VkPipelineLayoutCreateInfo plci{};
         plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         plci.setLayoutCount = 1;
-        plci.pSetLayouts = &setLayout_;
+        plci.pSetLayouts = &out->setLayout;
         plci.pushConstantRangeCount = 1;
         plci.pPushConstantRanges = &pcr;
-        VKOK(vkCreatePipelineLayout(dev_, &plci, nullptr, &pipeLayout_),
+        VKOK(vkCreatePipelineLayout(dev_, &plci, nullptr, &out->layout),
              "pipeline layout");
 
         // Workgroup size is a specialization constant so the host dispatch and
         // the shader can never disagree about it - that drifted once already
-        // in this repo and silently ran half the work.
-        const uint32_t local = 64;
-        VkSpecializationMapEntry sme{};
-        sme.constantID = 0;
-        sme.offset = 0;
-        sme.size = sizeof(uint32_t);
+        // in this repo and silently ran half the work while crediting all of it.
+        const uint32_t spec[2] = {local, 256u};   // local size, MAX_OUT
+        VkSpecializationMapEntry sme[2]{};
+        sme[0].constantID = 0;
+        sme[0].offset = 0;
+        sme[0].size = sizeof(uint32_t);
+        sme[1].constantID = 1;
+        sme[1].offset = sizeof(uint32_t);
+        sme[1].size = sizeof(uint32_t);
         VkSpecializationInfo si{};
-        si.mapEntryCount = 1;
-        si.pMapEntries = &sme;
-        si.dataSize = sizeof(uint32_t);
-        si.pData = &local;
+        si.mapEntryCount = nBindings > 5 ? 2 : 1;   // the DAG shader has no MAX_OUT
+        si.pMapEntries = sme;
+        si.dataSize = si.mapEntryCount * sizeof(uint32_t);
+        si.pData = spec;
 
         VkPipelineShaderStageCreateInfo ssci{};
         ssci.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ssci.module = module_;
+        ssci.module = out->module;
         ssci.pName = "main";
         ssci.pSpecializationInfo = &si;
         VkComputePipelineCreateInfo cpci{};
         cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage = ssci;
-        cpci.layout = pipeLayout_;
+        cpci.layout = out->layout;
         VKOK(vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpci, nullptr,
-                                      &pipe_),
+                                      &out->pipe),
              "compute pipeline");
-        localSize_ = local;
 
         VkDescriptorPoolSize ps{};
         ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        ps.descriptorCount = 5;
+        ps.descriptorCount = nBindings;
         VkDescriptorPoolCreateInfo dpci{};
         dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpci.maxSets = 1;
         dpci.poolSizeCount = 1;
         dpci.pPoolSizes = &ps;
-        VKOK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &descPool_), "desc pool");
+        VKOK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &out->pool), "desc pool");
         VkDescriptorSetAllocateInfo dsai{};
         dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = descPool_;
+        dsai.descriptorPool = out->pool;
         dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &setLayout_;
-        VKOK(vkAllocateDescriptorSets(dev_, &dsai, &descSet_), "desc set");
+        dsai.pSetLayouts = &out->setLayout;
+        VKOK(vkAllocateDescriptorSets(dev_, &dsai, &out->set), "desc set");
         return true;
     }
 
@@ -281,27 +308,25 @@ class Harness {
         return true;
     }
 
-    void writeDescriptors(const Buffer &cache, Buffer dag[kNumBufs]) {
-        VkDescriptorBufferInfo info[5]{};
-        info[0].buffer = cache.buf;
-        info[0].range = cache.size;
-        for (uint32_t i = 0; i < kNumBufs; i++) {
-            info[1 + i].buffer = dag[i].buf;
-            info[1 + i].range = dag[i].size;
-        }
-        VkWriteDescriptorSet w[5]{};
-        for (int i = 0; i < 5; i++) {
+    void writeDescriptors(const Pipeline &p, const std::vector<Buffer *> &bufs) {
+        std::vector<VkDescriptorBufferInfo> info(bufs.size());
+        std::vector<VkWriteDescriptorSet> w(bufs.size());
+        for (size_t i = 0; i < bufs.size(); i++) {
+            info[i] = {};
+            info[i].buffer = bufs[i]->buf;
+            info[i].range = bufs[i]->size;
+            w[i] = {};
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = descSet_;
+            w[i].dstSet = p.set;
             w[i].dstBinding = (uint32_t)i;
             w[i].descriptorCount = 1;
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w[i].pBufferInfo = &info[i];
         }
-        vkUpdateDescriptorSets(dev_, 5, w, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, (uint32_t)w.size(), w.data(), 0, nullptr);
     }
 
-    bool dispatch(const uint32_t push[4], uint32_t groups) {
+    bool dispatch(const Pipeline &p, const void *push, uint32_t groups) {
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = pool_;
@@ -314,11 +339,11 @@ class Harness {
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VKOK(vkBeginCommandBuffer(cb, &bi), "begin cmd buffer");
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_,
-                                0, 1, &descSet_, 0, nullptr);
-        vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16,
-                           push);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0,
+                                1, &p.set, 0, nullptr);
+        vkCmdPushConstants(cb, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           p.pushBytes, push);
         vkCmdDispatch(cb, groups, 1, 1);
         VKOK(vkEndCommandBuffer(cb), "end cmd buffer");
 
@@ -341,7 +366,6 @@ class Harness {
         return true;
     }
 
-    uint32_t localSize() const { return localSize_; }
     VkDevice dev() const { return dev_; }
 
    private:
@@ -351,14 +375,21 @@ class Harness {
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = UINT32_MAX;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkShaderModule module_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout pipeLayout_ = VK_NULL_HANDLE;
-    VkPipeline pipe_ = VK_NULL_HANDLE;
-    VkDescriptorPool descPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descSet_ = VK_NULL_HANDLE;
-    uint32_t localSize_ = 64;
+
 };
+
+void hexToWords(const char *hex, uint32_t *out, int words) {
+    auto hv = [](char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    };
+    for (int i = 0; i < words * 4; i++) {
+        const uint8_t b = (uint8_t)((hv(hex[i * 2]) << 4) | hv(hex[i * 2 + 1]));
+        if (i % 4 == 0) out[i / 4] = 0;
+        out[i / 4] |= (uint32_t)b << ((i % 4) * 8);
+    }
+}
 
 std::string wordsToHex(const uint32_t *w, int words) {
     static const char *d = "0123456789abcdef";
@@ -375,18 +406,23 @@ std::string wordsToHex(const uint32_t *w, int words) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    const char *spvPath = argc > 1 ? argv[1] : "build/dag.spv";
-    const int deviceIndex = argc > 2 ? atoi(argv[2]) : -1;
+    const char *dagSpv = argc > 1 ? argv[1] : "build/dag.spv";
+    const char *mixSpv = argc > 2 ? argv[2] : "build/kawpow.spv";
+    const int deviceIndex = argc > 3 ? atoi(argv[3]) : -1;
 
-    const std::vector<uint32_t> spirv = readSpirv(spvPath);
-    if (spirv.empty()) {
-        fprintf(stderr, "cannot read SPIR-V from %s\n", spvPath);
+    const std::vector<uint32_t> dagCode = readSpirv(dagSpv);
+    const std::vector<uint32_t> mixCode = readSpirv(mixSpv);
+    if (dagCode.empty() || mixCode.empty()) {
+        fprintf(stderr, "cannot read SPIR-V from %s / %s\n", dagSpv, mixSpv);
         return 2;
     }
 
     Harness h;
-    if (!h.init(deviceIndex, spirv)) return 0;   // skip, politely
-    if (!h.buildPipeline()) return 1;
+    if (!h.init(deviceIndex)) return 0;   // skip, politely
+
+    Harness::Pipeline dagPipe, mixPipe;
+    if (!h.buildPipeline(dagCode, 5, 16, 64, &dagPipe)) return 1;
+    if (!h.buildPipeline(mixCode, 7, 92, 64, &mixPipe)) return 1;
 
     // Epoch 0's light cache: 16 MB, and the smallest real one there is.
     const int epoch = 0;
@@ -405,34 +441,31 @@ int main(int argc, char **argv) {
         if (!h.createBuffer((VkDeviceSize)Harness::kWordsPerBuf * 4, hostVisible,
                             &dag[i]))
             return 1;
-    h.writeDescriptors(cacheBuf, dag);
+
+    h.writeDescriptors(dagPipe, {&cacheBuf, &dag[0], &dag[1], &dag[2], &dag[3]});
 
     const uint32_t items = Harness::kItems512;
     printf("  building %u dataset items into %u buffers of %u words\n", items,
            Harness::kNumBufs, Harness::kWordsPerBuf);
-
     const uint32_t push[4] = {0u, items, (uint32_t)numCacheItems,
                               Harness::kWordsPerBuf};
-    if (!h.dispatch(push, (items + h.localSize() - 1) / h.localSize())) return 1;
+    if (!h.dispatch(dagPipe, push, (items + 63) / 64)) return 1;
 
-    // Sample across every buffer, and specifically the last item of each and
-    // the first of the next - which is where the straddle arithmetic breaks.
+    // --- 1. the DAG shader vs the host --------------------------------------
     const uint32_t perBuf = Harness::kWordsPerBuf / 16;
-    std::vector<uint32_t> probes = {0, 1, 17, perBuf - 1, perBuf,
-                                    perBuf + 1, 2 * perBuf - 1, 2 * perBuf,
-                                    3 * perBuf - 1, 3 * perBuf,
-                                    items - 1};
+    std::vector<uint32_t> probes = {0,      1,           17,
+                                    perBuf - 1, perBuf,  perBuf + 1,
+                                    2 * perBuf - 1, 2 * perBuf,
+                                    3 * perBuf - 1, 3 * perBuf, items - 1};
     int mismatched = 0;
     for (uint32_t idx : probes) {
         uint32_t host[16];
         datasetItem512(cache.data(), numCacheItems, idx, host);
-
         const uint32_t wordIndex = idx * 16u;
         const uint32_t buf = wordIndex / Harness::kWordsPerBuf;
         const uint32_t off = wordIndex - buf * Harness::kWordsPerBuf;
         uint32_t got[16];
         if (!h.download(&dag[buf], (size_t)off * 4, got, sizeof(got))) return 1;
-
         if (memcmp(host, got, sizeof(got)) != 0) {
             if (mismatched < 3) {
                 printf("  FAIL  item %u (buffer %u, word %u)\n", idx, buf, off);
@@ -445,15 +478,102 @@ int main(int argc, char **argv) {
     check(mismatched == 0,
           "every sampled DAG item matches the host, across all four buffers");
 
-    // A shader that wrote nothing would match a host that also computed
-    // nothing, so make sure the data is not simply zero.
     uint32_t first[16];
     h.download(&dag[0], 0, first, sizeof(first));
     bool allZero = true;
     for (int i = 0; i < 16; i++)
         if (first[i] != 0) allZero = false;
-    check(!allZero, "the shader actually wrote something");
+    check(!allZero, "the DAG shader actually wrote something");
+    if (mismatched || allZero) return 1;   // the mix result would be meaningless
 
-    if (g_fail == 0) printf("KawPow Vulkan DAG: matches the host reference\n");
+    // --- 2. the mix shader vs the host --------------------------------------
+    //
+    // The DAG here is a small slice, so numItems2048 is set to what was
+    // actually built and the HOST is told the same number. The hashes then
+    // correspond to no real block, which does not matter: what is under test is
+    // whether two implementations of the same function agree, and pointing both
+    // at the same truncated dataset is what makes that comparison exact.
+    const uint32_t numItems2048 = items / 4;
+    const int height = 4501000;
+
+    const om::progpow::Program prog =
+        om::progpow::buildProgram(height, om::kawpow::params());
+    Buffer progBuf, outBuf, cntBuf;
+    // The shader's Prog block is a std430 run of plain uint arrays, which packs
+    // exactly as the host struct's tables do - but only the tables, so they are
+    // copied field by field rather than memcpy'd over the whole struct, whose
+    // first three ints are counts the shader does not have.
+    std::vector<uint32_t> progWords;
+    auto push_n = [&](const uint32_t *a, int n) {
+        for (int i = 0; i < n; i++) progWords.push_back(a[i]);
+    };
+    push_n(prog.cacheSrc, 11);
+    push_n(prog.cacheDst, 11);
+    push_n(prog.cacheSel, 11);
+    push_n(prog.mathSrc1, 18);
+    push_n(prog.mathSrc2, 18);
+    push_n(prog.mathSel1, 18);
+    push_n(prog.mathDst, 18);
+    push_n(prog.mathSel2, 18);
+    push_n(prog.dagDst, 4);
+    push_n(prog.dagSel, 4);
+
+    const uint32_t kNonces = 16;
+    if (!h.createBuffer(progWords.size() * 4, hostVisible, &progBuf)) return 1;
+    if (!h.upload(&progBuf, progWords.data(), progWords.size() * 4)) return 1;
+    if (!h.createBuffer(kNonces * 18 * 4, hostVisible, &outBuf)) return 1;
+    if (!h.createBuffer(4, hostVisible, &cntBuf)) return 1;
+    const uint32_t zero = 0;
+    h.upload(&cntBuf, &zero, 4);
+
+    h.writeDescriptors(mixPipe, {&progBuf, &dag[0], &dag[1], &dag[2], &dag[3],
+                                 &outBuf, &cntBuf});
+
+    uint32_t mp[23]{};
+    uint32_t hdr[8];
+    hexToWords("8dc2a5086848cb872bb610d1a06294e3c41196bb04b041c8fe84da0153ba5db7",
+               hdr, 8);
+    for (int i = 0; i < 8; i++) mp[i] = hdr[i];
+    const uint64_t base = 0x329dd53ca526c2c0ull;
+    mp[8] = (uint32_t)base;
+    mp[9] = (uint32_t)(base >> 32);
+    mp[10] = kNonces;
+    mp[11] = 0;
+    for (int i = 12; i < 20; i++) mp[i] = 0;   // target, unused in dump mode
+    mp[20] = numItems2048;
+    mp[21] = Harness::kWordsPerBuf;
+    mp[22] = 1;   // dump every hash
+
+    if (!h.dispatch(mixPipe, mp, (kNonces + 3) / 4)) return 1;
+
+    std::vector<uint32_t> got(kNonces * 18);
+    if (!h.download(&outBuf, 0, got.data(), got.size() * 4)) return 1;
+
+    std::vector<uint32_t> l1(kL1CacheWords, 0);
+    for (uint32_t i = 0; i < kL1CacheBytes / 256; i++)
+        datasetItem2048(cache.data(), numCacheItems, i, l1.data() + i * 64);
+
+    int mixBad = 0;
+    for (uint32_t i = 0; i < kNonces; i++) {
+        uint32_t hFinal[8], hMix[8];
+        om::kawpow::hashLight(cache.data(), numCacheItems, l1.data(),
+                              numItems2048, height, hdr, base + i, hFinal, hMix);
+        const uint32_t *gFinal = &got[i * 18 + 2];
+        const uint32_t *gMix = &got[i * 18 + 10];
+        if (memcmp(hFinal, gFinal, 32) != 0 || memcmp(hMix, gMix, 32) != 0) {
+            if (mixBad < 3) {
+                printf("  FAIL  nonce %016llx\n        host %s\n        gpu  %s\n",
+                       (unsigned long long)(base + i),
+                       wordsToHex(hFinal, 8).c_str(),
+                       wordsToHex(gFinal, 8).c_str());
+            }
+            mixBad++;
+        }
+    }
+    check(mixBad == 0,
+          std::to_string(kNonces) +
+              " consecutive nonces hash identically on the shader and the host");
+
+    if (g_fail == 0) printf("KawPow Vulkan: DAG and mix both match the host\n");
     return g_fail == 0 ? 0 : 1;
 }
