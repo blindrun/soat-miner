@@ -94,7 +94,7 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
             src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
             src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
-            src/core/rvn_address.h
+            src/core/kawpow_address.h
 
 # The Vulkan build carries one object per algorithm plus its embedded SPIR-V
 # module, and vk_common.o holds the registry and the shared device handling.
@@ -365,13 +365,13 @@ tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
                            $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< src/core/stratum_kawpow.cpp -lpthread -o $@
 
-tests/test_rvn_address: tests/test_rvn_address.cpp src/core/rvn_address.h \
+tests/test_kawpow_address: tests/test_kawpow_address.cpp src/core/kawpow_address.h \
                         src/core/sha256.h
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
              tests/test_progpow_stock tests/test_progpow_ops \
-             tests/test_kawpow_stratum tests/test_rvn_address | dirs
+             tests/test_kawpow_stratum tests/test_kawpow_address | dirs
 	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
 	@./tests/test_kawpow_hash
 	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
@@ -397,7 +397,7 @@ test-kawpow: tests/test_kawpow_hash tests/test_kawpow_block \
 	@echo "--- kawpow: stratum, against shapes captured from live pools ---"
 	@./tests/test_kawpow_stratum
 	@echo "--- kawpow: Ravencoin address validation ---"
-	@./tests/test_rvn_address
+	@./tests/test_kawpow_address
 	@echo "--- launcher: which backend each algorithm actually gets ---"
 	@./tests/test_launcher_backend.sh
 
@@ -514,7 +514,7 @@ tests/test_sha3_algo: tests/test_sha3_algo.cu tests/sha3_vectors.h \
             src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
             src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
             src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
-            src/core/rvn_address.h src/algos/sha3-256t/sha3.h \
+            src/core/kawpow_address.h src/algos/sha3-256t/sha3.h \
                       src/core/algo.h src/core/btc_job.h
 	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
 

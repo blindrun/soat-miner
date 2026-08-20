@@ -1,4 +1,4 @@
-// Ravencoin payout address validation.
+// Payout address validation for the KawPow coins.
 //
 // A real Base58Check decode, not a shape test, because the mistake this
 // catches is a typo in a 34-character string a user copied by hand. A shape
@@ -7,13 +7,25 @@
 // checksum is four bytes of double SHA-256 and costs nothing to check once at
 // startup.
 //
-// Ravencoin's version bytes:
-//   60 (0x3C)  P2PKH, the ordinary payout address, renders as 'R...'
-//  122 (0x7A)  P2SH, renders as 'r...'
+// One algorithm, several chains. Every version byte below was read out of that
+// chain's own chainparams.cpp, inside its mainnet block, and not inferred from
+// the letter an address happens to start with:
 //
-// Both are accepted: a pool will pay either. Anything else - a Bitcoin
-// address, an Ergo address, a testnet address - is refused by version byte
-// rather than by prefix character, which is the same check the network does.
+//   Ravencoin  60, 122   RavenProject/Ravencoin
+//   Neurai     53, 117   NeuraiProject/Neurai
+//   Neoxa      38, 122   NeoxaChain/Neoxa
+//
+// Note 122 is BOTH Ravencoin's and Neoxa's P2SH byte, so a version-122 address
+// is genuinely ambiguous between the two chains and this says so rather than
+// picking one.
+//
+// Kringle (KRGN) is deliberately absent: no source repository could be found
+// to read a version byte out of, and guessing one would produce a miner that
+// accepts an address it cannot be paid at.
+//
+// Naming the chain matters as much as accepting it. A user who pastes a Neurai
+// address into a Ravencoin launcher gets told which chain it belongs to, which
+// is a diagnosis; "not a Ravencoin address" is a dead end.
 //
 // This never sees a private key or a seed. A pool login is a public payout
 // address; if something arriving here looks like recovery material it is
@@ -64,6 +76,35 @@ inline bool base58Decode(const std::string &s, std::vector<uint8_t> *out) {
 }
 
 /** Why an address was refused, so the miner can say something useful. */
+/** A chain this miner can be paid on, and the Base58 version it uses. */
+struct KawpowChain {
+    uint8_t version;
+    const char *coin;
+    const char *kind;
+};
+
+/** Read from each chain's own chainparams.cpp, mainnet block. See above. */
+inline const KawpowChain *kawpowChains(int *count) {
+    static const KawpowChain kChains[] = {
+        {60, "Ravencoin", "P2PKH"},
+        {122, "Ravencoin or Neoxa", "P2SH"},
+        {53, "Neurai", "P2PKH"},
+        {117, "Neurai", "P2SH"},
+        {38, "Neoxa", "P2PKH"},
+    };
+    *count = (int)(sizeof(kChains) / sizeof(kChains[0]));
+    return kChains;
+}
+
+/** Which chain an accepted address belongs to, or nullptr. */
+inline const KawpowChain *kawpowChainFor(uint8_t version) {
+    int n = 0;
+    const KawpowChain *c = kawpowChains(&n);
+    for (int i = 0; i < n; i++)
+        if (c[i].version == version) return &c[i];
+    return nullptr;
+}
+
 enum class RvnAddressVerdict {
     kOk,
     kEmpty,
@@ -91,7 +132,8 @@ inline RvnAddressVerdict rvnAddressCheck(const std::string &address) {
     if (memcmp(digest, raw.data() + 21, 4) != 0)
         return RvnAddressVerdict::kBadChecksum;
 
-    if (raw[0] != 60 && raw[0] != 122) return RvnAddressVerdict::kWrongNetwork;
+    if (kawpowChainFor(raw[0]) == nullptr)
+        return RvnAddressVerdict::kWrongNetwork;
     return RvnAddressVerdict::kOk;
 }
 
@@ -118,14 +160,26 @@ inline std::string rvnAddressReason(RvnAddressVerdict v) {
                    "wrong. Copy the address again rather than retyping it - "
                    "mining to it would pay an address that does not exist";
         case RvnAddressVerdict::kWrongNetwork:
-            return "that is a valid Base58Check address but not a Ravencoin "
-                   "one. Ravencoin addresses start with R (or r for a "
-                   "multisig address)";
+            return "that is a valid Base58Check address but not one of the "
+                   "chains this miner knows how to be paid on. KawPow covers "
+                   "Ravencoin (R...), Neurai (N...) and Neoxa";
         case RvnAddressVerdict::kLooksLikeSecret:
             return "that looks like recovery material, not a payout address. "
                    "Never give a miner a seed phrase or a private key";
     }
     return "";
+}
+
+}  // namespace om
+
+namespace om {
+
+/** The chain an address belongs to, for logging. Empty if it is not valid. */
+inline std::string kawpowAddressChain(const std::string &address) {
+    std::vector<uint8_t> raw;
+    if (!base58Decode(address, &raw) || raw.size() != 25) return std::string();
+    const KawpowChain *c = kawpowChainFor(raw[0]);
+    return c ? std::string(c->coin) + " " + c->kind : std::string();
 }
 
 }  // namespace om

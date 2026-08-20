@@ -1,4 +1,4 @@
-// Ravencoin address validation.
+// Payout address validation for the KawPow chains.
 //
 // The case that matters is the near-miss: an address with two characters
 // transposed is still 34 Base58 characters starting with R, so a shape test
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "core/rvn_address.h"
+#include "core/kawpow_address.h"
 
 using namespace om;
 
@@ -21,9 +21,13 @@ namespace {
 
 int g_fail = 0;
 
-void check(bool ok, const std::string &what) {
+void check(bool ok, const std::string &what,
+           const std::string &detail = std::string()) {
     printf("  %s  %s\n", ok ? "ok  " : "FAIL", what.c_str());
-    if (!ok) g_fail++;
+    if (!ok) {
+        if (!detail.empty()) printf("        got %s\n", detail.c_str());
+        g_fail++;
+    }
 }
 
 /** Base58Check-encode a version byte plus a 20-byte hash. */
@@ -112,8 +116,42 @@ int main() {
     // be mistaken for a Ravencoin one.
     check(!rvnAddressValid(
               "9fRAWhdxEsTcdb8PhGNrZfwqa65zfkuYHAMmkQLcic1gdLSV5vA"),
-          "an Ergo address is not accepted as a Ravencoin one");
+          "an Ergo address is not accepted by any KawPow chain");
 
-    if (g_fail == 0) printf("RVN address checks passed\n");
+    // --- the other chains this algorithm serves ---------------------------
+    //
+    // Every version byte here was read out of that chain's own chainparams.cpp
+    // inside its mainnet block. Without these checks the chain table could be
+    // wrong in any entry and every test above would still pass, because they
+    // only ever exercise Ravencoin.
+    const std::string neurai = encode(53, hash160(0x44));
+    const std::string neuraiP2SH = encode(117, hash160(0x55));
+    const std::string neoxa = encode(38, hash160(0x66));
+
+    check(rvnAddressValid(neurai),
+          "a Neurai address is accepted (" + neurai + ")");
+    check(kawpowAddressChain(neurai) == "Neurai P2PKH",
+          "and is named as Neurai, not merely allowed",
+          kawpowAddressChain(neurai));
+    check(rvnAddressValid(neuraiP2SH) &&
+              kawpowAddressChain(neuraiP2SH) == "Neurai P2SH",
+          "a Neurai P2SH address is accepted and named");
+    check(rvnAddressValid(neoxa) && kawpowAddressChain(neoxa) == "Neoxa P2PKH",
+          "a Neoxa address is accepted and named (" + neoxa + ")");
+
+    // 122 is Ravencoin's P2SH byte AND Neoxa's. An address carrying it is
+    // genuinely ambiguous, and saying so beats picking one silently.
+    check(kawpowAddressChain(p2sh) == "Ravencoin or Neoxa P2SH",
+          "the shared 122 byte is reported as ambiguous, not resolved",
+          kawpowAddressChain(p2sh));
+
+    // A version byte outside the table must still be refused. Kringle is the
+    // live example: no source repository could be found to read a byte out of,
+    // so it is deliberately absent and its addresses will not validate.
+    check(rvnAddressCheck(encode(45, hash160(0x77))) ==
+              RvnAddressVerdict::kWrongNetwork,
+          "an unknown chain's version byte is still refused");
+
+    if (g_fail == 0) printf("KawPow address checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

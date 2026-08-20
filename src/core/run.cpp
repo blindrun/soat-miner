@@ -6,7 +6,7 @@
 #include "bc3_destination.h"
 #include "pearl_gateway.h"
 #include "pearl_pool.h"
-#include "rvn_address.h"
+#include "kawpow_address.h"
 #include "stratum_btc.h"
 #include "stratum_kawpow.h"
 #include "stratum.h"
