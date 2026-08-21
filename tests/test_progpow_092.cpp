@@ -1,114 +1,65 @@
-// ProgPoW **0.9.2**, layer by layer, against its own published vectors.
+// ProgPoW **0.9.2** / ProgPowZ, layer by layer, against authoritative sources.
 //
-// What this corrects
-// ------------------
-// test_progpow_stock.cpp carries ifdefelse/ProgPOW master's vectors, which a
-// parameter sweep showed are 0.9.4. It then states that no published vector
-// exercises 0.9.2 and that ProgPowZ therefore has no anchor short of real ZANO
-// mainnet blocks, which is what the handoff has been reporting as a blocker.
+// WHAT PROGPOWZ ACTUALLY IS, established from source rather than inferred
+// ----------------------------------------------------------------------
+// Zano's node vendors its consensus implementation at
+// hyle-team/zano contrib/ethereum/libethash/progpow.cpp. It is chfast/ethash
+// v0.4.1's lib/ethash/progpow.cpp - 11534 bytes against 11540 - with exactly
+// one change: random_math's switch is ROTATED BY TWO (case 2 is add, case 0
+// is clz, where the stock file has case 0 add).
 //
-// That was wrong. VeriBlock's ProgPoW-miner fork publishes a test-vectors.md
-// from before the 0.9.3 parameter change:
+// So ProgPowZ = ethash v0.4.1 progpow + that rotation. Everything else -
+// constants, keccak, seed handling, L1 cache build, reduction - is stock.
 //
-//   https://github.com/VeriBlock/ProgPoW-miner/blob/master/test-vectors.md
+// Constants, from include/ethash/progpow.hpp v0.4.1 AND from Zano's own miner
+// hyle-team/progminer libprogpow/ProgPow.h. Both agree, and both agree with
+// what this project already had: period 50, lanes 16, regs 32, DAG_LOADS 4,
+// L1 16 KB, CNT_DAG 64, CNT_CACHE 12, CNT_MATH 20. Epoch length is
+// ETHASH_EPOCH_LENGTH, 30000.
 //
-// All fifteen of its progPowHash vectors satisfy prog_seed == block / 50, so
-// the period is 50 - the 0.9.2 set, and the set ProgPowZ uses. It also
-// publishes the INTERMEDIATE values, which is what makes it useful: the layers
-// can be pinned one at a time instead of guessed at through an end-to-end hash.
+// kMath092 IS CORRECT and is confirmed here against Zano's own switch. An
+// earlier note in this file said the rotation was "unsupported by any
+// published vector"; that was true only of VeriBlock's ProgPoW 0.9.2, which
+// uses the UNROTATED labelling. Both are called 0.9.2 and they disagree - a
+// vector set is ground truth only for the chain that produced it.
 //
-// Four layers are pinned here and all four pass. The fifth does not yet, and
-// saying which is which is the entire point of the file.
+// Vectors below are chfast/ethash v0.4.1's own
+// test/unittests/progpow_test_vectors.hpp, i.e. the reference this coin pins.
+// They carry FULL 64-character final hashes, which also settles a quirk of
+// VeriBlock's copy of the same values: twelve of its results are 63
+// characters, truncated by one nibble, and asserting them would fail a
+// correct implementation.
 //
-// PINNED
-//   1. keccak_f800, against the document's own keccak test case 1.
-//   2. fill_mix, for hash_seed 0xEE304846DDD0A47B lane 0, all 32 words.
-//   3. random_math, all twelve rows of the document's math table.
-//   4. The program KISS99 seeding for period 600 (block 30,000).
+// PINNED AND PASSING - eleven checks
+//   fnv1a; kiss99 (including iteration 100000); kMath092 against Zano's own
+//   eleven-selector switch; keccak_f800; fill_mix; random_math; random_merge;
+//   the program KISS99 seeding and both register permutations for period 600.
 //
-// WHERE THE DIFFERENCE IS, measured rather than argued
-//   The document also publishes all sixteen lanes of the mix after loop 1 for
-//   block 30,000. Running exactly one loop iteration against it:
+// NOT REPRODUCED: the end-to-end hash, 0 of 12 (--e2e). Stated plainly
+// because I could not find the cause and will not invent one.
 //
-//     12 cache / 20 math ops     177 of 512 words match
-//     11 cache / 18 math ops     144 of 512
-//     DAG item zeroed            177 of 512  <- unchanged
+//   What has been checked against the reference source and MATCHES: the
+//   constants; the program generation, op for op and in RNG draw order; the
+//   per-round state being passed BY VALUE so all 64 rounds share one program;
+//   the DAG item index; the L1 cache build (calculate_dataset_item_2048 for
+//   i in 0..63, exactly what this code does); the seed being be::uint64 of
+//   the first keccak's output; the lane-hash and mix-hash reduction.
 //
-//   177 is far above chance, so most of the loop is right. Zeroing the DAG
-//   item does NOT change the count, and the ablation was checked to actually
-//   take effect (the mix fingerprint changes, 0x5B922BA0 -> 0x36FD880F), so
-//   this is not a dispatch that quietly did nothing.
+//   RETRACTED: an earlier note here localised the gap to the L1 cache
+//   contents, from a word implied by VeriBlock's merge table. That table
+//   describes the unrotated labelling, so it is not ground truth for this
+//   code path, and the L1 build provably matches the reference. The
+//   localisation does not stand.
 //
-//   Read together: the words that match are the DAG-independent ones, and
-//   every DAG-touched register is wrong whatever the DAG contains. The
-//   difference is therefore in how the DAG is ACCESSED or MERGED - the words
-//   per lane, the destination registers, or the chunk mapping - and not in
-//   the dataset, the parameters, or any progPowInit layer.
+//   Also corrected here: 0.9.2's FINAL keccak re-absorbs the header with the
+//   64-bit seed in the nonce slot - keccak_progpow_256(header, seed, mix) -
+//   rather than carrying the first keccak's state forward the way 0.9.4 does.
+//   That is now implemented. It sits downstream of the mix, so it cannot be
+//   confirmed until the mix reproduces.
 //
-//   SECOND CORRECTION, and this one resolves it. The end-to-end and loop
-//   vectors are DAG-dependent and this document's DAG is NOT the stock Ethash
-//   one. Cache op 0 in my program has exactly the destination register,
-//   selector and source register the document's merge table implies - so the
-//   program and the offset are right - and only the value read from L1
-//   differs: 0x49A89D11 against the required 0x870FA227. That word is absent
-//   from the whole 16 KB L1 at epochs 0, 1, 2 and 3, so it is not a layout or
-//   ordering difference; the dataset itself is different.
-//
-//   My Ethash dataset code is independently proven correct against real
-//   RAVENCOIN mainnet blocks (13 vectors plus a full end-to-end run at block
-//   4,501,000), so buildLightCache, epochSeed and datasetItem2048 are not the
-//   suspects. These are VeriBlock's vectors, and VeriBlock is its own chain;
-//   the most likely reading is that its DAG derivation differs. NOT verified,
-//   and stated as the likely reading rather than a finding.
-//
-//   What follows practically: the DAG-INDEPENDENT vectors are valid anchors
-//   and all pass, and the DAG-dependent ones cannot be reproduced without
-//   that fork's dataset. --e2e failing is therefore not evidence of a defect
-//   in this implementation, and should not be read as one.
-//
-//   FIRST CORRECTION, from testing instead of believing: the DAG merge is NOT
-//   where the divergence starts. Sweeping the merge structure - 1, 2 or 4
-//   words per lane crossed with strides of 1, 2, 4 - gives 177/512 in all
-//   nine cases, as does zeroing the DAG. If the wrong registers were the
-//   DAG-touched ones, changing which registers the merge writes would move
-//   the count. It does not move at all.
-//
-//   Two further properties of the 177: the expected state differs from the
-//   initial fill_mix state in all 512 words, so the matches are genuine and
-//   not untouched registers; and every one of the 32 registers is written
-//   during the round, so there is no untouched class at all.
-//
-//   Correct primitives, correct program, correct DAG handling, and the loop
-//   still lands ~35% right. What remains untested: the L1 cache (c_dag)
-//   contents, for which this document publishes no anchor, and the order the
-//   ops are applied in. Candidates, not findings.
-//
-// NOT REPRODUCED, and this is the honest state of ProgPowZ
-//   The end-to-end progPowHash still matches 0 of 13. Run with --e2e to see
-//   it. Since 1-4 pass, whatever differs is INSIDE the loop body - the DAG or
-//   L1 access, the round count, or the final keccak - and it is not
-//   parametric: a sweep of period x {12,20},{11,18} x both math labellings
-//   reproduces nothing, not even block 0, which every period reproduces in
-//   the 0.9.4 set.
-//
-// TWO CORRECTIONS TO WHAT THE HANDOFF SAID
-//
-//   * The 0.9.2 math labelling is NOT rotated. The handoff recorded "0.9.2
-//     selector 0 = clz+clz = 0.9.4's case 9, implemented as s = (s + 9) % 11".
-//     Against the document's math table that scores 0 of 12, while plain
-//     0.9.4 labelling scores 12 of 12. Whatever 0.9.3 changed, it was not
-//     this. kMath092 as implemented is unsupported by any published vector.
-//
-//   * 0.9.2 feeds fill_mix a seed byte-swapped AND word-reversed relative to
-//     0.9.4. The document prints the keccak result as 0x464830EE, 0x7BA4D0DD
-//     and then says the fill_mix seed "would be 0xEE304846DDD0A47B".
-//     test_progpow_stock.cpp separately records that byte-swapping reproduces
-//     nothing against 0.9.4. Both are true - it is one of the 0.9.3 changes.
-//
-// A quirk of the source document, so nobody wastes an hour on it: twelve of
-// the fifteen _result_ fields are 63 hex characters, one nibble short. Each
-// block's true result is the NEXT block's header, which are all 64. Asserting
-// the printed field would fail a correct implementation.
+// One inconsistency worth knowing about, in Zano's own tree: progminer pins
+// STOCK ethash v0.4.1 through Hunter (unrotated) while generating rotated GPU
+// kernels. The node is authoritative for consensus, and the node rotates.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -200,58 +151,54 @@ struct Vector {
 // header, which is what makes the block-number column the variable under test.
 
 const Vector kVectors[] = {
-    {30000, "123456789abcdef0",
-     "ffeeddccbbaa9988776655443322110000112233445566778899aabbccddeeff",
-     "11f19805c58ab46610ff9c719dcf0a5f18fa2f1605798eef770c47219274767d",
-     "5b7ccd472dbefdd95b895cac8ece67ff0deb5a6bd2ecc6e162383d00c3728ece"},
     {0, "0000000000000000",
      "0000000000000000000000000000000000000000000000000000000000000000",
      "faeb1be51075b03a4ff44b335067951ead07a3b078539ace76fd56fc410557a3",
-     ""},
+     "63155f732f2bf556967f906155b510c917e48e99685ead76ea83f4eca03ab12b"},
     {49, "0000000006ff2c47",
      "63155f732f2bf556967f906155b510c917e48e99685ead76ea83f4eca03ab12b",
      "c789c1180f890ec555ff42042913465481e8e6bc512cb981e1c1108dc3f2227d",
-     ""},
+     "9e7248f20914913a73d80a70174c331b1d34f260535ac3631d770e656b5dd922"},
     {50, "00000000076e482e",
      "9e7248f20914913a73d80a70174c331b1d34f260535ac3631d770e656b5dd922",
      "c7340542c2a06b3a7dc7222635f7cd402abf8b528ae971ddac6bbe2b0c7cb518",
-     ""},
+     "de37e1824c86d35d154cf65a88de6d9286aec4f7f10c3fc9f0fa1bcc2687188d"},
     {99, "000000003917afab",
      "de37e1824c86d35d154cf65a88de6d9286aec4f7f10c3fc9f0fa1bcc2687188d",
      "f5e60b2c5bfddd136167a30cbc3c8dbdbd15a512257dee7964e0bc6daa9f8ba7",
-     ""},
+     "ac7b55e801511b77e11d52e9599206101550144525b5679f2dab19386f23dcce"},
     {29950, "005d409dbc23a62a",
      "ac7b55e801511b77e11d52e9599206101550144525b5679f2dab19386f23dcce",
      "07393d15805eb08ee6fc6cb3ad4ad1010533bd0ff92d6006850246829f18fd6e",
-     ""},
+     "e43d7e0bdc8a4a3f6e291a5ed790b9fa1a0948a2b9e33c844888690847de19f5"},
     {29999, "005db5fa4c2a3d03",
      "e43d7e0bdc8a4a3f6e291a5ed790b9fa1a0948a2b9e33c844888690847de19f5",
      "7551bddf977491da2f6cfc1679299544b23483e8f8ee0931c4c16a796558a0b8",
-     ""},
+     "d34519f72c97cae8892c277776259db3320820cb5279a299d0ef1e155e5c6454"},
     {30000, "005db8607994ff30",
      "d34519f72c97cae8892c277776259db3320820cb5279a299d0ef1e155e5c6454",
      "f1c2c7c32266af9635462e6ce1c98ebe4e7e3ecab7a38aaabfbf2e731e0fbff4",
-     ""},
+     "8b6ce5da0b06d18db7bd8492d9e5717f8b53e7e098d9fef7886d58a6e913ef64"},
     {30049, "005e2e215a8ca2e7",
      "8b6ce5da0b06d18db7bd8492d9e5717f8b53e7e098d9fef7886d58a6e913ef64",
      "57fe6a9fbf920b4e91deeb66cb0efa971e08229d1a160330e08da54af0689add",
-     ""},
+     "c2c46173481b9ced61123d2e293b42ede5a1b323210eb2a684df0874ffe09047"},
     {30050, "005e30899481055e",
      "c2c46173481b9ced61123d2e293b42ede5a1b323210eb2a684df0874ffe09047",
      "ba30c61cc5a2c74a5ecaf505965140a08f24a296d687e78720f0b48baf712f2d",
-     ""},
+     "ea42197eb2ba79c63cb5e655b8b1f612c5f08aae1a49ff236795a3516d87bc71"},
     {30099, "005ea6aef136f88b",
      "ea42197eb2ba79c63cb5e655b8b1f612c5f08aae1a49ff236795a3516d87bc71",
      "cfd5e46048cd133d40f261fe8704e51d3f497fc14203ac6a9ef6a0841780b1cd",
-     ""},
+     "49e15ba4bf501ce8fe8876101c808e24c69a859be15de554bf85dbc095491bd6"},
     {59950, "02ebe0503bd7b1da",
      "49e15ba4bf501ce8fe8876101c808e24c69a859be15de554bf85dbc095491bd6",
      "21511fbaa31fb9f5fc4998a754e97b3083a866f4de86fa7500a633346f56d773",
-     ""},
+     "f5c50ba5c0d6210ddb16250ec3efda178de857b2b1703d8d5403bd0f848e19cf"},
     {59999, "02edb6275bd221e3",
      "f5c50ba5c0d6210ddb16250ec3efda178de857b2b1703d8d5403bd0f848e19cf",
      "653eda37d337e39d311d22be9bbd3458d3abee4e643bee4a7280a6d08106ef98",
-     ""},
+     "341562d10d4afb706ec2c8d5537cb0c810de02b4ebb0a0eea5ae335af6fb2e88"},
 };
 
 /** Stock ProgPoW 0.9.2: period 50, 12 cache accesses, 20 math ops. */
@@ -524,8 +471,22 @@ int main(int argc, char **argv) {
         hashMixLight(st.cache.data(), st.numCacheItems, st.l1.data(),
                      st.numItems2048, v.block, p, hashSeed, mix);
 
+        // 0.9.2's final keccak RE-ABSORBS the header with the 64-bit seed in
+        // the nonce slot; it does not carry the first keccak's state forward
+        // the way 0.9.4 does. Straight from the reference this coin pins,
+        // chfast/ethash v0.4.1 lib/ethash/progpow.cpp:
+        //   final_hash = keccak_progpow_256(header_hash, seed, mix_hash)
         uint32_t fin[8];
-        stockFinalKeccak(init, mix, fin);
+        {
+            uint32_t st[25];
+            memset(st, 0, sizeof st);
+            for (int i = 0; i < 8; i++) st[i] = hdr[i];
+            st[8] = hashSeed[0];   // seed low  word
+            st[9] = hashSeed[1];   // seed high word
+            for (int i = 0; i < 8; i++) st[10 + i] = mix[i];
+            keccakf800(st);
+            for (int i = 0; i < 8; i++) fin[i] = st[i];
+        }
 
         uint32_t wantMix[8];
         hexToWords(v.mix, wantMix, 8);
