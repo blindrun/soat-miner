@@ -136,6 +136,30 @@ class KawPowVK : public Algorithm {
                  VK_VERSION_MINOR(props.apiVersion));
         maxStorageRange_ = props.limits.maxStorageBufferRange;
 
+        // NVIDIA's Vulkan driver collapses on this algorithm's 6 GB working
+        // set. The launcher already routes NVIDIA to CUDA, but running this
+        // binary directly bypasses that, and the only symptom is a number the
+        // user has nothing to compare against - so say it, with the figures.
+        //
+        // Measured on idle cards, one algorithm each:
+        //   RTX 4090   CUDA 11.9 MH/s   Vulkan 1.7 MH/s
+        //   RTX 5080   CUDA  7.4 MH/s   Vulkan 4.3 MH/s
+        // AMD is unaffected and is in fact the fastest card here: an
+        // RX 7900 XT does 34.0 MH/s on this same Vulkan path.
+        if (props.vendorID == 0x10DEu) {
+            fprintf(stderr,
+                "[kawpow] this is the SLOW backend on this card.\n"
+                "  card:   %s\n"
+                "  KawPow on NVIDIA's Vulkan driver is several times slower than\n"
+                "  CUDA - measured 1.7 MH/s against 11.9 on an RTX 4090, and\n"
+                "  4.3 against 7.4 on an RTX 5080. The shader is fine; the\n"
+                "  driver does not handle the 6 GB DAG well.\n"
+                "  Run ./soat-miner (the CUDA binary) instead, or use\n"
+                "  soat-miner.sh, which picks it for you on NVIDIA.\n"
+                "  Mining will continue - this is a warning, not a refusal.\n",
+                props.deviceName);
+        }
+
         VkPhysicalDeviceMemoryProperties mp{};
         vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
         for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
@@ -226,10 +250,22 @@ class KawPowVK : public Algorithm {
         const uint32_t numItems512 = (uint32_t)fullDatasetNumItems(epoch) * 2;
 
         if (dagBytes + 256ull * 1024 * 1024 > deviceLocalBytes_) {
+            // This is the message a user with too small a card actually sees -
+            // it fires before any allocation is attempted. So it names the
+            // card, and says what the card CAN do, rather than only what it
+            // cannot. "KawPow cannot run on it" on its own leaves someone with
+            // a working GPU believing the miner is useless to them.
             fprintf(stderr,
-                    "[kawpow] epoch %d needs a %.2f GB DAG and this device has "
-                    "%.1f GB. KawPow cannot run on it.\n",
-                    epoch, dagBytes / 1e9, deviceLocalBytes_ / 1e9);
+                    "[kawpow] this card cannot mine Ravencoin.\n"
+                    "  card:  %s\n"
+                    "  VRAM:  %.1f GB device-local\n"
+                    "  need:  %.2f GB for epoch %d, plus about 0.25 GB working space\n"
+                    "  The DAG grows roughly 8 MB per epoch and never shrinks, so a\n"
+                    "  card that is short today does not become able later.\n"
+                    "  This card CAN mine the small-working-set algorithms on this\n"
+                    "  same binary: --algo sha3-256t needs a few kB, and\n"
+                    "  --algo autolykos2 needs about 7.5 GB.\n",
+                    devName_, deviceLocalBytes_ / 1e9, dagBytes / 1e9, epoch);
             return false;
         }
 
@@ -315,9 +351,39 @@ class KawPowVK : public Algorithm {
         } else {
             for (uint32_t i = 0; i < dagBufs_; i++)
                 if (!createBuffer(bytesPerBuf, deviceLocal(), &dag_[i])) {
+                    // "buffer 3 of 8" tells the person holding the card
+                    // nothing. Name the card, the VRAM it has, and which of
+                    // the two problems this is - too small is permanent and
+                    // needs a different algorithm, busy is not and needs a
+                    // different moment.
+                    VkPhysicalDeviceProperties dp{};
+                    vkGetPhysicalDeviceProperties(phys_, &dp);
+                    VkPhysicalDeviceMemoryProperties mp{};
+                    vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+                    VkDeviceSize local = 0;
+                    for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+                        if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                            local = local > mp.memoryHeaps[h].size
+                                        ? local : mp.memoryHeaps[h].size;
+                    const double needGB = (double)dagBytes / 1e9;
                     fprintf(stderr,
-                            "[kawpow] cannot allocate DAG buffer %u of %u (%.2f "
-                            "GB each)\n", i + 1, dagBufs_, bytesPerBuf / 1e9);
+                            "[kawpow] cannot allocate the DAG: failed on buffer "
+                            "%u of %u, %.2f GB each.\n"
+                            "  card:  %s\n"
+                            "  VRAM:  %.2f GB device-local\n"
+                            "  need:  %.2f GB total for epoch %d\n",
+                            i + 1, dagBufs_, bytesPerBuf / 1e9,
+                            dp.deviceName, local / 1e9, needGB, epoch);
+                    if (local && (double)local < needGB * 1e9)
+                        fprintf(stderr,
+                            "  This card is too small for Ravencoin and always will\n"
+                            "  be - the DAG grows about 8 MB per epoch. It can still\n"
+                            "  mine --algo sha3-256t, or --algo autolykos2 with 8 GB.\n");
+                    else
+                        fprintf(stderr,
+                            "  The card is big enough but not enough is free. A\n"
+                            "  display, a compositor or another miner on the same\n"
+                            "  card is the usual cause.\n");
                     return false;
                 }
         }

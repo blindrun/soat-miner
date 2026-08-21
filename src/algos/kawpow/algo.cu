@@ -61,6 +61,32 @@ class KawPow : public Algorithm {
         const uint32_t numItems512 = (uint32_t)fullDatasetNumItems(epoch) * 2;
         const uint64_t dagBytes = fullDatasetBytes(epoch);
 
+        // Check the card is big enough BEFORE building a 95 MB light cache
+        // that takes real time. The Vulkan path has always done this; CUDA
+        // only found out at cudaMalloc, so a user with too small a card waited
+        // through the whole build to be told it was never going to work.
+        {
+            cudaDeviceProp p{};
+            int dev = 0;
+            cudaGetDevice(&dev);
+            const bool haveProp = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+            const uint64_t total = haveProp ? (uint64_t)p.totalGlobalMem : 0;
+            if (total && dagBytes + 256ull * 1024 * 1024 > total) {
+                fprintf(stderr,
+                    "[kawpow] this card cannot mine Ravencoin.\n"
+                    "  card:  %s\n"
+                    "  VRAM:  %.1f GB\n"
+                    "  need:  %.2f GB for epoch %d, plus about 0.25 GB working space\n"
+                    "  The DAG grows roughly 8 MB per epoch and never shrinks, so a\n"
+                    "  card that is short today does not become able later.\n"
+                    "  This card CAN mine the small-working-set algorithms on this\n"
+                    "  same binary: --algo sha3-256t needs a few kB, and\n"
+                    "  --algo autolykos2 needs about 7.5 GB.\n",
+                    p.name, total / 1e9, dagBytes / 1e9, epoch);
+                return false;
+            }
+        }
+
         // The host keeps its copy of the light cache for the lifetime of the
         // epoch. It is 95 MB, and it is what verify() re-derives a solution
         // from - asking the same possibly-unstable GPU to confirm its own
@@ -81,11 +107,38 @@ class KawPow : public Algorithm {
             return false;
         }
         if (cudaMalloc(&dDag_, dagBytes) != cudaSuccess) {
+            // Name the card and say which of the two problems this is. They
+            // need opposite actions: a card that is merely busy can mine
+            // Ravencoin once something frees up, and a card that is too small
+            // never will - and will only get further away, because the DAG
+            // grows about 8 MB an epoch and never shrinks.
+            cudaDeviceProp p{};
+            int dev = 0;
+            cudaGetDevice(&dev);
+            const bool haveProp = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+            size_t freeB = 0, totalB = 0;
+            cudaMemGetInfo(&freeB, &totalB);
+
             fprintf(stderr,
                     "[kawpow] cannot allocate the %.2f GB DAG for epoch %d.\n"
-                    "  KawPow needs that much VRAM free; a display and a browser "
-                    "on the same card can be enough to prevent it.\n",
-                    dagBytes / 1e9, epoch);
+                    "  card:     %s\n"
+                    "  VRAM:     %.2f GB total, %.2f GB free\n"
+                    "  need:     %.2f GB in one allocation\n",
+                    dagBytes / 1e9, epoch,
+                    haveProp ? p.name : "unknown",
+                    totalB / 1e9, freeB / 1e9, dagBytes / 1e9);
+            if (totalB && totalB < dagBytes) {
+                fprintf(stderr,
+                    "  This card is too small for Ravencoin and always will be -\n"
+                    "  the DAG grows about 8 MB per epoch and never shrinks. It can\n"
+                    "  still mine the algorithms with small working sets: try\n"
+                    "  --algo sha3-256t, or --algo autolykos2 if it has 8 GB.\n");
+            } else {
+                fprintf(stderr,
+                    "  The card is big enough but not enough is free right now.\n"
+                    "  A display, a browser or another miner on the same card is\n"
+                    "  the usual cause; close one and retry.\n");
+            }
             cudaFree(dCache);
             dDag_ = nullptr;
             return false;
