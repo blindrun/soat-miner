@@ -45,7 +45,28 @@
 //   per lane, the destination registers, or the chunk mapping - and not in
 //   the dataset, the parameters, or any progPowInit layer.
 //
-//   CORRECTION, from testing that instead of believing it: the DAG is NOT
+//   SECOND CORRECTION, and this one resolves it. The end-to-end and loop
+//   vectors are DAG-dependent and this document's DAG is NOT the stock Ethash
+//   one. Cache op 0 in my program has exactly the destination register,
+//   selector and source register the document's merge table implies - so the
+//   program and the offset are right - and only the value read from L1
+//   differs: 0x49A89D11 against the required 0x870FA227. That word is absent
+//   from the whole 16 KB L1 at epochs 0, 1, 2 and 3, so it is not a layout or
+//   ordering difference; the dataset itself is different.
+//
+//   My Ethash dataset code is independently proven correct against real
+//   RAVENCOIN mainnet blocks (13 vectors plus a full end-to-end run at block
+//   4,501,000), so buildLightCache, epochSeed and datasetItem2048 are not the
+//   suspects. These are VeriBlock's vectors, and VeriBlock is its own chain;
+//   the most likely reading is that its DAG derivation differs. NOT verified,
+//   and stated as the likely reading rather than a finding.
+//
+//   What follows practically: the DAG-INDEPENDENT vectors are valid anchors
+//   and all pass, and the DAG-dependent ones cannot be reproduced without
+//   that fork's dataset. --e2e failing is therefore not evidence of a defect
+//   in this implementation, and should not be read as one.
+//
+//   FIRST CORRECTION, from testing instead of believing: the DAG merge is NOT
 //   where the divergence starts. Sweeping the merge structure - 1, 2 or 4
 //   words per lane crossed with strides of 1, 2, 4 - gives 177/512 in all
 //   nine cases, as does zeroing the DAG. If the wrong registers were the
@@ -293,6 +314,28 @@ int main(int argc, char **argv) {
         if (ok) printf("  ok    %s\n", what);
         else { printf("  FAIL  %s\n", what); bad++; }
     };
+
+    // --- 0. fnv1a and kiss99, the two lowest layers -----------------------
+    {
+        uint32_t h = 0x811C9DC5u;
+        h = fnv1a(h, 0xDDD0A47Bu);
+        const bool a = h == 0xD37EE61Au;
+        h = fnv1a(h, 0xEE304846u);
+        const bool b = h == 0xDEDC7AD4u;
+        h = fnv1a(h, 0x00000000u);
+        ck(a && b && h == 0xA9155BBCu, "fnv1a matches all three chained rows");
+
+        Kiss99 k{362436069u, 521288629u, 123456789u, 380116160u};
+        const uint32_t w1 = k.next(), w2 = k.next(), w3 = k.next(), w4 = k.next();
+        bool ok = w1 == 769445856u && w2 == 742012328u &&
+                  w3 == 2121196314u && w4 == 2805620942u;
+        // The document also pins iteration 100000, which is the one that
+        // catches a generator that is right for a few steps and then drifts.
+        uint32_t last = w4;
+        for (int i = 5; i <= 100000; i++) last = k.next();
+        ck(ok && last == 941074834u,
+           "kiss99 matches iterations 1-4 and 100000");
+    }
 
     // --- 1. keccak_f800, the document's own test case 1 -------------------
     {
