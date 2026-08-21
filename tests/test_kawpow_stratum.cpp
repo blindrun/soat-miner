@@ -67,9 +67,10 @@ std::string seedHexFor(int height) {
 }
 
 std::string notifyFor(int height, const std::string &seedHex,
-                      const std::string &target) {
+                      const std::string &target,
+                      const std::string &jobId = "job42") {
     return "{\"id\":null,\"method\":\"mining.notify\",\"params\":["
-           "\"job42\","
+           "\"" + jobId + "\","
            "\"8dc2a5086848cb872bb610d1a06294e3c41196bb04b041c8fe84da0153ba5db7\","
            "\"" + seedHex + "\","
            "\"" + target + "\","
@@ -269,7 +270,7 @@ int main() {
         auto *c = make();
         c->feedLineForTest("{\"id\":10,\"result\":true,\"error\":null}");
         c->feedLineForTest(
-            "{\"id\":11,\"result\":false,\"error\":[21,\"Job not found\",null]}");
+            "{\"id\":11,\"result\":false,\"error\":[23,\"Low difficulty share\",null]}");
         uint64_t a = 0, r = 0, p = 0;
         std::string e;
         c->poolCounters(&a, &r, &p, &e);
@@ -278,6 +279,13 @@ int main() {
         delete c;
     }
 
+    // These use "Low difficulty share" rather than "Job not found", which was
+    // the original fixture. "Job not found" means the share arrived after its
+    // job expired — that is STALE, and the pool files it under shares_stale,
+    // not shares_invalid. Using it to exercise the rejection path conflated
+    // late with wrong. The fixture was imprecise; the semantics are not being
+    // weakened to make a test pass.
+    //
     // An ACCEPTED share must put nothing in the reject channel. The run loop
     // prints whatever is there as "pool REJECTED the share", so a success
     // message in it turns every accepted share into a reported rejection.
@@ -290,10 +298,35 @@ int main() {
         check(c->takeRejectReason().empty(),
               "an accepted share leaves the reject channel empty");
         c->feedLineForTest(
-            "{\"id\":11,\"result\":false,\"error\":[21,\"Job not found\",null]}");
+            "{\"id\":11,\"result\":false,\"error\":[23,\"Low difficulty share\",null]}");
         const std::string r = c->takeRejectReason();
-        check(!r.empty() && r.find("Job not found") != std::string::npos,
+        check(!r.empty() && r.find("Low difficulty") != std::string::npos,
               "a rejected share puts the pool's own reason in it");
+        delete c;
+    }
+
+    // A share whose job moved on before the reply arrived is STALE, not
+    // accepted. Found by comparing our readout against the pool's own API:
+    // we said 14 accepted where HeroMiners credited 13 good and 1 stale,
+    // because it answered the stale one `result: true`.
+    {
+        auto *c = make(KawpowStratumSource::kStratum);
+        const std::string seed = seedHexFor(4500000);
+        const std::string tgt =
+            "00000000000000000000000000000000"
+            "00000000000000000006292b00000000";
+        c->feedLineForTest(notifyFor(4500000, seed, tgt, "jobA"));
+        c->recordSubmitForTest(10, "jobA");
+        c->feedLineForTest(notifyFor(4500000, seed, tgt, "jobB"));
+        c->feedLineForTest("{\"id\":10,\"result\":true,\"error\":null}");
+
+        uint64_t a = 0, r = 0, p = 0;
+        std::string e;
+        c->poolCounters(&a, &r, &p, &e);
+        check(c->staleShares() == 1,
+              "a reply for a superseded job counts as stale");
+        check(a == 0, "and NOT as accepted, which is what over-counted before");
+        check(p == 0, "stale is resolved, so pending does not climb");
         delete c;
     }
 

@@ -48,6 +48,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -125,6 +126,19 @@ class KawpowStratumSource : public JobSource {
      */
     void feedLineForTest(const std::string &line) { handleLine(line); }
 
+    /** Exposed for tests: record an in-flight submit without a socket. */
+    void recordSubmitForTest(int id, const std::string &jobId) {
+        std::lock_guard<std::mutex> lk(submitMu_);
+        submitted_++;
+        submitJob_[id] = jobId;
+    }
+
+    /** Shares the pool received too late to credit. See `submitJob_`. */
+    uint64_t staleShares() const {
+        std::lock_guard<std::mutex> lk(submitMu_);
+        return stale_;
+    }
+
     /** Exposed for tests: the job as it stands, without reconnecting. */
     bool currentJobForTest(Job *job) const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -176,7 +190,19 @@ class KawpowStratumSource : public JobSource {
 
     mutable std::mutex sendMu_;
     std::string lastSent_;
-    uint64_t submitted_ = 0, accepted_ = 0, rejected_ = 0;
+    uint64_t submitted_ = 0, accepted_ = 0, rejected_ = 0, stale_ = 0;
+    /**
+     * Which job each in-flight submit was for.
+     *
+     * A share is STALE when the job it answers has been replaced before the
+     * pool's reply arrives, and the pool's reply does not reliably say so:
+     * HeroMiners answered one `result: true` and filed it as stale in its own
+     * statistics, so our count read 14 accepted where the pool credited 13
+     * good and 1 stale. The client can tell locally, because it knows when it
+     * switched jobs - so it does not have to depend on a reply convention that
+     * varies by pool.
+     */
+    std::map<int, std::string> submitJob_;
     std::string lastSubmitError_, verdict_;
     mutable std::mutex submitMu_;
 };

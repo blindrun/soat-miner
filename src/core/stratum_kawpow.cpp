@@ -414,12 +414,44 @@ void KawpowStratumSource::handleLine(const std::string &line) {
         // matched as bytes in the line: a pool is free to space and order its
         // JSON however it likes, and "result": true is the same reply as
         // "result":true.
+        // Read the current job BEFORE taking submitMu_. The stale test needs
+        // it and it lives under mu_; taking both at once is the lock nesting
+        // this file deliberately does not do.
+        std::string currentJob;
+        bool haveCurrent = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            haveCurrent = haveJob_;
+            currentJob = current_.jobId;
+        }
+
         std::string warn;
         {
             std::lock_guard<std::mutex> lk(submitMu_);
             std::string result;
             const bool haveResult = jsonRawValue(line, "result", &result);
-            if (isErr || (haveResult && result == "false")) {
+
+            // STALE: the job this answers was replaced before the reply came
+            // back. Decided from what this client did, not from the reply,
+            // because pools do not agree on how to signal it - HeroMiners
+            // answered one `result: true` and filed it as stale in its own
+            // statistics, so our readout said 14 accepted where the pool
+            // credited 13 good and 1 stale.
+            bool jobMoved = false;
+            const auto it = submitJob_.find(id);
+            if (it != submitJob_.end()) {
+                jobMoved = haveCurrent && it->second != currentJob;
+                submitJob_.erase(it);
+            }
+            // Believe a pool that does say so, in whatever words it uses.
+            const bool saysStale =
+                isErr && (errRaw.find("tale") != std::string::npos ||
+                          errRaw.find("Job not found") != std::string::npos);
+
+            if (saysStale || (jobMoved && !(isErr || result == "false"))) {
+                stale_++;
+                verdict_.clear();
+            } else if (isErr || (haveResult && result == "false")) {
                 rejected_++;
                 lastSubmitError_ =
                     isErr ? errRaw : std::string("pool said false");
@@ -508,6 +540,7 @@ bool KawpowStratumSource::submit(const Job &job, const Solution &sol,
     {
         std::lock_guard<std::mutex> lk(submitMu_);
         submitted_++;
+        submitJob_[id] = job.jobId;
     }
     if (!sendLine(req)) {
         *err = "submit send failed";
@@ -522,7 +555,9 @@ bool KawpowStratumSource::poolCounters(uint64_t *accepted, uint64_t *rejected,
     std::lock_guard<std::mutex> lk(submitMu_);
     *accepted = accepted_;
     *rejected = rejected_;
-    *pending = submitted_ - accepted_ - rejected_;
+    // Stale shares are resolved, not in flight: leaving them out of this
+    // subtraction would make `pending` climb forever on a busy pool.
+    *pending = submitted_ - accepted_ - rejected_ - stale_;
     *lastError = lastSubmitError_;
     return true;
 }
