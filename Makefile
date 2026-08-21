@@ -301,7 +301,11 @@ tests/test_kawpow_device: tests/test_kawpow_device.cu \
 # The device gate needs a card and enough VRAM for the real 6.1 GB DAG, so it
 # is its own target rather than part of test-kawpow, which must pass on a build
 # machine with no GPU at all. It skips itself politely on a small card.
-test-kawpow-device: tests/test_kawpow_device
+test-bench-runs: cuda
+	@echo "--- bench mode starts and reports, on every algorithm ---"
+	@sh tests/test_bench_runs.sh ./soat-miner
+
+test-kawpow-device: tests/test_kawpow_device test-bench-runs
 	@echo "--- kawpow: CUDA kernels vs the host reference, on a real DAG ---"
 	@./tests/test_kawpow_device $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
 		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
