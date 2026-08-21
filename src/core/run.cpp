@@ -696,7 +696,14 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // credited shares - which happened for BC3 (367 shares, readout said
         // zero) and then again for KawPow (263 shares, readout said zero). A
         // cast chain is a hand-maintained list of types; the interface is not.
-        {
+        // Guarded because benchmark mode has no JobSource at all: `source` is
+        // a unique_ptr that is simply never assigned. The dynamic_cast chain
+        // this block replaced was null-safe by accident - casting a null
+        // pointer yields null and the old code tested it - so removing the
+        // chain removed a guard nobody had written down. Bench mode segfaulted
+        // on the first stats interval, and the pool path masked it because
+        // that was the only path retested after the change.
+        if (source) {
             const std::string v = source->takeRejectReason();
             if (!v.empty())
                 logLine(tty, "error", "pool REJECTED the share: " + v);
