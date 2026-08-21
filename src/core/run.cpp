@@ -497,6 +497,10 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         memset(job.msg, 0xab, 32);
         for (int i = 0; i < 4; i++) job.target[i] = 0;  // never hits
         job.valid = true;
+        // Anything this algorithm needs beyond the generic fields. Pearl's
+        // header stub lives in `extra`, and without this `--bench --algo
+        // pearl-pow` printed one line and exited.
+        algo->fillBenchJob(&job);
     }
 
     auto tEpoch = tStart;

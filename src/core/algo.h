@@ -124,6 +124,21 @@ class Algorithm {
      */
     virtual std::string launcherGlob() const { return std::string(); }
 
+    /**
+     * Fill in whatever a synthetic benchmark job needs beyond the generic
+     * fields the run loop sets (message, epoch, target).
+     *
+     * Default does nothing, which is right for every algorithm whose job fits
+     * `Job`'s fixed fields. Pearl is the exception: its 76-byte header stub and
+     * certificate version ride in `Job::extra`, so a bench job without them is
+     * refused by `prepare()` and `--bench` fails.
+     *
+     * This lives on the interface rather than as a branch in the run loop for
+     * the same reason `launcherGlob()` does: a new algorithm that needs bench
+     * setup gets it by existing, not by someone remembering to edit run.cpp.
+     */
+    virtual void fillBenchJob(Job *job) const { (void)job; }
+
     /** Release device memory. */
     virtual void release() = 0;
 };

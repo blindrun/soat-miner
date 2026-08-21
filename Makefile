@@ -143,7 +143,7 @@ vkgen = $(BUILD)/lin/gen/$(1).o
 VK_OBJS  = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(BUILD)/lin/gen/%.o,$(VK_SRC_GEN))
 
-.PHONY: all cuda vulkan clean test test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-device test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -301,6 +301,15 @@ tests/test_kawpow_device: tests/test_kawpow_device.cu \
 # The device gate needs a card and enough VRAM for the real 6.1 GB DAG, so it
 # is its own target rather than part of test-kawpow, which must pass on a build
 # machine with no GPU at all. It skips itself politely on a small card.
+# Every gate that needs a real GPU, in one place.
+#
+# These were reachable only by typing their exact names, which meant nobody ran
+# them and a segfault in `--bench` - the first command most people type - stayed
+# invisible while the offline gate reported 119 checks passing. A gate nobody
+# invokes is not a gate.
+test-device: test-bench-runs test-kawpow-device
+	@echo "device gates: all passed"
+
 test-bench-runs: cuda
 	@echo "--- bench mode starts and reports, on every algorithm ---"
 	@sh tests/test_bench_runs.sh ./soat-miner
@@ -378,6 +387,10 @@ tests/test_kawpow_address: tests/test_kawpow_address.cpp src/core/kawpow_address
 
 # test_algo_registry compares the binaries against the launcher, so both
 # binaries have to exist for it to say anything.
+# NOTE: this gate needs no GPU and therefore does NOT run the device gates.
+# It ends by saying so - see the last line of the recipe. An offline gate that
+# reports success without naming what it skipped is how "the tests pass" came
+# to mean less than it sounded.
 test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
              tests/test_progpow_stock tests/test_progpow_ops \
              tests/test_progpow_092 \
@@ -414,6 +427,12 @@ test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
 	@./tests/test_launcher_backend.sh
 	@echo "--- registries: do the four lists describing an algorithm agree? ---"
 	@./tests/test_algo_registry.sh
+	@echo ""
+	@echo "NOT RUN by this gate, because they need a real GPU:"
+	@echo "  device kernels vs the host reference, and --bench on every algorithm."
+	@echo "  Run them with:  make test-device"
+	@echo "  A crash in --bench was invisible to CI until 2026-08-21 because"
+	@echo "  nothing here said it had not been checked."
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the
