@@ -21,7 +21,13 @@ namespace om {
 
 Algorithm *makeAutolykos2VK(int deviceIndex);
 Algorithm *makeSha3_256tVK(int deviceIndex);
-// Algorithm *makePearlPowVK(int deviceIndex);   // <- add here
+// Registered only now that the backend really mines: prepare() runs the whole
+// chain and checks it against job.h before a share is possible, search() opens
+// a winning tile into a real proof, and the mock-pool test submits one that is
+// accepted. Registering earlier would have made --algo pearl-pow start,
+// allocate a device and then fail, which is worse for a user than the honest
+// "Pearl is CUDA only" that miner_vk.cpp printed while this line was commented.
+Algorithm *makePearlPowVK(int deviceIndex);
 
 namespace {
 
@@ -33,6 +39,7 @@ struct Entry {
 const Entry kVulkanRegistry[] = {
     {"autolykos2", &makeAutolykos2VK},
     {"sha3-256t", &makeSha3_256tVK},
+    {"pearl-pow", &makePearlPowVK},
 };
 
 }  // namespace

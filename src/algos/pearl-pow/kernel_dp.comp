@@ -1,0 +1,201 @@
+// Pearl NoisyGEMM for devices with NO cooperative matrix — the RDNA2 path.
+//
+// A drop-in replacement for kernel.comp: same bindings, same push constants,
+// same dispatch shape, same transcript. The only runtime difference is which
+// SPIR-V module the pipeline is built from, selected by CAPABILITY and never by
+// vendor string or card name.
+//
+// WHY THIS EXISTS. RDNA2 has no matrix cores at all: VK_KHR_cooperative_matrix
+// is absent from an RX 6700 XT's device extension list, the feature bit is
+// false, and vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT. What it
+// does have is the hardware int8 dot product V_DOT4_I32_I8, four int8 MACs per
+// lane per instruction, reached from GLSL through dotPacked4x8AccSatEXT.
+//
+// Note the extension is GL_EXT_integer_dot_product, NOT
+// GL_EXT_shader_integer_dot_product, and the signed overload takes `int`.
+// Both of those cost time the first time somebody writes this.
+//
+// ===================================================================
+// THE THREE THINGS THAT MAKE THIS BYTE-IDENTICAL OR NOT
+// ===================================================================
+//
+// 1. THE ACCUMULATOR IS NEVER RESET BETWEEN RANK CHUNKS. kernel.comp declares
+//    `acc` once before the k loop, so the value folded at chunk r is the XOR of
+//    the RUNNING accumulator after r+1 chunks, not of that chunk's own
+//    contribution. A variant that folds per-chunk deltas is a perfectly
+//    reasonable-looking shader that produces a completely different transcript,
+//    verifies against nothing local, and is rejected by the node with the same
+//    sentence as every other failure.
+//
+// 2. THE TRANSCRIPT INDEX IS BLOCK-MAJOR, not row-major over tiles. It is
+//    copied verbatim from kernel.comp rather than re-derived:
+//
+//      flatIdx = ((iIdx*blocksPerRow + jIdx)*tilesPerSide + hi)*tilesPerSide + wi
+//
+// 3. B IS K-MAJOR. B[p*n + j] — it is applyNoise mode 2's output, not the
+//    transposed Bt. A is row-major, A[row*k + col]. They are indexed
+//    differently and swapping them silently computes something else.
+//
+// WHAT IS FREE, and it is what makes this tractable: XOR is commutative and
+// associative within a tile, so this shader does NOT have to reproduce
+// coopmat's element-to-invocation mapping. Any lane may hold any subset of the
+// 256 accumulator values as long as every value is XORed exactly once.
+//
+// WHAT IS NOT FREE: the fold needs the whole 16x16 accumulator after EVERY rank
+// chunk, so a workgroup covers exactly one hash tile. The 128x64 geometry that
+// reached 3.06 T MAC/s in ~/pearl-vk-probe covers thirty-two of them and cannot
+// be used unchanged. Correctness first; this is the agreed increment.
+//
+// ON SATURATION: dotPacked4x8AccSatEXT saturates where coopmat wraps. It cannot
+// bite here — operands are int8 in [-64,63] plus noise in [-63,63], so a
+// product is at most 127*127 = 16129 and k = 2048 terms bound the sum at about
+// 3.3e7, three orders of magnitude inside int32. The saturating form is used
+// because it is the one measured to reach V_DOT4_I32_I8. The gate would catch
+// it if that analysis were ever wrong.
+
+#version 450
+
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const int SUBGROUP_SIZE = 64;
+// constant_id 1 is K_DIM in kernel.comp and is coopmat-only. Reused here for
+// the largest rank this shader will be asked for, because shared memory cannot
+// be sized at dispatch time and rank arrives in a push constant.
+layout(constant_id = 1) const int MAX_RANK = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// A is declared as uint and B as int8_t deliberately, each for its access
+// pattern. A is contiguous in k, so four int8 come out of one uint load in the
+// order dotPacked4x8 wants. B is strided by n in k, so its bytes are gathered
+// individually and repacked - there is no contiguous load to be had.
+layout(std430, binding = 0) readonly  buffer BufA { uint    Apack[]; };
+layout(std430, binding = 1) readonly  buffer BufB { int8_t  B[]; };
+layout(std430, binding = 2) writeonly buffer BufC { int32_t C[]; };
+layout(std430, binding = 3)           buffer BufT { uint transcripts[]; };
+
+layout(push_constant) uniform Push {
+    int m;
+    int n;
+    int k;
+    int rank;
+    int writeC;
+} pc;
+
+const int HASH_TILE = 16;
+const int TRANSCRIPT_U32 = 16;
+const int ROTATION = 13;
+
+// A tile: 16 rows x MAX_RANK int8, k-contiguous, 4 per uint.
+// B tile: transposed to 16 columns x MAX_RANK int8, so k is contiguous here too.
+shared uint sA[HASH_TILE * (MAX_RANK / 4)];
+shared uint sB[HASH_TILE * (MAX_RANK / 4)];
+
+uint rotl32(uint x, int r) {
+    return (x << r) | (x >> (32 - r));
+}
+
+void main() {
+    const int tilesX = pc.n / HASH_TILE;
+    const int tilesY = pc.m / HASH_TILE;
+    const int tile = int(gl_WorkGroupID.x);
+    if (tile >= tilesX * tilesY) return;
+
+    const int tileRow = tile / tilesX;
+    const int tileCol = tile % tilesX;
+    const int row = tileRow * HASH_TILE;
+    const int col = tileCol * HASH_TILE;
+
+    const int lane = int(gl_SubgroupInvocationID);
+    const int lanes = SUBGROUP_SIZE;
+
+    // 256 accumulators spread over the subgroup. Which lane holds which does
+    // not matter - see "what is free" above - only that each is XORed once.
+    // Sized from the spec constant, not from a guessed minimum. The first
+    // version used a fixed [256/32] and llvmpipe's subgroup of 8 needs 32
+    // accumulators per lane - it wrote off the end and produced a plausible
+    // wrong answer rather than crashing.
+    const int perLane = (HASH_TILE * HASH_TILE) / SUBGROUP_SIZE;
+    int32_t acc[(HASH_TILE * HASH_TILE) / SUBGROUP_SIZE];
+    for (int e = 0; e < perLane; ++e) acc[e] = 0;
+
+    uint slot = 0u;
+    int reduction = 0;
+
+    const int kGroups = pc.rank / 4;             // uints of k per staged row
+
+    for (int p = 0; p < pc.k; p += pc.rank) {
+        if (pc.k - p < pc.rank) break;
+
+        // ---- stage A: 16 rows x rank int8, already k-contiguous ----
+        for (int idx = lane; idx < HASH_TILE * kGroups; idx += lanes) {
+            const int i = idx / kGroups;
+            const int g = idx % kGroups;
+            sA[idx] = Apack[((row + i) * pc.k + p) / 4 + g];
+        }
+
+        // ---- stage B transposed: 16 cols x rank int8, gathered byte by byte ----
+        // B[kk*n + col + j] for four consecutive kk, packed little-endian so
+        // component 0 is the lowest k - the same order the A load produces.
+        for (int idx = lane; idx < HASH_TILE * kGroups; idx += lanes) {
+            const int j = idx / kGroups;
+            const int g = idx % kGroups;
+            const int kk = p + g * 4;
+            const uint b0 = uint(int(B[kk       * pc.n + col + j]) & 0xFF);
+            const uint b1 = uint(int(B[(kk + 1) * pc.n + col + j]) & 0xFF);
+            const uint b2 = uint(int(B[(kk + 2) * pc.n + col + j]) & 0xFF);
+            const uint b3 = uint(int(B[(kk + 3) * pc.n + col + j]) & 0xFF);
+            sB[idx] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        barrier();
+
+        // ---- the dot products ----
+        for (int e = 0; e < perLane; ++e) {
+            const int outIdx = e * lanes + lane;   // not `flat`: reserved word in GLSL    // which of the 256 outputs
+            const int i = outIdx / HASH_TILE;
+            const int j = outIdx % HASH_TILE;
+            int32_t a = acc[e];
+            for (int g = 0; g < kGroups; ++g) {
+                a = dotPacked4x8AccSatEXT(int(sA[i * kGroups + g]),
+                                          int(sB[j * kGroups + g]), a);
+            }
+            acc[e] = a;
+        }
+        barrier();
+
+        // ---- fold, exactly as kernel.comp does ----
+        uint v = 0u;
+        for (int e = 0; e < perLane; ++e) v ^= uint(acc[e]);
+        v = subgroupXor(v);
+
+        if (lane == reduction % TRANSCRIPT_U32) {
+            slot = rotl32(slot, ROTATION) ^ v;
+        }
+        ++reduction;
+    }
+
+    if (pc.writeC != 0) {
+        for (int e = 0; e < perLane; ++e) {
+            const int outIdx = e * lanes + lane;   // not `flat`: reserved word in GLSL
+            const int i = outIdx / HASH_TILE;
+            const int j = outIdx % HASH_TILE;
+            C[(row + i) * pc.n + col + j] = acc[e];
+        }
+    }
+
+    if (lane < TRANSCRIPT_U32) {
+        const int blocksPerRow = pc.n / pc.rank;
+        const int iIdx = row / pc.rank;
+        const int jIdx = col / pc.rank;
+        const int hi = (row % pc.rank) / HASH_TILE;
+        const int wi = (col % pc.rank) / HASH_TILE;
+        const int tilesPerSide = pc.rank / HASH_TILE;
+        const int flatIdx =
+            ((iIdx * blocksPerRow + jIdx) * tilesPerSide + hi) * tilesPerSide + wi;
+        transcripts[flatIdx * TRANSCRIPT_U32 + lane] = slot;
+    }
+}

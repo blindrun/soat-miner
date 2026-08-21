@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,13 +24,15 @@
 static int failures = 0, checks = 0;
 
 static void writeClaim(const std::string &dir, const char *key,
-                       const char *who, long pid, long long until) {
+                       const char *who, long long since, long long until) {
     std::string d = dir + "/" + key + ".lock";
     mkdir(dir.c_str(), 0755);
     mkdir(d.c_str(), 0755);
     FILE *f = fopen((d + "/meta").c_str(), "w");
-    fprintf(f, "who=%s\npid=%ld\npurpose=fixture\nsince=0\nuntil=%lld\n", who,
-            pid, until);
+    // pid is written because a real claim has one - and is deliberately NOT
+    // read by the guard. See vk_claim_guard.h.
+    fprintf(f, "who=%s\npid=1\npurpose=fixture\nsince=%lld\nuntil=%lld\n", who,
+            since, until);
     fclose(f);
 }
 
@@ -68,8 +71,9 @@ int main() {
     char tmpl[] = "/tmp/claimguardXXXXXX";
     const char *dir = mkdtemp(tmpl);
     if (!dir) { printf("could not make a fixture dir\n"); return 1; }
-    const long alive = (long)getpid();
-    const long long far = 4102444800LL;   // 2100
+    const long long now = (long long)time(nullptr);
+    const long long fresh = now - 60;     // claimed a minute ago...
+    const long long far = now + 3600;     // ...for an hour
 
     printf("claim guard:\n");
 
@@ -77,7 +81,7 @@ int main() {
     expect("no claim file at all is a refusal, not a shrug",
            permits("NVIDIA GeForce RTX 4090", "me", dir), false);
 
-    writeClaim(dir, "4070s", "probe-holder-name", alive, far);
+    writeClaim(dir, "4070s", "probe-holder-name", fresh, far);
     expect("a holder that merely CONTAINS our name is not us",
            permits("NVIDIA GeForce RTX 4070 SUPER", "probe", dir), false);
     expect("and the lane-prefix case: wF:p1 against wF:p10",
@@ -85,7 +89,7 @@ int main() {
            false);
 
     // The positive case, or the test proves only that it always refuses.
-    expect("an exact holder with a live pid is permitted",
+    expect("an exact holder on a fresh claim is permitted",
            permits("NVIDIA GeForce RTX 4070 SUPER", "probe-holder-name", dir),
            true);
 
@@ -93,9 +97,18 @@ int main() {
     expect("GPULOCK_WHO unset",
            permits("NVIDIA GeForce RTX 4070 SUPER", nullptr, dir), false);
 
-    writeClaim(dir, "4080", "me", 999999999, far);
-    expect("a claim whose process is gone is stale, not ours",
+    // Stale on gpulock's rule: past `until` plus the claim's own span again.
+    // A 30-minute claim that ended two hours ago is long gone.
+    writeClaim(dir, "4080", "me", now - 9000, now - 7200);
+    expect("a claim stale on gpulock's own rule is not ours to rely on",
            permits("NVIDIA GeForce RTX 4080", "me", dir), false);
+
+    // Merely expired is NOT stale - it is still ours and a lane must ask.
+    // This is the case a pid check got wrong, marking every claim stale the
+    // moment it was made.
+    writeClaim(dir, "4090", "me", now - 1800, now - 60);
+    expect("a claim that just expired is still ours",
+           permits("NVIDIA GeForce RTX 4090", "me", dir), true);
 
     // A malformed claim: the guard must not read it as consent.
     {
@@ -109,7 +122,7 @@ int main() {
            permits("NVIDIA GeForce RTX 5080", "me", dir), false);
 
     // An unknown variant of a fleet family must not borrow another card's lock.
-    writeClaim(dir, "4070s", "me", alive, far);
+    writeClaim(dir, "4070s", "me", fresh, far);
     expect("a plain RTX 4070 does not inherit the SUPER's claim",
            permits("NVIDIA GeForce RTX 4070", "me", dir), false);
 

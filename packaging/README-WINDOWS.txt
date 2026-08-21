@@ -11,7 +11,7 @@ WHAT IS IN HERE
   mine_ergo_*.bat     ready-made pool / solo scripts - edit WALLET and run
   ergo-pools.json     reviewed pool endpoints and their source URLs
 
-  mine_pearl_*.bat    Pearl pool script - edit WALLET and run (CUDA only)
+  mine_pearl_*.bat    Pearl pool script - edit WALLET and run
   mine_bc3_*.bat      Bitcoin III pool scripts - edit WALLET and run.
                       One per pool, so you are not stuck with ours:
                         mine_bc3_pythonpool.bat        0%   solo
@@ -31,9 +31,8 @@ WHAT IS IN HERE
   benchmark.bat       benchmark, no pool or node needed
 
 WHICH ONE RUNS
-  Pearl is CUDA only, so mine_pearl_*.bat calls soat-miner.exe directly and
-  says so if it is missing. Ergo and Bitcoin III both have Vulkan shaders, so
-  soat-miner.bat picks by GPU, not by brand, and you do not choose:
+  All three algorithms have Vulkan shaders now, so every mine_*.bat goes
+  through soat-miner.bat and it picks by GPU, not by brand. You do not choose:
     - AMD and Intel            -> Vulkan (soat-miner-vk.exe)
     - NVIDIA 50-series         -> Vulkan, ~22% faster than CUDA on Blackwell
     - NVIDIA 40-series / older -> CUDA (soat-miner.exe), ~34% faster on Ada
@@ -78,10 +77,16 @@ PEARL
   Set WALLET in a mine_pearl_*.bat to a PEARL address - it starts prl1 and is
   about 63 characters. An Ergo address cannot be paid by a Pearl pool.
 
-  These call soat-miner.exe directly instead of going through soat-miner.bat,
-  and that is deliberate: Pearl is CUDA only, and soat-miner.bat would send a
-  50-series card to the Vulkan binary, which has no pearl-pow in it. So Pearl
-  needs an NVIDIA card and soat-miner.exe present.
+  These go through soat-miner.bat like every other script. They used to call
+  soat-miner.exe directly, which was right while Pearl was CUDA-only and became
+  wrong the day it got a Vulkan backend - an AMD user was told the binary was
+  missing rather than being sent to the one that has it.
+
+  On NVIDIA the launcher still picks CUDA for Pearl: its shape and tile tuner
+  has no Vulkan equivalent yet. On AMD it picks Vulkan, which is the only
+  backend there. The Vulkan path is new - the miner checks the whole chain
+  against its own reference at startup and refuses to mine if a card computes
+  it wrongly, and the end-to-end run has so far been confirmed on NVIDIA.
 
   There is one launcher per pool. Each file's header carries that pool's fee,
   payout scheme, alternate regions and ports, and the share difficulty it

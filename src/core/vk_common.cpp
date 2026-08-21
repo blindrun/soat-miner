@@ -87,7 +87,9 @@ bool vkPickPhysicalDevice(VkInstance inst, int requestedIndex,
 void vkListDevices() {
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.apiVersion = VK_API_VERSION_1_2;
+    // 1.3, not 1.2: the cooperative-matrix query below needs it, and this
+    // listing is the only place a user can see WHICH device has it.
+    app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
@@ -112,14 +114,33 @@ void vkListDevices() {
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
             if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 local = std::max(local, mp.memoryHeaps[h].size);
+        // Report the capability PER DEVICE, because that is exactly what a
+        // whole-machine check gets wrong. Measured on this fleet:
+        //
+        //   RTX 4090   extension YES  feature YES  15 configs,  2 int8
+        //   llvmpipe   extension YES  feature YES   4 configs,  1 int8
+        //   6700 XT    extension no
+        //
+        // So `vulkaninfo | grep cooperative` finds llvmpipe's support at every
+        // level INCLUDING an int8 configuration, on a box whose actual GPU has
+        // none. What llvmpipe does not have is the M16 N16 sint8 x sint8 ->
+        // sint32 shape Pearl's GEMM is written against, which is what
+        // vkInt8CooperativeMatrix() requires - hence the label naming the
+        // shape rather than claiming the device has no int8 coopmat at all.
+        uint32_t k = 0;
+        const bool coop = vkInt8CooperativeMatrix(inst, d, &k);
+        char cm[56];
+        if (coop) snprintf(cm, sizeof(cm), "int8 coopmat M16N16K%u", k);
+        else snprintf(cm, sizeof(cm), "no M16N16 int8 coopmat");
+
         if (gpu) {
-            printf("  [%d] %-38s %5.1f GB  max buffer %4.1f GB  (%s)\n", idx++,
-                   p.deviceName, local / 1e9,
+            printf("  [%d] %-38s %5.1f GB  max buffer %4.1f GB  (%s, %s)\n",
+                   idx++, p.deviceName, local / 1e9,
                    p.limits.maxStorageBufferRange / 1e9,
-                   driverTypeName(p.deviceType));
+                   driverTypeName(p.deviceType), cm);
         } else {
-            printf("   -  %-38s %5.1f GB  (skipped: %s)\n", p.deviceName,
-                   local / 1e9, driverTypeName(p.deviceType));
+            printf("   -  %-38s %5.1f GB  (skipped: %s, %s)\n", p.deviceName,
+                   local / 1e9, driverTypeName(p.deviceType), cm);
         }
     }
     if (idx == 0) printf("no usable Vulkan GPU found\n");

@@ -39,14 +39,26 @@ echo auto: BC3 on NVIDIA - CUDA, it beats Vulkan here
 set BACKEND=cuda
 goto :backend_done
 :not_bc3
-REM Pearl is CUDA only. Without this an ALGO set in config.txt falls through
-REM to the Blackwell rule below and picks the Vulkan binary, which does not
-REM have it. Bitcoin III used to be on this list and is not any more: it has
-REM its own Vulkan shader now and runs on AMD.
+REM Pearl on NVIDIA prefers CUDA, and this is no longer a CUDA-ONLY rule.
+REM
+REM Pearl has a Vulkan backend now - ten shaders, each byte-identical to the
+REM CUDA reference on an Ada and an RDNA3 card - so an AMD user is no longer
+REM told the algorithm does not exist for them. Bitcoin III made exactly this
+REM transition earlier for the same reason.
+REM
+REM CUDA still wins on NVIDIA, and not from a measurement: there is no Vulkan
+REM Pearl throughput number yet. It is what the two paths ARE - the CUDA one
+REM tunes shape and tile configuration per card at startup, the Vulkan one has
+REM one fixed shape and an untuned GEMM. Revisit with a number, not a guess.
+REM Note the nvidia-smi test: without it this sends an AMD card to a CUDA
+REM binary it does not have, which is the bug this whole block exists to stop.
 set "WANT_PEARL="
 if /i "%ALGO%"=="pearl-pow" set "WANT_PEARL=1"
 echo %* | findstr /I /C:"pearl-pow" >nul && set "WANT_PEARL=1"
 if not defined WANT_PEARL goto :not_pearl
+if not exist "soat-miner.exe" goto :not_pearl
+where nvidia-smi >nul 2>&1 || goto :not_pearl
+echo auto: Pearl on NVIDIA - CUDA, its shape tuner has no Vulkan equivalent
 set BACKEND=cuda
 goto :backend_done
 :not_pearl

@@ -42,6 +42,7 @@
 
 #include "../src/algos/pearl-pow/job.h"
 #include "vk_claim_guard.h"
+#include "vk_spv.h"
 
 #define VKCHECK(x)                                                        \
     do {                                                                  \
@@ -120,10 +121,7 @@ int main(int argc, char **argv) {
     const int wantDevice = argc > 2 ? atoi(argv[2]) : 0;
 
     std::vector<uint8_t> spv;
-    if (!readFile(argv[1], &spv)) {
-        fprintf(stderr, "cannot open %s\n", argv[1]);
-        return 2;
-    }
+    if (!om::loadSpirv(argv[1], &spv)) return 2;
 
     // ---- the problem, built on the host first ----
     const uint32_t kCount = 4096;

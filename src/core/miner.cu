@@ -160,6 +160,26 @@ int main(int argc, char **argv) {
                 "                    so the cost of a new block is measured\n");
             return 0;
         }
+        else {
+            // AN UNKNOWN ARGUMENT IS AN ERROR, NOT A SHRUG.
+            //
+            // This loop used to fall off the end and ignore anything it did
+            // not recognise. A typo, a renamed flag, or a probe like
+            // `--version` (which this miner does not have) therefore did not
+            // fail - it started mining, on whatever GPU was there, with
+            // whatever defaults the rest of the line implied. That is how a
+            // one-line check turned into an unclaimed run on a card another
+            // lane could have been measuring on.
+            //
+            // The same mistake is already documented ten lines above for
+            // --algo, where swallowing an unknown algorithm silently mined
+            // Ergo instead of Pearl. Fixing it there and not here left the
+            // hole open for every other flag.
+            fprintf(stderr,
+                    "unknown option '%s'. Run with --help for the list.\n",
+                    a.c_str());
+            return 1;
+        }
     }
 
     // The Lithos reference client listens on 127.0.0.1:4444 by default.

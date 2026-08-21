@@ -152,7 +152,7 @@ VK_OBJS  = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(BUILD)/lin/gen/%.o,$(VK_SRC_GEN))
 
 .PHONY: all cuda vulkan clean test test-pearl test-telemetry test-pearl-pool \
-        test-pearl-cli test-pearl-e2e test-claim-guard test-ergo-pools test-btc-stratum test-bc3-destination \
+        test-pearl-cli test-pearl-e2e test-pearl-parity test-claim-guard test-ergo-pools test-btc-stratum test-bc3-destination \
         test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan \
         bench install dirs package
 
@@ -306,6 +306,8 @@ test-pearl: tests/test_pearl tests/test_pearl_job tests/test_pearl_prepare \
 	@./tests/test_pearl_apply_noise_vk $(BUILD)/apply_noise.spv
 	@echo "--- pearl: the Vulkan PoW scan, against the CUDA hit list ---"
 	@./tests/test_pearl_powscan_vk $(BUILD)/powscan.spv
+	@echo "--- pearl: the coopmat-free GEMM, against the same CUDA vectors ---"
+	@./tests/test_pearl_dp_vk $(PEARL_VEC) $(BUILD)/kernel_dp.spv
 
 # The only test that runs the miner against a server. Everything else about
 # Pearl is a vector check or a device gate, and neither opens a socket - which
@@ -495,7 +497,7 @@ clean:
 	       tests/test_sha3_algo tests/test_sha3_vulkan
 
 # --- release packaging (lolMiner-style flat archive) -----------------------
-VERSION ?= 0.2.18
+VERSION ?= 0.2.17
 PKGNAME  = soat-miner_v$(VERSION)_Lin64
 package: cuda vulkan
 	@rm -rf $(BUILD)/$(PKGNAME) && mkdir -p $(BUILD)/$(PKGNAME)

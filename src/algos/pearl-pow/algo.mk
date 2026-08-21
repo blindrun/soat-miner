@@ -42,7 +42,8 @@ PEARL_SHADERS = \
     commitments:commitments:commitments:kPearlCommitmentsSpirv \
     noise:noise:noise:kPearlNoiseSpirv \
     applynoise:apply_noise:apply_noise:kPearlApplyNoiseSpirv \
-    powscan:powscan:powscan:kPearlPowScanSpirv
+    powscan:powscan:powscan:kPearlPowScanSpirv \
+    dp:kernel_dp:kernel_dp:kPearlDpSpirv
 
 pearl_field = $(word $(1),$(subst :, ,$(2)))
 
@@ -85,7 +86,19 @@ $(foreach s,$(PEARL_SHADERS),$(eval $(call PEARL_SHADER_RULE,$(s))))
 PEARL_VK_GATES = tests/test_pearl_vk tests/test_pearl_merkle_vk \
                  tests/test_pearl_genmatrix_vk tests/test_pearl_transpose_vk \
                  tests/test_pearl_commitments_vk tests/test_pearl_noise_vk \
-                 tests/test_pearl_apply_noise_vk tests/test_pearl_powscan_vk
+                 tests/test_pearl_apply_noise_vk tests/test_pearl_powscan_vk \
+                 tests/test_pearl_dp_vk
+
+# The dot-product GEMM's own gate. It cannot reuse test_pearl_vk: that one
+# calls vkInt8CooperativeMatrix and RETURNS 0 with "skipping device test" when
+# it is absent, so on an RDNA2 card it would skip and report success - an
+# all-clear from a scan that never ran.
+# Takes <vectors.bin> <kernel_dp.spv> [device] - three arguments, not two.
+# Checked against its usage line rather than inferred from a neighbouring gate,
+# which is how the powscan gate got wired up wrong earlier in this branch.
+tests/test_pearl_dp_vk: tests/test_pearl_dp_vk.cpp $(PEARL_DIR)/job.h \
+                        $(BUILD)/kernel_dp.spv
+	$(CXX) $(CXXFLAGS) -Itests $< -lvulkan -o $@
 
 tests/test_pearl_noise_vk: tests/test_pearl_noise_vk.cpp \
                            $(PEARL_DIR)/job.h $(BUILD)/noise.spv
@@ -102,3 +115,29 @@ tests/test_pearl_apply_noise_vk: tests/test_pearl_apply_noise_vk.cpp \
 tests/test_pearl_powscan_vk: tests/test_pearl_powscan_vk.cpp \
                              $(PEARL_DIR)/job.h $(BUILD)/powscan.spv
 	$(CXX) $(CXXFLAGS) $< -lvulkan -o $@
+
+# CUDA and Vulkan in ONE binary, so the two backends can be compared directly
+# rather than through two processes and two log files. It needs nvcc for
+# algo.cu, a host compiler for algo_vk.cpp, every embedded Pearl shader, and
+# libvulkan - which is why it lives here beside the shader list rather than as
+# another hand-maintained set of objects in the Makefile.
+# The Vulkan side is linked as OBJECTS, not sources. nvcc's -x c++ is not
+# reliably positional the way gcc's is, so handing it algo.cu and algo_vk.cpp
+# in one command compiled noisy_gemm.cuh as C++ and every __device__ became a
+# syntax error. The host compiler builds the Vulkan half through the same rules
+# the miner uses; nvcc only links it.
+PEARL_PARITY_OBJS = $(call vkobj,$(PEARL_DIR)/algo_vk.cpp) \
+                    $(call vkobj,src/core/vk_common.cpp) \
+                    $(foreach s,$(PEARL_SHADERS),\
+                      $(call vkgen,spirv_pearl_$(call pearl_field,1,$(s))))
+
+tests/test_pearl_backend_parity: tests/test_pearl_backend_parity.cu \
+                                 $(PEARL_DIR)/algo.cu $(PEARL_DIR)/job.h \
+                                 $(PEARL_PARITY_OBJS)
+	$(NVCC) $(NVFLAGS) -Isrc $< $(PEARL_DIR)/algo.cu \
+	    $(PEARL_PARITY_OBJS) -lvulkan -o $@
+
+.PHONY: test-pearl-parity
+test-pearl-parity: tests/test_pearl_backend_parity
+	@echo "--- pearl: CUDA and Vulkan proofs, byte for byte ---"
+	@./tests/test_pearl_backend_parity

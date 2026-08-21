@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "vk_claim_guard.h"
+#include "vk_spv.h"
 
 #include "../src/algos/pearl-pow/job.h"
 
@@ -59,14 +60,7 @@ int main(int argc, char **argv) {
     const int wantDev = argc > 2 ? atoi(argv[2]) : 0;
 
     std::vector<uint32_t> spv;
-    {
-        FILE *f = fopen(spvPath, "rb");
-        if (!f) { fprintf(stderr, "cannot open %s\n", spvPath); return 2; }
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        spv.resize((sz + 3) / 4);
-        if (fread(spv.data(), 1, sz, f) != (size_t)sz) { fclose(f); return 2; }
-        fclose(f);
-    }
+    if (!om::loadSpirvWords(spvPath, &spv)) return 2;
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.apiVersion = VK_API_VERSION_1_3;

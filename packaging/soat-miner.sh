@@ -32,25 +32,30 @@ done
 # Blackwell therefore wants Vulkan even though it is an NVIDIA card.
 BACKEND="${BACKEND:-auto}"
 
-# Pearl is CUDA only. Without this the Blackwell rule below sends it to the
-# Vulkan binary, which does not have it, and the run fails as a bad ERGO
-# address - which is a baffling thing to be told when you asked for Pearl.
-# Non-NVIDIA hits the same path, so this is not only a Blackwell problem.
-# Kept as a list rather than a hardcoded test: a hardcoded pearl-pow check is
-# what let BC3 inherit this bug when it was added.
-# Checks config.txt's ALGO too, not only the command line. Setting an ALGO
-# there and running this with no arguments used to fall through to the
-# Blackwell rule and pick a binary that could not mine it.
+# Nothing is CUDA-only any more, and this list is kept empty rather than
+# deleted because it is load-bearing the moment a new algorithm ships on one
+# backend first.
 #
-# BC3 (sha3-256t) is NOT on this list any more: it has a Vulkan backend and a
-# .comp shader of its own, verified against the host reference on an RX 7900 XT
-# as well as on NVIDIA. Leaving it here was the thing that made BC3 CUDA-only
-# in practice no matter what the binary supported - an AMD user was told the
-# algorithm did not exist for them.
+# The rule it exists for: without it the Blackwell rule below sends a
+# CUDA-only algorithm to the Vulkan binary, which does not have it, and the run
+# fails as a bad ERGO address - a baffling thing to be told when you asked for
+# something else. Non-NVIDIA hits the same path, so it was never only a
+# Blackwell problem. It is a list rather than a hardcoded test because a
+# hardcoded pearl-pow check is what let BC3 inherit this bug when it was added.
+# It checks config.txt's ALGO too, not only the command line.
+#
+# BC3 (sha3-256t) came off this list when it got a Vulkan backend. PEARL CAME
+# OFF IT TODAY for the same reason: ten shaders, each byte-identical to the
+# CUDA reference on an Ada and an RDNA3 card, a chain self-check that runs
+# before any share is possible, and a mock gateway that accepted a real proof.
+# Leaving an algorithm here after it works elsewhere is what made BC3
+# CUDA-only in practice no matter what the binary supported - an AMD user was
+# told the algorithm did not exist for them.
 CUDA_ONLY_ALGO=""
 for a in "$@" "${ALGO:-}"; do
   case "$a" in
-    pearl-pow) CUDA_ONLY_ALGO="Pearl" ;;
+    # (none)
+    "") ;;
   esac
 done
 if [[ -n "$CUDA_ONLY_ALGO" ]]; then
@@ -70,16 +75,32 @@ fi
 # carry: BC3 is faster on CUDA on NVIDIA (4090: CUDA 1543 MH/s, Vulkan 1086).
 # BC3 got this wrong the moment it stopped being CUDA-only and fell through to
 # the Autolykos rule, and an NVIDIA card quietly picked the slower backend.
+# The REASON is per algorithm too, not just the choice. "It beats Vulkan here"
+# is a measurement and it is true for BC3 (4090: CUDA 1543 MH/s, Vulkan 1086).
+# It is NOT measured for Pearl, and printing it there would state a number
+# nobody has taken.
 PREFERS_CUDA_ON_NVIDIA=""
+PREFERS_CUDA_WHY=""
 for a in "$@" "${ALGO:-}"; do
   case "$a" in
-    sha3-256t) PREFERS_CUDA_ON_NVIDIA="BC3" ;;
+    sha3-256t)
+      PREFERS_CUDA_ON_NVIDIA="BC3"
+      PREFERS_CUDA_WHY="it beats Vulkan here" ;;
+    # Pearl on NVIDIA stays on CUDA. Not from a measurement - there is no
+    # Vulkan Pearl throughput number yet - but from what the two paths are:
+    # the CUDA one tunes its shape and tile configuration per card at startup
+    # and the Vulkan one has a single fixed shape and an untuned GEMM. On AMD
+    # the question does not arise, since Vulkan is the only backend there.
+    # Revisit this line with a number, not an assumption.
+    pearl-pow)
+      PREFERS_CUDA_ON_NVIDIA="Pearl"
+      PREFERS_CUDA_WHY="its shape tuner has no Vulkan equivalent yet" ;;
   esac
 done
 if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" && -x ./soat-miner ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     BACKEND=cuda
-    echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, it beats Vulkan here"
+    echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, $PREFERS_CUDA_WHY"
   fi
 fi
 

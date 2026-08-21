@@ -1055,7 +1055,22 @@ class PearlPow : public Algorithm {
         // Only the first win is submitted. A second tile from the same attempt
         // is a second solution to the SAME block, so it can never be accepted
         // once the first is, and building its proof would be wasted work.
-        const uint32_t flat = index[0];
+        // WHICH win, when an attempt has several: the LOWEST tile index, not
+        // the first one the scan happened to record.
+        //
+        // powScan appends hits through an atomic counter, so the order is
+        // whatever the hardware produced - it differs between two runs on one
+        // card and between CUDA and Vulkan on the same job and nonce. Any of
+        // them is a valid solution to the same block, so nothing was wrong;
+        // but it made the miner's output nondeterministic, which means two
+        // runs of one job cannot be diffed and the two backends cannot be
+        // compared at all. Taking the minimum costs a scan of at most 64
+        // entries, once per win, and makes the share a function of the job and
+        // the nonce.
+        uint32_t sel = 0;
+        for (uint32_t i = 1; i < hits; i++)
+            if (index[i] < index[sel]) sel = i;
+        const uint32_t flat = index[sel];
         const uint32_t tilesPerSide = kRank / kTileSide;
         const uint32_t blocksPerRow = shape_.n / kRank;
         const uint32_t wi = flat % tilesPerSide;
@@ -1195,8 +1210,14 @@ class PearlPow : public Algorithm {
 
         Solution sol;
         sol.nonce = nonce;
+        // The digest of the tile we SELECTED, not of hit 0. These were the
+        // same expression while the selection was always hit 0, and taking the
+        // lowest index without moving this made the miner report one tile's
+        // digest for another tile's proof. verify() caught it immediately,
+        // which is exactly what it is for.
         for (int i = 0; i < 4; i++)
-            sol.hit[i] = (uint64_t)digest[i * 2] | ((uint64_t)digest[i * 2 + 1] << 32);
+            sol.hit[i] = (uint64_t)digest[sel * 8 + i * 2] |
+                         ((uint64_t)digest[sel * 8 + i * 2 + 1] << 32);
         sol.extra = base64(encodePlainProof(shape_.m, shape_.n, kK, kRank, aProof,
                                             tRow, kTileSide, btProof, tCol,
                                             kTileSide));

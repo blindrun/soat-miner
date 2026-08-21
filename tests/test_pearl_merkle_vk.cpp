@@ -57,6 +57,8 @@
 #include <vector>
 
 #include "../src/algos/pearl-pow/job.h"
+#include "vk_claim_guard.h"
+#include "vk_spv.h"
 
 #define VKCHECK(x)                                                        \
     do {                                                                  \
@@ -175,10 +177,7 @@ int main(int argc, char **argv) {
     // ---- spirv ----
     std::vector<uint8_t> spvBytes[3];
     for (int i = 0; i < 3; i++)
-        if (!readFile(spvPaths[i], &spvBytes[i])) {
-            fprintf(stderr, "cannot open %s\n", spvPaths[i]);
-            return 2;
-        }
+        if (!om::loadSpirv(spvPaths[i], &spvBytes[i])) return 2;
 
     // ---- instance and device ----
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -201,6 +200,9 @@ int main(int argc, char **argv) {
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(pd, &props);
+    // This gate had no claim guard at all: it ran a full blake3 tree over
+    // 32768 chunks on whatever card it found, claimed or not.
+    om::requireGpuClaim(props.deviceName);
     VkPhysicalDeviceSubgroupProperties sgp{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};

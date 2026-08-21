@@ -124,6 +124,16 @@ def pick_binary(argv):
 
 
 def run_case(binary, mock, transcript, extra_args=()):
+    # DELETE THE TRANSCRIPT FIRST, AND REQUIRE A NEW ONE.
+    #
+    # Without this a run reads whatever the last one left at the same path.
+    # That is not hypothetical: a Vulkan binary that silently ignored
+    # --pearl-transcript produced no file, the reader found the previous CUDA
+    # run's, and every transcript assertion passed while testing a backend that
+    # had not written a byte. A test passing against stale state is the same
+    # failure as a mutation test passing against a stale binary.
+    if os.path.exists(transcript):
+        os.remove(transcript)
     t = threading.Thread(target=mock.serve, daemon=True)
     t.start()
     time.sleep(0.3)
@@ -161,6 +171,9 @@ def run_case(binary, mock, transcript, extra_args=()):
     d.join(timeout=5)
 
     events = []
+    if not os.path.exists(transcript):
+        fail("the miner wrote no transcript at %s - does this binary support "
+             "--pearl-transcript?" % transcript)
     if os.path.exists(transcript):
         for ln in open(transcript):
             ln = ln.strip()
@@ -241,6 +254,10 @@ def phase_accept(binary, tmp):
     else:
         ok("proof decodes to m=%s n=%s k=%s rank=%s"
            % (s.get("m"), s.get("n"), s.get("k"), s.get("rank")))
+        # The shape identifies which backend really ran: the CUDA path tunes
+        # across several and the Vulkan one is fixed. A run that looked like it
+        # exercised Vulkan but reported CUDA's shape is what made this line
+        # worth printing rather than only checking.
 
     # The proof was mined against the job it names.
     hb = {n.get("job_id"): n.get("header_b3") for n in nots}
@@ -383,6 +400,14 @@ def main():
         print("\nSKIP: no built binary reports pearl-pow in --list-algos")
         return 1 if FAILURES else 0
     print("\nbinary: %s" % binary)
+    # SAY WHICH BACKEND RAN. A phase-1 line reading n=65536 when the Vulkan
+    # shape is 16384 was the only clue that a run had not exercised what it
+    # looked like it had, and it took a second run to settle. The banner is
+    # cheap and removes the ambiguity.
+    algos = subprocess.run([binary, "--list-algos"], capture_output=True,
+                           text=True, timeout=60).stdout.split()
+    print("backend:  %s  (algos: %s)"
+          % (os.path.basename(binary), " ".join(algos)))
 
     phase_accept(binary, tmp)
     phase_reject(binary, tmp)

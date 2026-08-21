@@ -1,24 +1,19 @@
-// Pearl NoisyGEMM on Vulkan, against the same reference vectors as the CUDA
-// test. Every backend must produce byte-identical transcripts.
+// Pearl's NoisyGEMM on a device with NO cooperative matrix - the RDNA2 gate.
 //
-// This carries its own Vulkan setup rather than reusing algo_vk.cpp's, which
-// keeps its boilerplate private. It is deliberately minimal: one queue, one
-// pipeline, host-visible buffers, no staging. Correctness first.
+// The twin of test_pearl_vk.cpp for kernel_dp.comp. Same vectors, same
+// assertions, same bar: byte-identical product AND transcripts against the CUDA
+// reference. The only differences are which capability it demands and which
+// specialisation constants it passes, because a separate gate is needed - the
+// coopmat gate SKIPS on a device without cooperative matrix
+// (test_pearl_vk.cpp:143 returns 0 with "skipping device test"), so pointing it
+// at this shader on an RX 6700 XT would report success having run nothing.
 //
-// usage: test_pearl_vk <vectors.bin> <shader.spv> [device_index]
+// usage: test_pearl_dp_vk <vectors.bin> <kernel_dp.spv> [device_index]
 //
-// NOT WIRED INTO `make test`, AND CANNOT BE UNTIL THERE IS A SHADER. There is
-// no Vulkan Pearl kernel yet, so there is no .spv to hand it. It compiles and
-// it is kept deliberately: the day someone writes the shader, the gate that
-// proves it byte-identical to CUDA already exists. Build it on its own with
-// `make tests/test_pearl_vk`.
-//
-// Feasibility for that shader was measured 2026-08-18 on an RX 6700 XT and is
-// written up in ~/RESUME-pearl-pow-miner.md: RDNA2 has no matrix cores, so the
-// path is dotPacked4x8AccSatEXT (hardware V_DOT4_I32_I8), and a tuned probe
-// reached 3.06 T MAC/s against WildRig's 8.1. Every AMD card loses money on
-// Pearl at 11.4 c/kWh even at the field's best rate, so this is a
-// parity feature and never an economic one.
+// Requires shaderIntegerDotProduct, which is core in Vulkan 1.3 but still an
+// opt-in feature. It does NOT require the *accelerated* bit: an implementation
+// that emulates the dot product still has to produce the same integers, and a
+// gate that skipped on unaccelerated hardware would be checking the wrong thing.
 
 #include <vulkan/vulkan.h>
 
@@ -139,17 +134,31 @@ int main(int argc, char **argv) {
     // then vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT, turning a
     // clean skip into a hard failure. vk_common owns that check now, so the
     // miner and the tests cannot drift on it.
-    uint32_t kSize = 0;
-    const int kDim = om::vkInt8CooperativeMatrix(inst, pd, &kSize) ? (int)kSize : 0;
-    if (!kDim) {
-        // Not a failure. A box without int8 cooperative matrix must not take
-        // the rest of the suite down with it.
-        printf("pearl-pow: no M16 N16 int8 coopmat on %s, skipping device test\n",
+    // No coopmat query at all - this shader exists precisely for devices that
+    // have none. What it needs instead is the integer dot product.
+    VkPhysicalDeviceShaderIntegerDotProductFeatures dotF{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+    VkPhysicalDeviceFeatures2 probe{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    probe.pNext = &dotF;
+    vkGetPhysicalDeviceFeatures2(pd, &probe);
+    if (!dotF.shaderIntegerDotProduct) {
+        printf("pearl-dp: %s has no shaderIntegerDotProduct, skipping device test\n",
                props.deviceName);
         vkDestroyInstance(inst, nullptr);
         return 0;
     }
-    printf("device: %s  (int8 coopmat M16 N16 K%d)\n", props.deviceName, kDim);
+
+    // Whether it is HARDWARE accelerated is reported separately and is a
+    // performance fact, not a correctness one. Printed, never gated on.
+    VkPhysicalDeviceShaderIntegerDotProductProperties dotP{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
+    VkPhysicalDeviceProperties2 dp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    dp2.pNext = &dotP;
+    vkGetPhysicalDeviceProperties2(pd, &dp2);
+
+    om::requireGpuClaim(props.deviceName);
+    printf("device: %s  (int8 dot4 accelerated: %s)\n", props.deviceName,
+           dotP.integerDotProduct4x8BitPackedSignedAccelerated ? "yes" : "no - emulated");
 
     VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -177,10 +186,10 @@ int main(int argc, char **argv) {
     // the same optional features, and vkCreateDevice fails the whole call with
     // VK_ERROR_FEATURE_NOT_PRESENT if any single requested feature is absent -
     // with no indication of which one.
-    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopF{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures dotEnable{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    v12.pNext = &coopF;
+    v12.pNext = &dotEnable;
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.pNext = &v12;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -192,7 +201,7 @@ int main(int argc, char **argv) {
         VkBool32 *flag;
         bool essential;
     } needs[] = {
-        {"cooperativeMatrix", &coopF.cooperativeMatrix, true},
+        {"shaderIntegerDotProduct", &dotEnable.shaderIntegerDotProduct, true},
         {"shaderInt8", &v12.shaderInt8, true},
         {"storageBuffer8BitAccess", &v12.storageBuffer8BitAccess, true},
         {"vulkanMemoryModel", &v12.vulkanMemoryModel, true},
@@ -220,11 +229,12 @@ int main(int argc, char **argv) {
     // base features to avoid asking for anything incidental.
     memset(&f2.features, 0, sizeof(f2.features));
 
-    const char *devExt[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+    // No device extension: shaderIntegerDotProduct is core in Vulkan 1.3 and
+    // the app already requests apiVersion 1.3. Only the feature is opt-in.
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = devExt;
+    dci.enabledExtensionCount = 0; dci.ppEnabledExtensionNames = nullptr;
     VkDevice dev;
     VKCHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
     VkQueue queue;
@@ -304,9 +314,17 @@ int main(int argc, char **argv) {
     VkShaderModule sm;
     VKCHECK(vkCreateShaderModule(dev, &smci, nullptr, &sm));
 
-    struct Spec { int32_t subgroup; int32_t k; } spec{(int32_t)subgroupSize, kDim};
+    // spec 0 = subgroup size (== local_size_x), spec 1 = MAX_RANK.
+    // MAX_RANK exists because shared memory cannot be sized at dispatch time and
+    // rank arrives in a push constant. It must be >= the largest rank used.
+    const int32_t kMaxRank = 128;
+    if (rank > kMaxRank) {
+        fprintf(stderr, "rank %d exceeds the shader's MAX_RANK %d\n", rank, kMaxRank);
+        return 2;
+    }
+    struct Spec { int32_t subgroup; int32_t maxRank; } spec{(int32_t)subgroupSize, kMaxRank};
     VkSpecializationMapEntry sme[2] = {{0, offsetof(Spec, subgroup), sizeof(int32_t)},
-                                       {1, offsetof(Spec, k), sizeof(int32_t)}};
+                                       {1, offsetof(Spec, maxRank), sizeof(int32_t)}};
     VkSpecializationInfo si{2, sme, sizeof(spec), &spec};
 
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 5};

@@ -10,19 +10,13 @@ Get one from Nautilus or the Ergo desktop wallet.
 You will also need a GPU with 8GB or more.
 The dataset is 7.27GB right now and it grows every few days.
 
-![The SOAT Miner window, mining Bitcoin III on an RTX 5080](docs/soat-miner-gui.png)
-
-There is a window now, for Linux and Windows, and it carries the miner inside it.
-Pick a coin, pick a pool, paste your address, click Mine. The terminal miner is
-unchanged if you prefer it.
-
 ## Get it
 
 Download the release for your os.
 
 https://github.com/blindrun/soat-miner/releases
 
-Unpack it on Linux with command tar xzf soat-miner_v0.2.18_Lin64.tar.gz
+Unpack it on Linux with command tar xzf soat-miner_v0.2.17_Lin64.tar.gz
 
 On Windows just unzip it.
 
@@ -388,7 +382,16 @@ one your GPU solved and every share dies as "low difficulty".
 
 ## Pearl (testing)
 
-Mines Pearl on NVIDIA. CUDA only. There is no Vulkan backend for it yet.
+Mines Pearl on NVIDIA via CUDA and on AMD via Vulkan.
+
+The Vulkan backend is new. Every one of its ten shader stages is byte-identical
+to the CUDA reference on an RTX 4090 and an RX 7900 XT, and the miner runs the
+whole chain against the host implementation at startup and refuses to mine if
+anything differs - so a card that computes it wrongly stops with a message
+rather than having every share rejected. **The end-to-end mine-and-submit has
+so far been confirmed on NVIDIA only; the AMD run is pending.** On NVIDIA the
+launcher still picks CUDA, whose shape and tile tuner has no Vulkan
+equivalent.
 
 **Pearl7 is withdrawn after a pool rejected a controlled share. Do not use a
 normal Pearl launcher until Control approves a corrected release.**

@@ -14,15 +14,25 @@
 // SOAT_VK_NO_CLAIM_GUARD=1 opts out, for a machine that has no gpulock - not
 // for a hurry.
 //
-// CLAIM AND RUN IN THE SAME SHELL. gpulock records the claiming process's pid
-// and treats a claim whose process is gone as stale - anyone may reap it - so
-// this guard refuses on one too. A claim made in one shell and used from a
-// later one is not protecting the card, and the refusal says so by name rather
-// than letting the run proceed under a claim any lane may take.
+// STALENESS IS DECIDED BY THE CLOCK, NOT BY A PID, and this file got that
+// wrong once already.
+//
+// The meta file carries a `pid=`, and checking it looks obviously right. It is
+// not, and gpulock's own source says why: `pid` is the shell that invoked
+// `gpulock claim`, which for a one-shot claim exits immediately. Treating a
+// dead pid as stale therefore marks EVERY claim stale the moment it is made -
+// "a liveness check worse than none", in its words. gpulock removed that check
+// deliberately; this guard reintroduced it, refused claims that were genuinely
+// held, and sent another lane off to change its whole claim workflow around a
+// bug of mine. Do not add it back.
+//
+// A claim is stale on gpulock's definition: past `until` plus its own window
+// again, minimum ten minutes. Match that rule here rather than inventing a
+// second one, because a guard that disagrees with the tool it guards is worse
+// than either.
 
 #pragma once
 
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,24 +167,29 @@ inline void requireGpuClaim(const char *deviceName) {
         refuse(std::string(key) + " is held by \"" + holder + "\", not \"" +
                who + "\".");
 
-    // A claim whose process is gone is stale: gpulock lets anyone reap it, so
-    // it is not ours to rely on even if the name still matches.
-    std::string pidStr;
-    if (gpulockMetaField(meta, "pid", &pidStr)) {
-        const long pid = atol(pidStr.c_str());
-        if (pid > 0 && kill((pid_t)pid, 0) != 0)
-            refuse(std::string(key) + " is claimed by \"" + holder +
-                   "\" but that process (pid " + pidStr +
-                   ") is gone, so the claim is stale and anyone may take it.");
-    }
-
-    // Expiry is a warning, not a refusal: the claim is still ours and another
-    // lane is supposed to ask before stealing it. Say so, because a long run
-    // that silently outlives its window is how a collision starts.
-    std::string untilStr;
+    // Stale on gpulock's own rule, so `status` and this guard cannot disagree
+    // about the same lock: past `until` plus the claim's own span again, with
+    // a ten-minute floor. A stale claim is reapable by any lane, so relying on
+    // it is not protection even though the name still matches.
+    //
+    // Deliberately NOT a pid check. See the note at the top of this file.
+    std::string untilStr, sinceStr;
     if (gpulockMetaField(meta, "until", &untilStr)) {
         const long long until = atoll(untilStr.c_str());
-        if (until > 0 && (long long)time(nullptr) > until)
+        long long since = until;
+        if (gpulockMetaField(meta, "since", &sinceStr))
+            since = atoll(sinceStr.c_str());
+        long long span = until - since;
+        if (span < 600) span = 600;
+        const long long now = (long long)time(nullptr);
+        if (until > 0 && now > until + span)
+            refuse(std::string(key) + " is claimed by \"" + holder +
+                   "\" but the claim is stale on gpulock's own rule, so any "
+                   "lane may reap it. Renew or re-claim it.");
+        // Expiry alone is a warning: the claim is still ours and another lane
+        // is supposed to ask before stealing. Say so, because a long run that
+        // silently outlives its window is how a collision starts.
+        if (until > 0 && now > until)
             fprintf(stderr,
                     "[claim-guard] your claim on %s has expired but is still "
                     "yours; renew it with `gpulock renew %s <minutes>`\n",
