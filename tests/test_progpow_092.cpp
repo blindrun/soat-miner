@@ -337,6 +337,42 @@ int main(int argc, char **argv) {
            "kiss99 matches iterations 1-4 and 100000");
     }
 
+    // --- 0b. the Zano labelling, from Zano's OWN miner --------------------
+    // hyle-team/progminer is Zano's official ProgPowZ miner. Its
+    // libprogpow/ProgPow.cpp math() switch maps selectors like this, which is
+    // ground truth for ProgPowZ in a way no ProgPoW vector is:
+    //
+    //   case 0 clz     case 1 popcount   case 2 add    case 3 mul
+    //   case 4 mul_hi  case 5 min        case 6 rotl   case 7 rotr
+    //   case 8 and     case 9 or         case 10 xor
+    //
+    // 0.9.4 puts add at case 0, so zano = (094 + 2) % 11 and evaluating a Zano
+    // selector s means taking 0.9.4 case (s + 9) % 11 - exactly what kMath092
+    // does. It is right for the coin it exists for.
+    {
+        const uint32_t a = 0x8626BB1Fu, b = 0xBBDFBC4Eu;
+        auto clzc = [](uint32_t v){ int n=0; while(n<32 && !(v&0x80000000u)){v<<=1;n++;} return (uint32_t)n; };
+        auto popc = [](uint32_t v){ uint32_t n=0; while(v){n+=v&1u;v>>=1;} return n; };
+        const uint32_t want[11] = {
+            clzc(a) + clzc(b),                       // 0
+            popc(a) + popc(b),                       // 1
+            a + b,                                   // 2
+            a * b,                                   // 3
+            (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32),  // 4
+            a < b ? a : b,                           // 5
+            rotl32(a, b % 32u),                      // 6
+            rotr32(a, b % 32u),                      // 7
+            a & b,                                   // 8
+            a | b,                                   // 9
+            a ^ b,                                   // 10
+        };
+        size_t ok = 0;
+        for (uint32_t sel = 0; sel < 11; sel++)
+            if (randomMath(a, b, sel, kMath092) == want[sel]) ok++;
+        ck(ok == 11,
+           "kMath092 reproduces Zano's own math() switch for all 11 selectors");
+    }
+
     // --- 1. keccak_f800, the document's own test case 1 -------------------
     {
         const uint32_t hdr[8] = {0xCCDDEEFFu,0x8899AABBu,0x44556677u,0x00112233u,
@@ -393,8 +429,11 @@ int main(int argc, char **argv) {
         printf("        math table: kMath094 %zu/%zu, kMath092 %zu/%zu\n",
                ok94, n, ok92, n);
         ck(ok94 == n, "0.9.2's math table uses the SAME labelling as 0.9.4");
+        // NOT "kMath092 is wrong". VeriBlock's ProgPoW 0.9.2 and Zano's
+        // ProgPowZ are both "0.9.2" and they DISAGREE here; the next check
+        // pins kMath092 against Zano's own miner, where it is correct.
         ck(ok92 == 0,
-           "the rotated kMath092 labelling matches none of it - it is unsupported");
+           "VeriBlock's 0.9.2 uses the UNROTATED labelling, so kMath092 misses it");
     }
 
     // --- 4. program seeding for period 600 --------------------------------
