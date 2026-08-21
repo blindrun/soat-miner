@@ -54,7 +54,19 @@ class JobSource {
      * The defaults are empty, so a source that has nothing to say says nothing
      * and needs no code at all.
      */
-    virtual std::string takeSubmitVerdict() { return std::string(); }
+    /**
+     * The reason the pool REJECTED the last share, or empty. Rejection-only:
+     * the run loop prints whatever comes back as a rejection, so anything put
+     * here is a rejection by definition.
+     *
+     * It used to be called takeSubmitVerdict(), and "verdict" reads as though
+     * it carries either outcome. The KawPow client duly put "share accepted"
+     * in it, and the miner reported every accepted share as REJECTED - on a
+     * live pool, with the counters simultaneously reading 3 accepted and 0
+     * rejected. Acceptance is already reported by poolCounters(); this channel
+     * carries bad news only.
+     */
+    virtual std::string takeRejectReason() { return std::string(); }
     virtual std::string takeJobWarning() { return std::string(); }
 
     virtual bool poolCounters(uint64_t *accepted, uint64_t *rejected,

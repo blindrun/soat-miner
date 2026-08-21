@@ -697,7 +697,7 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // zero) and then again for KawPow (263 shares, readout said zero). A
         // cast chain is a hand-maintained list of types; the interface is not.
         {
-            const std::string v = source->takeSubmitVerdict();
+            const std::string v = source->takeRejectReason();
             if (!v.empty())
                 logLine(tty, "error", "pool REJECTED the share: " + v);
             const std::string jw = source->takeJobWarning();

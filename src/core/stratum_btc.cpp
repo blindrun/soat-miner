@@ -443,7 +443,7 @@ std::string BitcoinStratumSource::takeJobWarning() {
     return s;
 }
 
-std::string BitcoinStratumSource::takeSubmitVerdict() {
+std::string BitcoinStratumSource::takeRejectReason() {
     std::lock_guard<std::mutex> lk(submitMu_);
     std::string s;
     s.swap(verdict_);

@@ -103,7 +103,7 @@ class BitcoinStratumSource : public JobSource {
     }
 
     std::string takeJobWarning() override;
-    std::string takeSubmitVerdict() override;
+    std::string takeRejectReason() override;
 
    private:
     friend struct BitcoinStratumTestAccess;

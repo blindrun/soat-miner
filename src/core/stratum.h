@@ -114,7 +114,7 @@ class StratumSource : public JobSource {
                       std::string *lastError) const override;
 
     /** Pops the most recent rejection reason, so it is logged exactly once. */
-    std::string takeSubmitVerdict() override;
+    std::string takeRejectReason() override;
 
    private:
     void readerLoop();

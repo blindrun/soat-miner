@@ -278,6 +278,25 @@ int main() {
         delete c;
     }
 
+    // An ACCEPTED share must put nothing in the reject channel. The run loop
+    // prints whatever is there as "pool REJECTED the share", so a success
+    // message in it turns every accepted share into a reported rejection.
+    // That is not hypothetical: it reached a live pool, which accepted three
+    // shares while the miner logged three rejections and the counters read
+    // 3 accepted / 0 rejected at the same time.
+    {
+        auto *c = make();
+        c->feedLineForTest("{\"id\":10,\"result\":true,\"error\":null}");
+        check(c->takeRejectReason().empty(),
+              "an accepted share leaves the reject channel empty");
+        c->feedLineForTest(
+            "{\"id\":11,\"result\":false,\"error\":[21,\"Job not found\",null]}");
+        const std::string r = c->takeRejectReason();
+        check(!r.empty() && r.find("Job not found") != std::string::npos,
+              "a rejected share puts the pool's own reason in it");
+        delete c;
+    }
+
     // A pool is free to put whitespace anywhere JSON allows and to order its
     // keys however it likes. A client that matches the bytes "result":true
     // gets both of these wrong and silently miscounts every share.

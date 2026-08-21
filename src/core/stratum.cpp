@@ -461,7 +461,7 @@ bool StratumSource::poolCounters(uint64_t *accepted, uint64_t *rejected,
     return true;
 }
 
-std::string StratumSource::takeSubmitVerdict() {
+std::string StratumSource::takeRejectReason() {
     std::lock_guard<std::mutex> lk(mu_);
     std::string v;
     v.swap(verdict_);

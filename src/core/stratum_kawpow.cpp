@@ -426,7 +426,10 @@ void KawpowStratumSource::handleLine(const std::string &line) {
                 verdict_ = "share rejected: " + lastSubmitError_;
             } else if (haveResult && result == "true") {
                 accepted_++;
-                verdict_ = "share accepted";
+                // Deliberately NOT a message. This channel is rejection-only
+                // and the run loop prints anything in it as a rejection; the
+                // accepted count is what reports success.
+                verdict_.clear();
             } else {
                 // Neither. This pool answered a submission in a shape this
                 // client cannot read, and there is no safe way to guess.
@@ -531,7 +534,7 @@ std::string KawpowStratumSource::takeJobWarning() {
     return w;
 }
 
-std::string KawpowStratumSource::takeSubmitVerdict() {
+std::string KawpowStratumSource::takeRejectReason() {
     std::lock_guard<std::mutex> lk(submitMu_);
     std::string v;
     v.swap(verdict_);
