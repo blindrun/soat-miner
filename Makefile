@@ -143,7 +143,7 @@ vkgen = $(BUILD)/lin/gen/$(1).o
 VK_OBJS  = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(BUILD)/lin/gen/%.o,$(VK_SRC_GEN))
 
-.PHONY: all cuda vulkan clean test test-device test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-nvrtc test-device test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -248,7 +248,7 @@ PEARL_VEC  = $(BUILD)/pearl_vectors.bin
 PEARL_VEC64 = $(BUILD)/pearl_vectors_r64.bin
 PEARL_JOBVEC = $(BUILD)/pearl_job_vectors.bin
 
-test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-pearl
+test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-pearl test-nvrtc
 	@echo "--- python reference vs real mainnet blocks ---"
 	@python3 tests/reference.py
 	@echo "--- device dataset elements vs python reference ---"
@@ -292,6 +292,41 @@ tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
 tests/test_kawpow_block: tests/test_kawpow_block.cpp src/algos/kawpow/kawpow.h \
                          $(PROGPOW_DEPS)
 	$(CXX) $(CXXFLAGS) $< -o $@
+
+# --- runtime kernel generation (NVRTC) ------------------------------------
+#
+# The header list lives in THIS RULE, so the Makefile itself is a prerequisite:
+# a generated artifact must depend on whatever determines its content, not just
+# on its inputs' timestamps. Adding a header here without that dependency would
+# reuse a stale embed and compile against a header set nobody asked for - the
+# same shape as the mingw import library that was silently reused after its
+# source list changed.
+NVRTC_HDRS = keccak.h=src/algos/progpow/keccak.h \
+             ethash.h=src/algos/progpow/ethash.h \
+             progpow.h=src/algos/progpow/progpow.h \
+             kawpow.h=src/algos/kawpow/kawpow.h \
+             progpow_mine.cuh=src/algos/progpow/mine.cuh \
+             kawpow_mine.cuh=src/algos/kawpow/mine.cuh
+
+$(BUILD)/nvrtc_embed.cpp: scripts/embed_headers.py Makefile \
+                          src/algos/progpow/keccak.h \
+                          src/algos/progpow/ethash.h \
+                          src/algos/progpow/progpow.h \
+                          src/algos/kawpow/kawpow.h \
+                          src/algos/progpow/mine.cuh \
+                          src/algos/kawpow/mine.cuh | dirs
+	@python3 scripts/embed_headers.py $@ $(NVRTC_HDRS)
+
+tests/test_nvrtc: tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
+                  src/algos/kawpow/nvrtc_source.h \
+                  src/algos/kawpow/nvrtc_headers.h $(PROGPOW_DEPS)
+	$(NVCC) -O2 -Isrc tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
+		-lnvrtc -o $@
+
+.PHONY: test-nvrtc
+test-nvrtc: tests/test_nvrtc
+	@echo "--- nvrtc: the runtime-compilation chain, offline ---"
+	@./tests/test_nvrtc
 
 tests/test_kawpow_device: tests/test_kawpow_device.cu \
                           src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
