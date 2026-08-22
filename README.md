@@ -259,8 +259,17 @@ any miner gets today. Compare like with like.
 
 Be honest with yourself about this.
 
-A tuned 4090 nets a few dollars a month at $0.11/kWh. It drops about 25% a
-quarter as the block reward steps down. This is not free money.
+A tuned 4090 loses money at $0.11/kWh. Measured on this miner: it earns about
+$0.25 a day and burns about $0.44 of power, so you are roughly six dollars a
+month out of pocket. It gets worse by about 25% a quarter as the block reward
+steps down.
+
+That number was wrong here until 2026-08-22. It said a tuned 4090 netted a few
+dollars a month, which was true when it was written and stopped being true as
+the reward stepped down. We measured it rather than leaving the estimate up.
+
+Mine because you want the coin, or because you want to support the network.
+Not because it pays.
 
 Power limit it to the efficiency knee. On a 4090 set 183W and you still get
 217 MH/s while the card actually pulls 167W. That is 24% less power for 0.3
