@@ -21,8 +21,10 @@
 #include <vector>
 
 #include "../../core/algo.h"
+#include "../../core/run.h"
 #include "job.h"
 #include "mine.cuh"
+#include "nvrtc_jit.h"
 
 namespace om {
 namespace {
@@ -169,6 +171,24 @@ class KawPow : public Algorithm {
         return dSol_ != nullptr && dCount_ != nullptr;
     }
 
+    bool acceptsRuntimeCompilation() const override { return true; }
+
+    void configure(const RunOptions &o) override {
+        jitWanted_ = o.nvrtc;
+        if (!jitWanted_) return;
+        int dev = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            ccMajor_ = prop.major;
+            ccMinor_ = prop.minor;
+        } else {
+            // Without a compute capability there is nothing sensible to
+            // compile for, so decline rather than guess an architecture.
+            jitWanted_ = false;
+        }
+    }
+
     bool search(const Job &job, uint64_t nonceBase, uint64_t count,
                 std::vector<Solution> *out) override {
         if (!dDag_) return false;
@@ -180,6 +200,7 @@ class KawPow : public Algorithm {
         if (period != builtPeriod_) {
             prog_ = om::progpow::buildProgram(height, params());
             builtPeriod_ = period;
+            if (jitWanted_ && !jitOff_) buildAndVerifyJit(job);
         }
 
         ensureScratch();
@@ -198,6 +219,34 @@ class KawPow : public Algorithm {
             memcpy(&hdr[i], job.msg + i * 4, 4);
         }
 
+        // The specialised kernel is used only after it has reproduced the
+        // interpreted kernel's output on this DAG, this period. jitReady_ is
+        // false until then and false forever after a single disagreement.
+        bool launched = false;
+        if (jitReady_) {
+            uint32_t nItems = numItems2048_;
+            uint64_t nb = nonceBase, cnt = count;
+            uint64_t t0 = job.target[0], t1 = job.target[1];
+            uint64_t t2 = job.target[2], t3 = job.target[3];
+            uint32_t cap = kMaxSolutions;
+            void *args[] = {&dDag_, &nItems,  &hdr[0], &hdr[1], &hdr[2],
+                            &hdr[3], &hdr[4], &hdr[5], &hdr[6], &hdr[7],
+                            &nb,     &cnt,    &t0,     &t1,     &t2,
+                            &t3,     &dSol_,  &dCount_, &cap};
+            launched = jit_.launch(jit_.searchKernel(), (unsigned)blocks,
+                                   threads, (unsigned)shared, mine_, args);
+            if (!launched) {
+                // Do not silently fall through to the interpreted kernel for
+                // the rest of the run without saying so: a miner quietly at a
+                // fifth of the speed it reported at startup is a support
+                // question nobody can answer from the log.
+                fprintf(stderr, "[kawpow] specialised kernel failed to launch; "
+                                "reverting to the interpreted kernel\n");
+                jitReady_ = false;
+                jitOff_ = true;
+            }
+        }
+        if (!launched)
         kpSearch<<<(unsigned)blocks, threads, shared, mine_>>>(
             dDag_, numItems2048_, prog_, hdr[0], hdr[1], hdr[2], hdr[3], hdr[4],
             hdr[5], hdr[6], hdr[7], nonceBase, count, job.target[0],
@@ -270,6 +319,11 @@ class KawPow : public Algorithm {
         dDag_ = nullptr;
         builtEpoch_ = -1;
         builtPeriod_ = -1;
+        // The compiled kernel is keyed to a period, and release() invalidates
+        // the period. Leaving jitReady_ set would let a later search launch a
+        // kernel built for a program that is no longer current - the exact
+        // failure the per-period verification exists to prevent.
+        jitReady_ = false;
         cache_.clear();
         cache_.shrink_to_fit();
         l1_.clear();
@@ -279,10 +333,126 @@ class KawPow : public Algorithm {
         release();
         if (dSol_) cudaFree(dSol_);
         if (dCount_) cudaFree(dCount_);
+        if (dVerifyA_) cudaFree(dVerifyA_);
+        if (dVerifyB_) cudaFree(dVerifyB_);
         if (mine_) cudaStreamDestroy(mine_);
     }
 
    private:
+    /// Compile this period's kernel and refuse to use it unless it reproduces
+    /// the interpreted kernel exactly.
+    ///
+    /// Run on the REAL DAG and this job's real header, every period - not once
+    /// at startup. The program changes with the period, so a generator bug can
+    /// be latent for hours and then produce a kernel that is wrong only for one
+    /// program in a hundred. Checking at startup would miss exactly that.
+    ///
+    /// The cost is two extra launches of `kVerifyNonces` nonces per period.
+    /// The compile itself is the larger cost and it is NOT MEASURED - stated
+    /// rather than estimated, because an estimate written in a comment becomes
+    /// a fact in a summary two hands later.
+    void buildAndVerifyJit(const Job &job) {
+        jitReady_ = false;
+        if (!jit_.build(prog_, ccMajor_, ccMinor_)) {
+            jitOff_ = true;
+            return;
+        }
+
+        const uint64_t n = kVerifyNonces;
+        if (!dVerifyA_ && cudaMalloc(&dVerifyA_, sizeof(Solution32) * n) !=
+                              cudaSuccess) {
+            jitOff_ = true;
+            return;
+        }
+        if (!dVerifyB_ && cudaMalloc(&dVerifyB_, sizeof(Solution32) * n) !=
+                              cudaSuccess) {
+            jitOff_ = true;
+            return;
+        }
+        cudaMemsetAsync(dVerifyA_, 0, sizeof(Solution32) * n, mine_);
+        cudaMemsetAsync(dVerifyB_, 0, sizeof(Solution32) * n, mine_);
+
+        uint32_t hdr[8];
+        for (int i = 0; i < 8; i++) memcpy(&hdr[i], job.msg + i * 4, 4);
+        const uint64_t base = 0x5EED0000ULL;
+
+        const int threads = 512;
+        const int groups = threads / (int)kNumLanes;
+        const size_t shared = (kL1CacheWords + groups * kNumLanes) * 4;
+        const unsigned blocks = (unsigned)((n + groups - 1) / groups);
+
+        kpHashBatch<<<blocks, threads, shared, mine_>>>(
+            dDag_, numItems2048_, prog_, hdr[0], hdr[1], hdr[2], hdr[3], hdr[4],
+            hdr[5], hdr[6], hdr[7], base, n, dVerifyA_);
+
+        uint32_t nItems = numItems2048_;
+        uint64_t nb = base, cnt = n;
+        void *args[] = {&dDag_, &nItems,  &hdr[0], &hdr[1], &hdr[2], &hdr[3],
+                        &hdr[4], &hdr[5], &hdr[6], &hdr[7], &nb,     &cnt,
+                        &dVerifyB_};
+        const bool ok =
+            jit_.launch(jit_.hashKernel(), blocks, threads, (unsigned)shared,
+                        mine_, args) &&
+            cudaStreamSynchronize(mine_) == cudaSuccess;
+
+        std::vector<Solution32> a(n), b(n);
+        if (ok) {
+            cudaMemcpy(a.data(), dVerifyA_, sizeof(Solution32) * n,
+                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(b.data(), dVerifyB_, sizeof(Solution32) * n,
+                       cudaMemcpyDeviceToHost);
+        }
+
+        // Two buffers of zeros compare equal, so an all-zero interpreted result
+        // would pass a kernel that did nothing at all. Require real output
+        // before the comparison is allowed to mean anything.
+        bool real = false;
+        for (uint64_t i = 0; i < n && !real; i++)
+            for (int w = 0; w < 8; w++)
+                if (a[i].mix[w] != 0) { real = true; break; }
+
+        bool same = ok && real;
+        for (uint64_t i = 0; i < n && same; i++) {
+            if (a[i].nonce != b[i].nonce) { same = false; break; }
+            for (int w = 0; w < 8; w++)
+                if (a[i].mix[w] != b[i].mix[w] || a[i].hit[w] != b[i].hit[w]) {
+                    same = false;
+                    break;
+                }
+        }
+
+        if (!same) {
+            // Permanent, not per-period. A generator that disagrees once is not
+            // trustworthy for the next period either, and a miner that hashes
+            // wrong finds nothing and reports no error - so the failure has to
+            // be loud here or it is never seen at all.
+            fprintf(stderr,
+                    "[kawpow] the runtime-compiled kernel disagreed with the "
+                    "interpreted one; staying on the interpreted kernel for "
+                    "the rest of this run\n");
+            jitOff_ = true;
+            return;
+        }
+
+        jitReady_ = true;
+        if (!announced_) {
+            fprintf(stderr, "[kawpow] runtime-compiled kernel verified against "
+                            "the interpreted kernel; using it\n");
+            announced_ = true;
+        }
+    }
+
+    /// How many nonces the per-period verification compares.
+    static const uint64_t kVerifyNonces = 512;
+
+    om::kawpow::NvrtcJit jit_;
+    Solution32 *dVerifyA_ = nullptr, *dVerifyB_ = nullptr;
+    bool jitWanted_ = false;   ///< --nvrtc was passed
+    bool jitReady_ = false;    ///< compiled AND verified for this period
+    bool jitOff_ = false;      ///< failed once; do not try again this run
+    bool announced_ = false;
+    int ccMajor_ = 0, ccMinor_ = 0;
+
     // Same 256 as every other algorithm here, for the same reason: a
     // deliberately low test difficulty can find far more than a handful.
     static const uint32_t kMaxSolutions = 256;

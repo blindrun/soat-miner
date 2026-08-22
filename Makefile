@@ -83,7 +83,8 @@ CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu 
             src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu \
             src/algos/kawpow/algo.cu
 CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp \
-               src/core/stratum_btc.cpp src/core/stratum_kawpow.cpp
+               src/core/stratum_btc.cpp src/core/stratum_kawpow.cpp \
+               $(BUILD)/nvrtc_embed.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
             src/core/stratum.h src/core/blake2b.cuh \
             src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \

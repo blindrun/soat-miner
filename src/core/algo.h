@@ -26,6 +26,12 @@
 
 namespace om {
 
+/// Defined in run.h, which includes this header - hence the declaration
+/// rather than the include. Inside `om`, not at global scope: a global one is
+/// a DIFFERENT type, and `using namespace om` then makes every mention
+/// ambiguous.
+struct RunOptions;
+
 /** A unit of work handed out by a node or pool. */
 struct Job {
     uint8_t msg[32] = {};      ///< header digest to hash against
@@ -122,6 +128,30 @@ class Algorithm {
      * defaulting to some other coin's script reads as correct and sends the
      * user to mine the wrong chain.
      */
+    /**
+     * Hand the algorithm the run's options, once, before mining starts.
+     *
+     * Default does nothing, deliberately: an algorithm that needs no tuning
+     * gets correct behaviour by existing rather than by someone remembering to
+     * add it to a list. The alternative - a dispatch in the caller naming each
+     * algorithm that has options - is the shape that silently stopped the
+     * share counters twice on this project.
+     *
+     * RunOptions is forward-declared because run.h includes this header; an
+     * implementation that needs the fields includes run.h itself.
+     */
+    virtual void configure(const RunOptions &) {}
+
+    /**
+     * Does this algorithm do anything with --nvrtc?
+     *
+     * Default false, so the caller can tell the difference between "enabled"
+     * and "silently ignored" without a list of algorithm names to keep in
+     * step. A new algorithm that ignores the flag is correctly reported as
+     * ignoring it, by existing.
+     */
+    virtual bool acceptsRuntimeCompilation() const { return false; }
+
     virtual std::string launcherGlob() const { return std::string(); }
 
     /**

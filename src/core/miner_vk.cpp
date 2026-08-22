@@ -148,6 +148,18 @@ int main(int argc, char **argv) {
                 "  --bench-height H  height to benchmark at\n");
             return 0;
         }
+        else if (a == "--nvrtc") {
+            // Accepted and refused OUT LOUD, rather than falling through to be
+            // ignored. Runtime kernel compilation is NVRTC, which is CUDA; this
+            // binary is Vulkan and has no equivalent. Silently ignoring it
+            // would leave someone who had read about the flag running at a
+            // fifth of the speed they expected with nothing in the output to
+            // explain why - the same shape as the launcher that declined to
+            // force CUDA and said nothing.
+            fprintf(stderr,
+                    "--nvrtc is CUDA-only and this is the Vulkan binary; "
+                    "run ./soat-miner instead. Continuing without it.\n");
+        }
     }
 
     // The Lithos reference client listens on 127.0.0.1:4444 by default.

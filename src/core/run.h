@@ -126,6 +126,14 @@ struct RunOptions {
     uint64_t batch = 1ULL << 22;
     bool bench = false;
     bool plain = false;
+    /// Compile a kernel specialised to each period at runtime (KawPow only).
+    ///
+    /// Off by default. Generating and compiling code while running is
+    /// behaviour endpoint security products react to, and whether Defender or
+    /// SmartScreen object has not been tested - an open question, not an
+    /// assumed answer. The interpreted kernel stays the default until somebody
+    /// has run this on a quarantined Windows machine.
+    bool nvrtc = false;
     uint64_t benchEpoch = 1851444;
     int reportSeconds = 5;
     std::string backendLabel;

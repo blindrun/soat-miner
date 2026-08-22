@@ -87,6 +87,7 @@ int main(int argc, char **argv) {
                          : -1;
         }
         else if (a == "--plain") opt.plain = true;
+        else if (a == "--nvrtc") opt.nvrtc = true;
         else if (a == "--ascii") om::g_asciiOnly = true;
         else if (a == "--interval") opt.reportSeconds = atoi(next().c_str());
         else if (a == "--list-algos") {
@@ -145,6 +146,9 @@ int main(int argc, char **argv) {
                 "                    500 restores a 4090 to stock for +2.3%%.\n"
                 "                    Needs root on Linux. 0 leaves it alone\n"
                 "  --mem-oc          conservative per-generation memory OC\n"
+                "  --nvrtc          compile a kernel per period at runtime (KawPow,\n"
+                "                    experimental). Verified against the interpreted\n"
+                "                    kernel before use; falls back on any disagreement.\n"
                 "                    (AMD: needs overdrive+root; NVIDIA: use\n"
                 "                    --mclk-offset instead)\n"
                 "  --bench           benchmark, no node required\n"
@@ -233,6 +237,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no CUDA device found\n");
         return 1;
     }
+
+    // After the device is chosen, because an algorithm may compile for the
+    // card it is actually going to run on.
+    if (opt.nvrtc && !algo->acceptsRuntimeCompilation()) {
+        // Asking for something an algorithm cannot do should say so. Ignoring
+        // it leaves someone who read about the flag believing it is on.
+        fprintf(stderr,
+                "--nvrtc has no effect for '%s'; it is implemented for kawpow "
+                "only. Continuing without it.\n",
+                algoName.c_str());
+    }
+    algo->configure(opt);
     char arch[32];
     snprintf(arch, sizeof(arch), "sm_%d%d", prop.major, prop.minor);
 
