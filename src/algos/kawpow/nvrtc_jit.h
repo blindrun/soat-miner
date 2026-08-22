@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -83,7 +84,12 @@ class NvrtcJit {
 
         const std::string src = specialisedSource(program);
         std::string ptx, log;
-        if (!compile(src, major, minor, &ptx, &log)) {
+        const auto tc = std::chrono::steady_clock::now();
+        const bool compiled = compile(src, major, minor, &ptx, &log);
+        compileMs_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - tc)
+                         .count();
+        if (!compiled) {
             fprintf(stderr, "[kawpow] kernel compile failed; using the "
                             "interpreted kernel\n");
             if (!log.empty()) fprintf(stderr, "%s\n", log.c_str());
@@ -97,7 +103,11 @@ class NvrtcJit {
         // problem and is not one.
         cudaFree(nullptr);
 
+        const auto tl = std::chrono::steady_clock::now();
         const CUresult lr = pCuModuleLoadData(&module_, ptx.c_str());
+        loadMs_ = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - tl)
+                      .count();
         if (lr != CUDA_SUCCESS) {
             // Print the code. "Could not load the compiled module" sent me
             // looking at the generated source for a fault that was in the
@@ -139,6 +149,27 @@ class NvrtcJit {
         return pCuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, sharedBytes,
                                (CUstream)stream, args, nullptr) == CUDA_SUCCESS;
     }
+
+    /// Compile only, no module load and no CUDA context.
+    ///
+    /// NVRTC is a compiler library and needs no device, so this measures the
+    /// dominant part of the per-period cost on a machine whose GPU is busy -
+    /// which is not a hypothetical: the one local card is shared with three
+    /// other lanes. Excludes module load and verification, both of which do
+    /// need the device.
+    bool compileOnly(const om::progpow::Program &program, int major, int minor,
+                     std::string *ptx) {
+        if (!available()) return false;
+        std::string log;
+        return compile(specialisedSource(program), major, minor, ptx, &log);
+    }
+
+    /// How long the last successful build() spent compiling, and loading.
+    ///
+    /// Separate because they are different costs with different fixes: a slow
+    /// compile is the generated source, a slow load is the driver.
+    double lastCompileMs() const { return compileMs_; }
+    double lastLoadMs() const { return loadMs_; }
 
     /// Suppress the one-time "unavailable" message, for probes that expect it.
     void setQuiet(bool q) { quiet_ = q; }
@@ -264,6 +295,7 @@ class NvrtcJit {
     CUfunction search_ = nullptr;
     CUfunction hash_ = nullptr;
     bool probed_ = false, ok_ = false, quiet_ = false;
+    double compileMs_ = 0, loadMs_ = 0;
     std::string why_;
 
     int (*pNvrtcCreateProgram)(void **, const char *, const char *, int,

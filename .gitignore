@@ -9,14 +9,18 @@ soat-miner-*
 sm-*
 build13
 soat-miner-13
-tests/measure_launch_gap
 
 scratchpad/
 tools/__pycache__/
 
-# Compiled test binaries. A pattern, not a list: every new test used to
-# need a line here, and the one that got forgotten showed up as an
-# untracked 20 MB binary in someone else's git status. Sources keep their
-# extension, so un-ignoring anything with a dot leaves them tracked.
-tests/test_*
-!tests/test_*.*
+# Compiled binaries in tests/. Matches on the ABSENCE of an extension rather
+# than on a name prefix, because the prefix version was still a list in
+# disguise: it covered tests/test_* and then bench_compile_latency appeared and
+# was not covered. Sources and scripts all carry an extension, so un-ignoring
+# anything with a dot keeps them tracked, and !tests/*/ keeps subdirectories.
+tests/*
+!tests/*.*
+!tests/*/
+# Re-ignored: the un-ignore above brings subdirectories back, including this
+# one, which an earlier explicit rule had covered.
+tests/__pycache__/

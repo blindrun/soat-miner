@@ -14,6 +14,7 @@
 //
 // Verified against Ravencoin mainnet block 4501000 (tests/test_kawpow_device).
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -353,6 +354,7 @@ class KawPow : public Algorithm {
     /// a fact in a summary two hands later.
     void buildAndVerifyJit(const Job &job) {
         jitReady_ = false;
+        const auto tStart = std::chrono::steady_clock::now();
         if (!jit_.build(prog_, ccMajor_, ccMinor_)) {
             jitOff_ = true;
             return;
@@ -435,6 +437,19 @@ class KawPow : public Algorithm {
         }
 
         jitReady_ = true;
+        const double totalMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tStart).count();
+        // Reported every period, not once. The compile stalls mining while it
+        // runs, so its cost is an operational fact a user is entitled to see
+        // rather than something they have to infer from a dip in the hashrate.
+        // Measured at ~1.46 s compile on a 4090 against a 180 s period (3
+        // blocks at 60 s), so roughly 0.8% of mining time.
+        fprintf(stderr,
+                "[kawpow] period %d: compiled in %.0f ms (compile %.0f, load "
+                "%.0f, verify %.0f), mining stalled that long\n",
+                builtPeriod_, totalMs, jit_.lastCompileMs(), jit_.lastLoadMs(),
+                totalMs - jit_.lastCompileMs() - jit_.lastLoadMs());
         if (!announced_) {
             fprintf(stderr, "[kawpow] runtime-compiled kernel verified against "
                             "the interpreted kernel; using it\n");
