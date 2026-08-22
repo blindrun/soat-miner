@@ -72,6 +72,8 @@ run_arm() {
     esac
     rate=$(grep -oE '"mhs_avg":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
     watts=$(grep -oE '"watts":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
+    wattsavg=$(grep -oE '"watts_avg":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
+    reported=$(grep -oE '"eff_mh_w":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
     # Derived here from mhs_avg, NOT read from the miner's eff_mh_w field.
     # That field is computed from the INSTANTANEOUS rate (telemetry.h: s.hashrate
     # / watts) while the headline this script reads is mhs_avg, so mixing them
@@ -79,8 +81,22 @@ run_arm() {
     # efficiency ratio to 5.19x when throughput had only moved 4.95x - and since
     # power was equal in both arms, those two ratios must be the same number.
     # A ratio that disagrees with itself is the tell.
-    if [ -n "$watts" ] && [ -n "$rate" ]; then
-        eff=$(echo "scale=4; $rate / $watts" | bc -l)
+    if [ -n "$wattsavg" ] && [ -n "$rate" ]; then
+        eff=$(echo "scale=4; $rate / $wattsavg" | bc -l)
+        # The reported efficiency must be reproducible from the other numbers
+        # on the same line. If it is not, the two halves are covering different
+        # windows again - which is the defect this comparison already caught
+        # once, when a 5.19x efficiency ratio sat beside a 4.95x throughput
+        # ratio at identical power.
+        if [ -n "$reported" ]; then
+            drift=$(echo "d = $eff - $reported; if (d < 0) d = -d; d" | bc -l)
+            over=$(echo "$drift > 0.002" | bc -l)
+            if [ "$over" = "1" ]; then
+                echo "  WARNING  eff_mh_w=$reported but mhs_avg/watts_avg=$eff"
+                echo "           the miner's efficiency is not reproducible"
+                echo "           from its own printed fields"
+            fi
+        fi
     else
         eff=""
     fi

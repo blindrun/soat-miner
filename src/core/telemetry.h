@@ -451,6 +451,27 @@ struct MinerStats {
     double uptimeSeconds = 0;
     std::vector<double> history;
 
+    /// Energy since start, so efficiency can use the SAME window as
+    /// `hashrateAvg` rather than a different one.
+    ///
+    /// Time-weighted rather than a mean of samples: report intervals are
+    /// nominally uniform but not guaranteed to be, and a plain mean would
+    /// quietly weight a short interval the same as a long one.
+    double joules = 0;          ///< sum of watts x interval
+    double poweredSeconds = 0;  ///< seconds those samples cover
+
+    void addPowerSample(double watts, double seconds) {
+        if (watts > 0.0 && seconds > 0.0) {
+            joules += watts * seconds;
+            poweredSeconds += seconds;
+        }
+    }
+
+    /// Mean power over the same window `hashrateAvg` covers.
+    double avgWatts() const {
+        return poweredSeconds > 0.0 ? joules / poweredSeconds : 0.0;
+    }
+
     void pushSample(double v) {
         history.push_back(v);
         if (history.size() > 48) history.erase(history.begin());
@@ -576,16 +597,30 @@ inline void logLine(bool tty, const char *kind, const std::string &msg) {
  */
 inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     const double watts = t.valid ? t.powerMilliwatts / 1000.0 : 0.0;
-    const double eff = (watts > 1.0) ? s.hashrate / watts : 0.0;
+
+    // Efficiency is a headline number now, not a diagnostic, so both halves of
+    // it must cover the SAME window. It used to be the instantaneous rate over
+    // the instantaneous wattage while the hashrate on display beside it was the
+    // average - self-consistent, but not consistent with anything else on the
+    // line, and dividing the two printed numbers gave a third answer.
+    //
+    // The window is SINCE PROCESS START, matching hashrateAvg. That window has
+    // a property worth knowing: it includes dataset build time, during which no
+    // nonces are produced, so efficiency reads low at first and climbs for the
+    // first minutes of a run. A short A/B comparison is still fair - both arms
+    // carry the same build - but an absolute figure taken early understates.
+    const double avgW = s.avgWatts();
+    const double eff = (avgW > 1.0) ? s.hashrateAvg / avgW : 0.0;
 
     if (!tty) {
         printf(
             "{\"uptime_s\":%.0f,\"algo\":\"%s\",\"backend\":\"%s\",\"mhs\":%.2f,"
-            "\"mhs_avg\":%.2f,\"watts\":%.1f,\"temp_c\":%u,\"fan_pct\":%u,"
+            "\"mhs_avg\":%.2f,\"watts\":%.1f,\"watts_avg\":%.1f,"
+            "\"temp_c\":%u,\"fan_pct\":%u,"
             "\"eff_mh_w\":%.3f,\"epoch\":%llu,\"accepted\":%llu,"
             "\"rejected\":%llu,\"nonces\":%llu}\n",
             s.uptimeSeconds, s.algo.c_str(), s.backend.c_str(), s.hashrate,
-            s.hashrateAvg, watts, t.temperatureC, t.fanPercent, eff,
+            s.hashrateAvg, watts, avgW, t.temperatureC, t.fanPercent, eff,
             (unsigned long long)s.epoch, (unsigned long long)s.accepted,
             (unsigned long long)s.rejected, (unsigned long long)s.totalNonces);
         fflush(stdout);

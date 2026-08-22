@@ -732,7 +732,12 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     : 0.0;
             stats.epoch = job.epoch;
             stats.pushSample(stats.hashrate);
-            printReadout(stats, gpu.sample(), tty);
+            // Sampled ONCE and reused: calling gpu.sample() twice would
+            // accumulate one reading and display a different one.
+            const GpuTelemetry sample = gpu.sample();
+            if (sample.valid)
+                stats.addPowerSample(sample.powerMilliwatts / 1000.0, el);
+            printReadout(stats, sample, tty);
             intervalHashes = 0;
             tReport = now;
         }
