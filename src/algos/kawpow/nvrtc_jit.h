@@ -95,6 +95,18 @@ class NvrtcJit {
             if (!log.empty()) fprintf(stderr, "%s\n", log.c_str());
             return false;
         }
+        return loadPtx(ptx);
+    }
+
+    /// Load already-compiled PTX, replacing whatever was loaded.
+    ///
+    /// Split out from `build()` so a kernel compiled ahead of time - on another
+    /// thread, during the previous period - can be adopted without recompiling.
+    /// This half needs the device; the compile half does not, which is the
+    /// whole reason the split is worth having.
+    bool loadPtx(const std::string &ptx) {
+        if (!available()) return false;
+        if (module_) unload();
 
         // The driver API needs a current context and the runtime API only
         // creates the primary context lazily - on the first allocation, not on
@@ -135,6 +147,24 @@ class NvrtcJit {
         return true;
     }
 
+    /// Take ownership of another instance's already-loaded module.
+    ///
+    /// The point of the exercise: cuModuleLoadData costs 0.4 ms on an idle GPU
+    /// and ~400 ms while mining - the same call, contending with the in-flight
+    /// kernel. So the load happens on the background thread during the previous
+    /// period, and the period boundary only moves three pointers.
+    void takeModuleFrom(NvrtcJit &other) {
+        unload();
+        module_ = other.module_;
+        search_ = other.search_;
+        hash_ = other.hash_;
+        compileMs_ = other.compileMs_;
+        loadMs_ = other.loadMs_;
+        other.module_ = nullptr;
+        other.search_ = nullptr;
+        other.hash_ = nullptr;
+    }
+
     /// True once `build()` has succeeded and the kernels are launchable.
     bool loaded() const { return module_ != nullptr && search_ && hash_; }
 
@@ -161,7 +191,15 @@ class NvrtcJit {
                      std::string *ptx) {
         if (!available()) return false;
         std::string log;
-        return compile(specialisedSource(program), major, minor, ptx, &log);
+        // Timed here as well as in build(). Without this the background
+        // thread's compile is reported as "compile 0 ms", which is not a
+        // measurement, it is a field nobody filled in.
+        const auto t = std::chrono::steady_clock::now();
+        const bool ok = compile(specialisedSource(program), major, minor, ptx,
+                                &log);
+        compileMs_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t).count();
+        return ok;
     }
 
     /// How long the last successful build() spent compiling, and loading.
@@ -200,10 +238,21 @@ class NvrtcJit {
                                 sources.data(), names.data()) != 0)
             return false;
 
-        // Compile for the card actually present, not a lowest common
-        // denominator - the point of compiling at runtime is knowing the target.
+        // sm_XX, not compute_XX, and that distinction is worth 375 ms per
+        // period.
+        //
+        // compute_XX yields PTX, and cuModuleLoadData on PTX makes the DRIVER
+        // JIT it to SASS - on the critical path, while mining. That cost hid
+        // from an offline harness because CUDA caches driver JIT results in
+        // ~/.nv/ComputeCache and the harness kept re-loading the same few
+        // programs; in a real run every period is a program the cache has
+        // never seen. sm_XX makes NVRTC run ptxas itself, so what reaches the
+        // driver is a finished cubin with nothing left to compile.
+        //
+        // Still no device involved: ptxas inside NVRTC is host code, so this
+        // stays on the background thread where it belongs.
         char arch[64];
-        snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", major,
+        snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d", major,
                  minor);
         // -default-device: ethash.h has host-only `inline` functions and JIT
         // mode rejects unannotated ones.
@@ -220,12 +269,25 @@ class NvrtcJit {
             pNvrtcDestroyProgram(&prog);
             return false;
         }
-        size_t ptxSize = 0;
-        pNvrtcGetPTXSize(prog, &ptxSize);
-        ptx->resize(ptxSize);
-        pNvrtcGetPTX(prog, &(*ptx)[0]);
+        // Prefer the cubin. Fall back to PTX where NVRTC is too old to
+        // provide one (nvrtcGetCUBIN arrived in 11.2) - correct, just with the
+        // driver-JIT cost back at each period boundary.
+        bool got = false;
+        if (pNvrtcGetCUBINSize && pNvrtcGetCUBIN) {
+            size_t cubinSize = 0;
+            if (pNvrtcGetCUBINSize(prog, &cubinSize) == 0 && cubinSize > 0) {
+                ptx->resize(cubinSize);
+                got = pNvrtcGetCUBIN(prog, &(*ptx)[0]) == 0;
+            }
+        }
+        if (!got) {
+            size_t ptxSize = 0;
+            pNvrtcGetPTXSize(prog, &ptxSize);
+            ptx->resize(ptxSize);
+            got = pNvrtcGetPTX(prog, &(*ptx)[0]) == 0;
+        }
         pNvrtcDestroyProgram(&prog);
-        return true;
+        return got;
     }
 
     bool loadLibs() {
@@ -259,6 +321,12 @@ class NvrtcJit {
             (int (*)(void *, char *))dlsym(nvrtcLib_, "nvrtcGetProgramLog");
         pNvrtcDestroyProgram =
             (int (*)(void **))dlsym(nvrtcLib_, "nvrtcDestroyProgram");
+        // Optional: absent before NVRTC 11.2, checked at the call site rather
+        // than in the all-symbols test below.
+        pNvrtcGetCUBINSize =
+            (int (*)(void *, size_t *))dlsym(nvrtcLib_, "nvrtcGetCUBINSize");
+        pNvrtcGetCUBIN =
+            (int (*)(void *, char *))dlsym(nvrtcLib_, "nvrtcGetCUBIN");
 
         pCuModuleLoadData = (CUresult (*)(CUmodule *, const void *))dlsym(
             cudaLib_, "cuModuleLoadData");
@@ -306,6 +374,8 @@ class NvrtcJit {
     int (*pNvrtcGetProgramLogSize)(void *, size_t *) = nullptr;
     int (*pNvrtcGetProgramLog)(void *, char *) = nullptr;
     int (*pNvrtcDestroyProgram)(void **) = nullptr;
+    int (*pNvrtcGetCUBINSize)(void *, size_t *) = nullptr;
+    int (*pNvrtcGetCUBIN)(void *, char *) = nullptr;
 
     CUresult (*pCuModuleLoadData)(CUmodule *, const void *) = nullptr;
     CUresult (*pCuModuleGetFunction)(CUfunction *, CUmodule,

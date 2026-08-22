@@ -14,8 +14,11 @@
 //
 // Verified against Ravencoin mainnet block 4501000 (tests/test_kawpow_device).
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <cstring>
 
 #include <string>
@@ -331,6 +334,9 @@ class KawPow : public Algorithm {
     }
 
     ~KawPow() override {
+        // Join before anything it touches is destroyed. Worst case this waits
+        // out one compile, ~1.4 s, on a path that is already shutting down.
+        if (precompileThread_.joinable()) precompileThread_.join();
         release();
         if (dSol_) cudaFree(dSol_);
         if (dCount_) cudaFree(dCount_);
@@ -355,7 +361,34 @@ class KawPow : public Algorithm {
     void buildAndVerifyJit(const Job &job) {
         jitReady_ = false;
         const auto tStart = std::chrono::steady_clock::now();
-        if (!jit_.build(prog_, ccMajor_, ccMinor_)) {
+
+        // Adopt the kernel the background thread compiled during the previous
+        // period, if it compiled the right one. Compilation is ~1.4 s and the
+        // period is ~180 s, so there is time to spare - but "there is time"
+        // is a prediction, and the staged period is checked rather than
+        // assumed. A kernel built for the wrong period would hash wrong, and
+        // the verification below would catch it, but silently recompiling is
+        // better than silently falling back to the interpreted kernel.
+        bool haveStaged = false;
+        {
+            std::lock_guard<std::mutex> lk(stagedMu_);
+            if (stagedReady_ && stagedPeriod_ == builtPeriod_) {
+                stagedReady_ = false;
+                haveStaged = true;
+            }
+        }
+        precompiled_ = haveStaged;
+
+        bool loaded;
+        if (haveStaged) {
+            // Three pointer assignments. The compile and the load both already
+            // happened, on the other thread, during the previous period.
+            jit_.takeModuleFrom(precompiler_);
+            loaded = jit_.loaded();
+        } else {
+            loaded = jit_.build(prog_, ccMajor_, ccMinor_);
+        }
+        if (!loaded) {
             jitOff_ = true;
             return;
         }
@@ -445,11 +478,31 @@ class KawPow : public Algorithm {
         // rather than something they have to infer from a dip in the hashrate.
         // Measured at ~1.46 s compile on a 4090 against a 180 s period (3
         // blocks at 60 s), so roughly 0.8% of mining time.
-        fprintf(stderr,
-                "[kawpow] period %d: compiled in %.0f ms (compile %.0f, load "
-                "%.0f, verify %.0f), mining stalled that long\n",
-                builtPeriod_, totalMs, jit_.lastCompileMs(), jit_.lastLoadMs(),
-                totalMs - jit_.lastCompileMs() - jit_.lastLoadMs());
+        // Says which path it took, because a precompile that lands too late
+        // is indistinguishable from one that works if you only look at the
+        // total. When precompiled, the compile time is NOT in this number -
+        // it happened during the previous period, off the critical path.
+        if (precompiled_) {
+            // The compile and load times carried over from the background
+            // thread are reported as what they are - work that happened during
+            // the PREVIOUS period, off the critical path. Subtracting them from
+            // the stall produced negative verify times, which is what a number
+            // does when it is being asked to mean two things at once.
+            fprintf(stderr,
+                    "[kawpow] period %d: precompiled, mining stalled %.1f ms; "
+                    "compile %.0f ms and load %.0f ms ran off-path during the "
+                    "previous period\n",
+                    builtPeriod_, totalMs, jit_.lastCompileMs(),
+                    jit_.lastLoadMs());
+        } else {
+            fprintf(stderr,
+                    "[kawpow] period %d: compiled on demand, mining stalled "
+                    "%.0f ms (compile %.0f, load %.0f, verify %.0f)\n",
+                    builtPeriod_, totalMs, jit_.lastCompileMs(),
+                    jit_.lastLoadMs(),
+                    totalMs - jit_.lastCompileMs() - jit_.lastLoadMs());
+        }
+        startPrecompile(builtPeriod_ + 1);
         if (!announced_) {
             fprintf(stderr, "[kawpow] runtime-compiled kernel verified against "
                             "the interpreted kernel; using it\n");
@@ -457,10 +510,54 @@ class KawPow : public Algorithm {
         }
     }
 
+    /// Compile the NEXT period's kernel while this one mines.
+    ///
+    /// The compile is ~1.4 s of pure CPU work - NVRTC is a compiler library and
+    /// touches no device - so it moves off the critical path entirely, leaving
+    /// only module load and verification (about 5 ms together) at the period
+    /// boundary. Nothing CUDA happens on this thread, deliberately: the module
+    /// load needs a context and doing it here would mean making the primary
+    /// context current on a second thread for no gain.
+    void startPrecompile(int nextPeriod) {
+        if (jitOff_ || !jitWanted_) return;
+        // Already compiling: do not queue a second. Skipping is safe - the
+        // period boundary falls back to compiling on demand and says so.
+        if (precompileBusy_.load()) return;
+        if (precompileThread_.joinable()) precompileThread_.join();
+        precompileBusy_.store(true);
+        const int height = nextPeriod * kPeriodLength;
+        precompileThread_ = std::thread([this, nextPeriod, height]() {
+            const om::progpow::Program next =
+                om::progpow::buildProgram(height, params());
+            std::string ptx;
+            // Its own NvrtcJit instance, so nothing is shared with the mining
+            // thread's - no locking around compile timings, no chance of one
+            // thread's unload() racing the other's launch.
+            // Compile AND load here. The load is the expensive half at a
+            // period boundary - not because loading is slow, but because it
+            // contends with the mining kernel - so it belongs on this thread,
+            // where waiting costs nothing that anyone sees.
+            if (precompiler_.compileOnly(next, ccMajor_, ccMinor_, &ptx) &&
+                precompiler_.loadPtx(ptx)) {
+                std::lock_guard<std::mutex> lk(stagedMu_);
+                stagedPeriod_ = nextPeriod;
+                stagedReady_ = true;
+            }
+            precompileBusy_.store(false);
+        });
+    }
+
     /// How many nonces the per-period verification compares.
     static const uint64_t kVerifyNonces = 512;
 
     om::kawpow::NvrtcJit jit_;
+    om::kawpow::NvrtcJit precompiler_;  ///< background thread's, compile only
+    std::thread precompileThread_;
+    std::mutex stagedMu_;
+    int stagedPeriod_ = -1;
+    bool stagedReady_ = false;
+    std::atomic<bool> precompileBusy_{false};
+    bool precompiled_ = false;  ///< did this period adopt a staged kernel?
     Solution32 *dVerifyA_ = nullptr, *dVerifyB_ = nullptr;
     bool jitWanted_ = false;   ///< --nvrtc was passed
     bool jitReady_ = false;    ///< compiled AND verified for this period

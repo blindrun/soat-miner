@@ -95,7 +95,9 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
             src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
             src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
-            src/core/kawpow_address.h
+            src/core/kawpow_address.h \
+            src/algos/kawpow/nvrtc_jit.h src/algos/kawpow/nvrtc_source.h \
+            src/algos/kawpow/nvrtc_headers.h
 
 # The Vulkan build carries one object per algorithm plus its embedded SPIR-V
 # module, and vk_common.o holds the registry and the shared device handling.
