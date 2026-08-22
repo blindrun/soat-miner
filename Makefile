@@ -143,7 +143,7 @@ vkgen = $(BUILD)/lin/gen/$(1).o
 VK_OBJS  = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(BUILD)/lin/gen/%.o,$(VK_SRC_GEN))
 
-.PHONY: all cuda vulkan clean test test-nvrtc test-device test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
+.PHONY: all cuda vulkan clean test test-nvrtc test-nvrtc-device test-device test-kawpow test-kawpow-device test-kawpow-vulkan test-kawpow-vulkan-real test-pearl test-btc-stratum test-bc3-destination test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan bench install dirs package
 
 all: cuda vulkan
 
@@ -323,6 +323,23 @@ tests/test_nvrtc: tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
 	$(NVCC) -O2 -Isrc tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
 		-lnvrtc -o $@
 
+tests/test_nvrtc_device: tests/test_nvrtc_device.cu $(BUILD)/nvrtc_embed.cpp \
+                        src/algos/kawpow/nvrtc_jit.h \
+                        src/algos/kawpow/nvrtc_source.h \
+                        src/algos/kawpow/mine.cuh $(PROGPOW_DEPS)
+	$(NVCC) $(NVFLAGS) -Isrc tests/test_nvrtc_device.cu \
+		$(BUILD)/nvrtc_embed.cpp -o $@
+
+# Runs BOTH directions. The forward check alone cannot tell a faithful kernel
+# from a comparison that never fails, so the mutation case - a kernel compiled
+# for the wrong period - has to be caught for the forward pass to mean anything.
+.PHONY: test-nvrtc-device
+test-nvrtc-device: tests/test_nvrtc_device
+	@echo "--- nvrtc: generated kernel vs interpreted, on a real card ---"
+	@./tests/test_nvrtc_device $(KAWPOW_BLK_HEIGHT)
+	@echo "--- nvrtc: and the comparison itself is not vacuous ---"
+	@./tests/test_nvrtc_device $(KAWPOW_BLK_HEIGHT) --mutate
+
 .PHONY: test-nvrtc
 test-nvrtc: tests/test_nvrtc
 	@echo "--- nvrtc: the runtime-compilation chain, offline ---"
@@ -342,7 +359,7 @@ tests/test_kawpow_device: tests/test_kawpow_device.cu \
 # them and a segfault in `--bench` - the first command most people type - stayed
 # invisible while the offline gate reported 119 checks passing. A gate nobody
 # invokes is not a gate.
-test-device: test-bench-runs test-kawpow-device
+test-device: test-bench-runs test-kawpow-device test-nvrtc-device
 	@echo "device gates: all passed"
 
 test-bench-runs: cuda
