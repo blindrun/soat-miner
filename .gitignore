@@ -1,40 +1,22 @@
 build/
 soat-miner
-tests/test_element
-tests/test_hit
 tests/__pycache__/
 *.o
 *.log
-tests/test_vulkan
-tests/test_algo
 
 # build-binary variants and experiment scratch binaries (never commit these)
 soat-miner-*
 sm-*
-tests/test_pearl_job
-tests/test_pearl_gateway
-tests/test_pearl_prepare
-tests/test_pearl_algo
-tests/test_pearl
 build13
 soat-miner-13
-tests/test_pearl_mining_shape
 tests/measure_launch_gap
-tests/test_pearl_vk
-tests/test_btc_stratum
-tests/test_bc3_destination
-tests/test_sha3_algo
-tests/test_sha3_vulkan
 
 scratchpad/
 tools/__pycache__/
-tests/test_kawpow_hash
-tests/test_kawpow_block
-tests/test_kawpow_device
-tests/test_kawpow_stratum
-tests/test_kawpow_address
-tests/test_progpow_stock
-tests/test_kawpow_vulkan
-tests/test_kawpow_vk_real
-tests/test_progpow_ops
-tests/test_algo_registry
+
+# Compiled test binaries. A pattern, not a list: every new test used to
+# need a line here, and the one that got forgotten showed up as an
+# untracked 20 MB binary in someone else's git status. Sources keep their
+# extension, so un-ignoring anything with a dot leaves them tracked.
+tests/test_*
+!tests/test_*.*
