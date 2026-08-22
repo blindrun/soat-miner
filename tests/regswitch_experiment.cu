@@ -168,6 +168,49 @@ __global__ void variantB(const uint32_t *__restrict__ l1, uint32_t *out,
     out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
 }
 
+
+// ---- C: program as compile-time literals = what NVRTC emits --------------
+__global__ void variantC(const uint32_t *__restrict__ l1, uint32_t *out,
+                         const uint32_t *__restrict__ prog, uint32_t seed) {
+    (void)prog;
+    uint32_t m0=seed*1u; uint32_t m1=seed*2u; uint32_t m2=seed*3u; uint32_t m3=seed*4u; uint32_t m4=seed*5u; uint32_t m5=seed*6u; uint32_t m6=seed*7u; uint32_t m7=seed*8u; uint32_t m8=seed*9u; uint32_t m9=seed*10u; uint32_t m10=seed*11u; uint32_t m11=seed*12u; uint32_t m12=seed*13u; uint32_t m13=seed*14u; uint32_t m14=seed*15u; uint32_t m15=seed*16u; uint32_t m16=seed*17u; uint32_t m17=seed*18u; uint32_t m18=seed*19u; uint32_t m19=seed*20u; uint32_t m20=seed*21u; uint32_t m21=seed*22u; uint32_t m22=seed*23u; uint32_t m23=seed*24u; uint32_t m24=seed*25u; uint32_t m25=seed*26u; uint32_t m26=seed*27u; uint32_t m27=seed*28u; uint32_t m28=seed*29u; uint32_t m29=seed*30u; uint32_t m30=seed*31u; uint32_t m31=seed*32u;
+    for (int r = 0; r < ROUNDS; r++) {
+            m9 = mrg(m9, l1[m20 & 4095u], 207388624u);
+            m23 = mrg(m23, l1[m6 & 4095u], 2503055453u);
+            m2 = mrg(m2, l1[m13 & 4095u], 369140570u);
+            m4 = mrg(m4, l1[m26 & 4095u], 1033639716u);
+            m3 = mrg(m3, l1[m27 & 4095u], 4070378921u);
+            m3 = mrg(m3, l1[m25 & 4095u], 4192983756u);
+            m8 = mrg(m8, l1[m2 & 4095u], 1243862422u);
+            m7 = mrg(m7, l1[m9 & 4095u], 2452055640u);
+            m6 = mrg(m6, l1[m11 & 4095u], 2744112455u);
+            m6 = mrg(m6, l1[m23 & 4095u], 884585951u);
+            m20 = mrg(m20, l1[m27 & 4095u], 3966150535u);
+            m19 = mrg(m19, l1[m23 & 4095u], 3349342752u);
+            m31 = mrg(m31, m5 + m19, (uint32_t)(r*31+0));
+            m18 = mrg(m18, m21 + m28, (uint32_t)(r*31+1));
+            m26 = mrg(m26, m4 + m7, (uint32_t)(r*31+2));
+            m9 = mrg(m9, m10 + m21, (uint32_t)(r*31+3));
+            m2 = mrg(m2, m31 + m26, (uint32_t)(r*31+4));
+            m21 = mrg(m21, m4 + m20, (uint32_t)(r*31+5));
+            m29 = mrg(m29, m22 + m31, (uint32_t)(r*31+6));
+            m17 = mrg(m17, m4 + m5, (uint32_t)(r*31+7));
+            m3 = mrg(m3, m30 + m4, (uint32_t)(r*31+8));
+            m18 = mrg(m18, m19 + m28, (uint32_t)(r*31+9));
+            m1 = mrg(m1, m24 + m22, (uint32_t)(r*31+10));
+            m10 = mrg(m10, m29 + m22, (uint32_t)(r*31+11));
+            m3 = mrg(m3, m7 + m31, (uint32_t)(r*31+12));
+            m8 = mrg(m8, m13 + m18, (uint32_t)(r*31+13));
+            m25 = mrg(m25, m15 + m25, (uint32_t)(r*31+14));
+            m10 = mrg(m10, m31 + m5, (uint32_t)(r*31+15));
+            m17 = mrg(m17, m28 + m25, (uint32_t)(r*31+16));
+            m17 = mrg(m17, m8 + m27, (uint32_t)(r*31+17));
+            m24 = mrg(m24, m26 + m22, (uint32_t)(r*31+18));
+            m5 = mrg(m5, m14 + m9, (uint32_t)(r*31+19));
+    }
+    out[blockIdx.x * blockDim.x + threadIdx.x] = m0 ^ m1 ^ m2 ^ m3 ^ m4 ^ m5 ^ m6 ^ m7 ^ m8 ^ m9 ^ m10 ^ m11 ^ m12 ^ m13 ^ m14 ^ m15 ^ m16 ^ m17 ^ m18 ^ m19 ^ m20 ^ m21 ^ m22 ^ m23 ^ m24 ^ m25 ^ m26 ^ m27 ^ m28 ^ m29 ^ m30 ^ m31;
+}
+
 // ---- host harness ---------------------------------------------------------
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -180,23 +223,25 @@ int main() {
     for (int i = 0; i < 256; i++) hp[i] = (uint32_t)(i * 2654435761u);
     cudaMalloc(&prog, sizeof hp); cudaMemcpy(prog, hp, sizeof hp, cudaMemcpyHostToDevice);
 
-    for (int v = 0; v < 2; v++) {
+    for (int v = 0; v < 3; v++) {
         // warm up, then time - a first launch carries context setup
         if (v == 0) variantA<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u);
-        else        variantB<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u);
+        else if (v == 1) variantB<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u);
+        else variantC<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u);
         cudaDeviceSynchronize();
 
         cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
         cudaEventRecord(a);
         for (int i = 0; i < ITERS; i++) {
             if (v == 0) variantA<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u + i);
-            else        variantB<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u + i);
+            else if (v == 1) variantB<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u + i);
+            else variantC<<<BLOCKS, THREADS>>>(l1, out, prog, 12345u + i);
         }
         cudaEventRecord(b); cudaEventSynchronize(b);
         float ms = 0; cudaEventElapsedTime(&ms, a, b);
         const double hashes = (double)BLOCKS * THREADS * ITERS;
         printf("  variant%c  %8.2f ms  %8.2f M mix/s\n",
-               v ? 'B' : 'A', ms, hashes / (ms / 1000.0) / 1e6);
+               "ABC"[v], ms, hashes / (ms / 1000.0) / 1e6);
         // did it run? a zeroed result would mean the launch failed silently
         uint32_t probe = 0;
         cudaMemcpy(&probe, out, 4, cudaMemcpyDeviceToHost);
