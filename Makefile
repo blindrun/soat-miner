@@ -336,6 +336,14 @@ tests/test_nvrtc_device: tests/test_nvrtc_device.cu $(BUILD)/nvrtc_embed.cpp \
 # Runs BOTH directions. The forward check alone cannot tell a faithful kernel
 # from a comparison that never fails, so the mutation case - a kernel compiled
 # for the wrong period - has to be caught for the forward pass to mean anything.
+.PHONY: test-nvrtc-precompile
+# The only gate that runs the miner with --nvrtc. Everything else exercises
+# NvrtcJit directly or never enables it, so without this the whole runtime
+# compilation path could be deleted and the suite would stay green.
+test-nvrtc-precompile: cuda
+	@echo "--- nvrtc: the async precompile runs, and lands in time ---"
+	@sh tests/test_nvrtc_precompile.sh ./soat-miner
+
 .PHONY: test-nvrtc-device
 test-nvrtc-device: tests/test_nvrtc_device
 	@echo "--- nvrtc: generated kernel vs interpreted, on a real card ---"
@@ -362,7 +370,7 @@ tests/test_kawpow_device: tests/test_kawpow_device.cu \
 # them and a segfault in `--bench` - the first command most people type - stayed
 # invisible while the offline gate reported 119 checks passing. A gate nobody
 # invokes is not a gate.
-test-device: test-bench-runs test-kawpow-device test-nvrtc-device
+test-device: test-bench-runs test-kawpow-device test-nvrtc-device test-nvrtc-precompile
 	@echo "device gates: all passed"
 
 test-bench-runs: cuda
