@@ -71,7 +71,14 @@ for algo in $ALGOS; do
     esac
 
     # 2. a stats line with a positive hashrate
+    #
+    # Efficiency is reported alongside it, never on its own line. A headline
+    # hashrate with no wattage is the industry habit and it is what made this
+    # project's own comparisons misleading: 235.5 MH/s at 167 W and 235.5 at
+    # 450 W are the same number describing very different machines.
     rate=$(grep -oE '"mhs_avg":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
+    watts=$(grep -oE '"watts":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
+    eff=$(grep -oE '"eff_mh_w":[0-9.]+' "$log" | tail -1 | cut -d: -f2)
     if [ -z "$rate" ]; then
         echo "  FAIL  $algo: no stats line in ${RUN}s - it never reached steady state"
         # Show the binary's own last words. Without this the CI output says
@@ -80,7 +87,7 @@ for algo in $ALGOS; do
         echo "        last output: $(tail -1 "$log")"
         fail=$((fail + 1))
     elif [ "$(echo "$rate > 0" | bc -l 2>/dev/null)" = "1" ]; then
-        echo "  ok    $algo benches at ${rate} MH/s"
+        echo "  ok    $algo  ${rate} MH/s  ${watts:-?} W  ${eff:-?} MH/W"
     else
         echo "  FAIL  $algo: reported ${rate} MH/s, which is not mining"
         fail=$((fail + 1))
