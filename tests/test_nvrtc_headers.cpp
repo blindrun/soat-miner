@@ -52,14 +52,22 @@ int main() {
     // relative paths, so each header is registered under every spelling that
     // references it: kawpow.h asks for "../progpow/ethash.h" while progpow.h
     // asks for "ethash.h", and both must resolve to the same text.
+    // DISTINCT names, deliberately. Both mine.cuh files share a basename, so
+    // the obvious rule - canonicalise every include to its basename - makes
+    // them collide. NVRTC would then resolve BOTH includes to whichever text
+    // was registered under "mine.cuh", and the result still COMPILES: a kernel
+    // built against the wrong mix function, which is exactly the class of bug
+    // that mines happily and never lands a share.
     const char *names[] = {"stdint.h", "keccak.h", "ethash.h", "progpow.h",
-                           "kawpow.h"};
+                           "kawpow.h", "progpow_mine.cuh", "kawpow_mine.cuh"};
     const char *paths[] = {
         nullptr,   // stdint is the stub above, not a file
         "/home/blindrun/Projects/soat-kawpow/src/algos/progpow/keccak.h",
         "/home/blindrun/Projects/soat-kawpow/src/algos/progpow/ethash.h",
         "/home/blindrun/Projects/soat-kawpow/src/algos/progpow/progpow.h",
-        "/home/blindrun/Projects/soat-kawpow/src/algos/kawpow/kawpow.h"};
+        "/home/blindrun/Projects/soat-kawpow/src/algos/kawpow/kawpow.h",
+        "/home/blindrun/Projects/soat-kawpow/src/algos/progpow/mine.cuh",
+        "/home/blindrun/Projects/soat-kawpow/src/algos/kawpow/mine.cuh"};
     std::vector<std::string> bodies;
     std::vector<const char *> hsrc, hname;
     // Canonicalise the include spellings so each header is registered ONCE.
@@ -68,31 +76,39 @@ int main() {
     // function is redefined.
     auto canon = [](std::string t) {
         const char *from[] = {"\"../progpow/keccak.h\"", "\"../progpow/ethash.h\"",
-                              "\"../progpow/progpow.h\""};
-        const char *to[] = {"\"keccak.h\"", "\"ethash.h\"", "\"progpow.h\""};
-        for (int i = 0; i < 3; i++) {
+                              "\"../progpow/progpow.h\"", "\"../progpow/mine.cuh\""};
+        const char *to[] = {"\"keccak.h\"", "\"ethash.h\"", "\"progpow.h\"",
+                            "\"progpow_mine.cuh\""};
+        for (int i = 0; i < 4; i++) {
             size_t p;
             while ((p = t.find(from[i])) != std::string::npos)
                 t.replace(p, strlen(from[i]), to[i]);
         }
         return t;
     };
-    bodies = {kStdint, canon(slurp(paths[1])), canon(slurp(paths[2])),
-              canon(slurp(paths[3])), canon(slurp(paths[4]))};
+    bodies = {kStdint};
+    for (int i = 1; i <= 6; i++) bodies.push_back(canon(slurp(paths[i])));
     for (size_t i = 0; i < bodies.size(); i++) {
         hsrc.push_back(bodies[i].c_str());
         hname.push_back(names[i]);
     }
 
+    // Compiles the REAL device path, not a sample of the host headers. Pulling
+    // in kawpow_mine.cuh compiles kpSearch and kpHashBatch themselves - warp
+    // shuffles, dynamic shared memory, the whole mix loop - so this answers
+    // "can NVRTC build our kernel" rather than "can it parse our constants".
     const std::string src = R"CU(
-#include "kawpow.h"
-extern "C" __global__ void probe(unsigned *out) {
-    // Touch one function from each header so nothing is optimised away.
-    unsigned st[25]; for (int i = 0; i < 25; i++) st[i] = i;
-    om::progpow::keccakf800(st);
-    unsigned m = om::progpow::fnv1a(2166136261u, st[0]);
-    m = om::progpow::randomMath(m, st[1], 3u, om::progpow::kMath094);
-    out[0] = m;
+#include "kawpow_mine.cuh"
+extern "C" __global__ void probe(const unsigned *dag, unsigned n,
+                                 om::progpow::Program prog, unsigned *out) {
+    extern __shared__ unsigned sh[];
+    unsigned *l1 = sh;
+    unsigned *scratch = sh + om::progpow::kL1CacheWords;
+    const unsigned lane = threadIdx.x % om::progpow::kNumLanes;
+    const unsigned seed[2] = {out[0], out[1]};
+    unsigned mixHash[8];
+    om::progpow::ppHashMix(dag, n, prog, l1, lane, seed, scratch, mixHash);
+    if (lane == 0) for (int i = 0; i < 8; i++) out[i] = mixHash[i];
 }
 )CU";
 
@@ -111,7 +127,7 @@ extern "C" __global__ void probe(unsigned *out) {
         return 1;
     }
     size_t ptxSize = 0; nvrtcGetPTXSize(prog, &ptxSize);
-    printf("NVRTC COMPILED OUR HEADERS: %zu bytes of PTX\n", ptxSize);
+    printf("NVRTC COMPILED THE REAL DEVICE KERNEL: %zu bytes of PTX\n", ptxSize);
     if (logSize > 1) printf("log: %s\n", log.c_str());
     return 0;
 }
