@@ -28,6 +28,7 @@ Algorithm *makeSha3_256tVK(int deviceIndex);
 // allocate a device and then fail, which is worse for a user than the honest
 // "Pearl is CUDA only" that miner_vk.cpp printed while this line was commented.
 Algorithm *makePearlPowVK(int deviceIndex);
+Algorithm *makeKawpowVK(int deviceIndex);
 
 namespace {
 
@@ -40,6 +41,7 @@ const Entry kVulkanRegistry[] = {
     {"autolykos2", &makeAutolykos2VK},
     {"sha3-256t", &makeSha3_256tVK},
     {"pearl-pow", &makePearlPowVK},
+    {"kawpow", &makeKawpowVK},
 };
 
 }  // namespace

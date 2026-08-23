@@ -454,6 +454,27 @@ struct MinerStats {
     double uptimeSeconds = 0;
     std::vector<double> history;
 
+    /// Energy since start, so efficiency can use the SAME window as
+    /// `hashrateAvg` rather than a different one.
+    ///
+    /// Time-weighted rather than a mean of samples: report intervals are
+    /// nominally uniform but not guaranteed to be, and a plain mean would
+    /// quietly weight a short interval the same as a long one.
+    double joules = 0;          ///< sum of watts x interval
+    double poweredSeconds = 0;  ///< seconds those samples cover
+
+    void addPowerSample(double watts, double seconds) {
+        if (watts > 0.0 && seconds > 0.0) {
+            joules += watts * seconds;
+            poweredSeconds += seconds;
+        }
+    }
+
+    /// Mean power over the same window `hashrateAvg` covers.
+    double avgWatts() const {
+        return poweredSeconds > 0.0 ? joules / poweredSeconds : 0.0;
+    }
+
     void pushSample(double v) {
         history.push_back(v);
         if (history.size() > 48) history.erase(history.begin());
@@ -579,7 +600,20 @@ inline void logLine(bool tty, const char *kind, const std::string &msg) {
  */
 inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     const double watts = t.valid ? t.powerMilliwatts / 1000.0 : 0.0;
-    const double eff = (watts > 1.0) ? s.hashrate / watts : 0.0;
+
+    // Efficiency is a headline number now, not a diagnostic, so both halves of
+    // it must cover the SAME window. It used to be the instantaneous rate over
+    // the instantaneous wattage while the hashrate on display beside it was the
+    // average - self-consistent, but not consistent with anything else on the
+    // line, and dividing the two printed numbers gave a third answer.
+    //
+    // The window is SINCE PROCESS START, matching hashrateAvg. That window has
+    // a property worth knowing: it includes dataset build time, during which no
+    // nonces are produced, so efficiency reads low at first and climbs for the
+    // first minutes of a run. A short A/B comparison is still fair - both arms
+    // carry the same build - but an absolute figure taken early understates.
+    const double avgW = s.avgWatts();
+    const double eff = (avgW > 1.0) ? s.hashrateAvg / avgW : 0.0;
 
     // Pearl does not hash, and it is not enough to say so. Calling a million
     // 16x16 tiles a megahash made it falsely comparable to BC3; calling them
@@ -599,7 +633,14 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
     const char *effUnit = macs ? "T MAC/W" : "MH/W";
     const double shownRate = macs ? s.hashrate * s.macsPerUnit / 1e6 : s.hashrate;
     const double shownAvg = macs ? s.hashrateAvg * s.macsPerUnit / 1e6 : s.hashrateAvg;
-    const double shownEff = (watts > 1.0) ? shownRate / watts : 0.0;
+    // Average rate over average power, both across the same window (since
+    // process start), NOT the instantaneous rate over an instantaneous
+    // sample. Efficiency is the stated optimisation target, so it is a
+    // headline number rather than a diagnostic, and the two halves have to
+    // cover the same interval. When they did not, the efficiency ratio
+    // disagreed with the throughput ratio at identical power - which is
+    // arithmetically impossible and was the tell.
+    const double shownEff = (avgW > 1.0) ? shownAvg / avgW : 0.0;
 
     if (!tty) {
         // Three things at once, on purpose.
@@ -625,13 +666,14 @@ inline void printReadout(const MinerStats &s, const GpuTelemetry &t, bool tty) {
             "\"rate\":%.2f,\"rate_avg\":%.2f,\"unit\":\"%s\","
             "\"eff\":%.3f,\"eff_unit\":\"%s\","
             "\"mhs\":%.2f,\"mhs_avg\":%.2f,\"eff_mh_w\":%.3f,"
-            "\"watts\":%.1f,\"temp_c\":%u,\"fan_pct\":%u,"
+            "\"watts\":%.1f,\"watts_avg\":%.1f,"
+            "\"temp_c\":%u,\"fan_pct\":%u,"
             "\"epoch\":%llu,\"accepted\":%llu,"
             "\"rejected\":%llu,\"nonces\":%llu%s}\n",
             s.uptimeSeconds, s.algo.c_str(), s.backend.c_str(),
             shownRate, shownAvg, rateUnit, shownEff, effUnit,
             shownRate, shownAvg, shownEff,
-            watts, t.temperatureC, t.fanPercent,
+            watts, avgW, t.temperatureC, t.fanPercent,
             (unsigned long long)s.epoch, (unsigned long long)s.accepted,
             (unsigned long long)s.rejected, (unsigned long long)s.totalNonces,
             rawField);

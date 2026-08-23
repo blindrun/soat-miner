@@ -261,6 +261,28 @@ class PearlPow : public Algorithm {
     }
 
     const char *name() const override { return "pearl-pow"; }
+    std::string launcherGlob() const override { return "mine_pearl_*"; }
+
+    /**
+     * Pearl's job does not fit `Job`'s fixed fields: a 76-byte header stub and
+     * a certificate version ride in `extra`. Benchmark mode builds a generic
+     * job and cannot know that, so `--bench --algo pearl-pow` used to reach
+     * `prepare()`, print "job carries no Pearl header" and exit — a crash on
+     * the first command most people type, invisible to CI until `--bench`
+     * entered the gate.
+     *
+     * The header contents are arbitrary here: benchmark mode has a zero target
+     * and submits nothing, so this measures the kernel and nothing else. It is
+     * deliberately NOT a real header, so a bench solution cannot be mistaken
+     * for a submittable one.
+     */
+    void fillBenchJob(Job *job) const override {
+        uint8_t header[76];
+        for (int i = 0; i < 76; i++) header[i] = (uint8_t)(0xab ^ i);
+        // Cert version 1: `beginJob` only stores it and compares it for job
+        // changes, so any consistent value works for a benchmark.
+        job->extra = packPearlExtra(header, 1);
+    }
 
     size_t memoryBytes(const Job &job) const override {
         (void)job;

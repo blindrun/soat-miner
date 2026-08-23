@@ -26,6 +26,12 @@
 
 namespace om {
 
+/// Defined in run.h, which includes this header - hence the declaration
+/// rather than the include. Inside `om`, not at global scope: a global one is
+/// a DIFFERENT type, and `using namespace om` then makes every mention
+/// ambiguous.
+struct RunOptions;
+
 /** A unit of work handed out by a node or pool. */
 struct Job {
     uint8_t msg[32] = {};      ///< header digest to hash against
@@ -116,6 +122,61 @@ class Algorithm {
 
     /** One line on what prefetch is doing, or empty if it is not running. */
     virtual std::string prefetchNote() const { return std::string(); }
+
+    /**
+     * The launcher scripts that mine this algorithm, e.g. "mine_rvn_*", or
+     * empty if it has none. Benchmark mode points the user at these.
+     *
+     * This lives here, and not as a name lookup in the run loop, because it
+     * was a name lookup in the run loop and it went wrong twice: an if-chain
+     * over algorithm names told BC3 users to go and mine Ergo, was fixed by
+     * adding a branch, and then told KawPow users the same thing.
+     *
+     * The default is DELIBERATELY empty rather than a guess. An algorithm
+     * that forgets to answer gets no script name, which reads as incomplete;
+     * defaulting to some other coin's script reads as correct and sends the
+     * user to mine the wrong chain.
+     */
+    /**
+     * Hand the algorithm the run's options, once, before mining starts.
+     *
+     * Default does nothing, deliberately: an algorithm that needs no tuning
+     * gets correct behaviour by existing rather than by someone remembering to
+     * add it to a list. The alternative - a dispatch in the caller naming each
+     * algorithm that has options - is the shape that silently stopped the
+     * share counters twice on this project.
+     *
+     * RunOptions is forward-declared because run.h includes this header; an
+     * implementation that needs the fields includes run.h itself.
+     */
+    virtual void configure(const RunOptions &) {}
+
+    /**
+     * Does this algorithm do anything with --nvrtc?
+     *
+     * Default false, so the caller can tell the difference between "enabled"
+     * and "silently ignored" without a list of algorithm names to keep in
+     * step. A new algorithm that ignores the flag is correctly reported as
+     * ignoring it, by existing.
+     */
+    virtual bool acceptsRuntimeCompilation() const { return false; }
+
+    virtual std::string launcherGlob() const { return std::string(); }
+
+    /**
+     * Fill in whatever a synthetic benchmark job needs beyond the generic
+     * fields the run loop sets (message, epoch, target).
+     *
+     * Default does nothing, which is right for every algorithm whose job fits
+     * `Job`'s fixed fields. Pearl is the exception: its 76-byte header stub and
+     * certificate version ride in `Job::extra`, so a bench job without them is
+     * refused by `prepare()` and `--bench` fails.
+     *
+     * This lives on the interface rather than as a branch in the run loop for
+     * the same reason `launcherGlob()` does: a new algorithm that needs bench
+     * setup gets it by existing, not by someone remembering to edit run.cpp.
+     */
+    virtual void fillBenchJob(Job *job) const { (void)job; }
 
     /** Release device memory. */
     virtual void release() = 0;

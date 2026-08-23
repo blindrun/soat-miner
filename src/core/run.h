@@ -39,6 +39,36 @@ class JobSource {
      * Returning false means "this source cannot tell you" - which is the
      * honest answer for solo, where the node's HTTP reply is synchronous.
      */
+    /**
+     * A one-off human-readable note about the last submission, or the last
+     * unusable job, popped so it is logged exactly once.
+     *
+     * These are on the INTERFACE rather than on each stratum class, and that
+     * is the point. The run loop used to reach them through a chain of
+     * dynamic_casts naming every source type it knew about, so adding a source
+     * and forgetting the chain left its counters reading zero for ever while
+     * the pool happily credited shares. That has now happened twice - once for
+     * BC3, once for KawPow - and a cast chain is a hand-maintained list of
+     * types, which is the same failure as a hand-maintained list of files.
+     *
+     * The defaults are empty, so a source that has nothing to say says nothing
+     * and needs no code at all.
+     */
+    /**
+     * The reason the pool REJECTED the last share, or empty. Rejection-only:
+     * the run loop prints whatever comes back as a rejection, so anything put
+     * here is a rejection by definition.
+     *
+     * It used to be called takeSubmitVerdict(), and "verdict" reads as though
+     * it carries either outcome. The KawPow client duly put "share accepted"
+     * in it, and the miner reported every accepted share as REJECTED - on a
+     * live pool, with the counters simultaneously reading 3 accepted and 0
+     * rejected. Acceptance is already reported by poolCounters(); this channel
+     * carries bad news only.
+     */
+    virtual std::string takeRejectReason() { return std::string(); }
+    virtual std::string takeJobWarning() { return std::string(); }
+
     virtual bool poolCounters(uint64_t *accepted, uint64_t *rejected,
                               uint64_t *pending, std::string *lastError) const {
         (void)accepted; (void)rejected; (void)pending; (void)lastError;
@@ -96,6 +126,14 @@ struct RunOptions {
     uint64_t batch = 1ULL << 22;
     bool bench = false;
     bool plain = false;
+    /// Compile a kernel specialised to each period at runtime (KawPow only).
+    ///
+    /// Off by default. Generating and compiling code while running is
+    /// behaviour endpoint security products react to, and whether Defender or
+    /// SmartScreen object has not been tested - an open question, not an
+    /// assumed answer. The interpreted kernel stays the default until somebody
+    /// has run this on a quarantined Windows machine.
+    bool nvrtc = false;
     uint64_t benchEpoch = 1851444;
     int reportSeconds = 5;
     std::string backendLabel;

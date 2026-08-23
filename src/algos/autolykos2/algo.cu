@@ -56,6 +56,7 @@ class Autolykos2 : public Algorithm {
     }
 
     const char *name() const override { return "autolykos2"; }
+    std::string launcherGlob() const override { return "mine_ergo_*"; }
 
     size_t memoryBytes(const Job &job) const override {
         return (size_t)calcN(job.epoch) * 32ULL;

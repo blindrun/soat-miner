@@ -6,7 +6,9 @@
 #include "bc3_destination.h"
 #include "pearl_gateway.h"
 #include "pearl_pool.h"
+#include "kawpow_address.h"
 #include "stratum_btc.h"
+#include "stratum_kawpow.h"
 #include "stratum.h"
 #include <thread>
 
@@ -151,18 +153,21 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         logLine(tty, "warn",
                 "benchmark mode: measuring hashrate only. No pool, no wallet, "
                 "no shares, no payouts.");
-        // Name the script for the algorithm actually selected. This said
-        // mine_ergo_* for every algorithm, so benchmarking BC3 told you to go
-        // and mine Ergo.
-        const char *script = "mine_ergo_*";
-        if (algo && algo->name()) {
-            if (!strcmp(algo->name(), "pearl-pow")) script = "mine_pearl_*";
-            else if (!strcmp(algo->name(), "sha3-256t")) script = "mine_bc3_*";
+        // The algorithm names its own scripts. This used to be an if-chain
+        // over algorithm names here, which told BC3 users to go and mine
+        // Ergo; that was fixed by adding a branch, and it then told KawPow
+        // users to go and mine Ergo. A list you have to remember to extend
+        // fails the same way every time it is extended.
+        const std::string script = algo ? algo->launcherGlob() : std::string();
+        if (script.empty()) {
+            logLine(tty, "info",
+                    "to actually mine, pass --pool HOST:PORT --wallet <address>");
+        } else {
+            logLine(tty, "info",
+                    "to actually mine, use a " + script +
+                        " script (edit WALLET first) or pass --pool HOST:PORT "
+                        "--wallet <address>");
         }
-        logLine(tty, "info",
-                std::string("to actually mine, use a ") + script +
-                    " script (edit WALLET first) or pass --pool HOST:PORT "
-                    "--wallet <address>");
     }
 
     algo->setPrefetch(opt.prefetch);
@@ -175,6 +180,12 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
     // parts and the miner assembles the header itself. Different protocol,
     // different JobSource - see stratum_btc.h.
     const bool isBc3 = algo && algo->name() && !strcmp(algo->name(), "sha3-256t");
+
+    // KawPow speaks its own stratum again: a share is a nonce AND a mix hash,
+    // and the job carries a block height no other algorithm here needs. See
+    // src/core/stratum_kawpow.h.
+    const bool isKawpow =
+        algo && algo->name() && !strcmp(algo->name(), "kawpow");
 
     std::unique_ptr<JobSource> source;
     uint64_t noncePrefix = 0;
@@ -203,6 +214,61 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                                        opt.worker, opt.pearlTranscript);
         source.reset(pp);
         stats.source = source->describe();
+    } else if (isKawpow) {
+        if (opt.poolHost.empty()) {
+            logLine(tty, "error",
+                    "--algo kawpow is pool-only; pass --pool HOST:PORT (e.g. "
+                    "ravencoin.herominers.com:1140).");
+            return 1;
+        }
+        // Validate before spending a connection. A Base58Check failure is a
+        // typo the user can fix; discovering it from a pool's rejection
+        // message hours later is not.
+        const RvnAddressVerdict v = rvnAddressCheck(opt.wallet);
+        if (v != RvnAddressVerdict::kOk) {
+            logLine(tty, "error", rvnAddressReason(v));
+            return 1;
+        }
+        logLine(tty, "info", "payout address: " + opt.wallet);
+        logLine(tty, "info", "connecting to " + opt.poolHost + ":" +
+                                 std::to_string(opt.poolPort) + " ...");
+        auto *ks = new KawpowStratumSource(opt.poolHost, opt.poolPort,
+                                           opt.wallet, opt.worker, opt.password);
+        std::string err;
+        if (!ks->start(&err)) {
+            logLine(tty, "error", "pool connect failed: " + err);
+            delete ks;
+            return 1;
+        }
+        source.reset(ks);
+        stats.source = source->describe();
+
+        bool gotJob = false;
+        for (int i = 0; i < 200; i++) {
+            Job probe;
+            if (ks->fetch(&probe)) { gotJob = true; break; }
+            if (ks->loginRejected()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (ks->loginRejected()) {
+            logLine(tty, "error", "pool REJECTED the login: " + ks->loginError());
+            logLine(tty, "error",
+                    "the address passed its checksum, so this is the pool's "
+                    "own rule - check the port is a KawPow port for this coin.");
+            return 1;
+        }
+        const std::string jw = ks->takeJobWarning();
+        if (!jw.empty()) logLine(tty, "warn", jw);
+        if (!gotJob) {
+            logLine(tty, "error",
+                    "connected to the pool but it sent no usable job in 20s. "
+                    "The socket is open, so this is not a firewall - the port "
+                    "may be for a different algorithm, or its notify is a "
+                    "shape this miner does not accept.");
+            return 1;
+        }
+        noncePrefix = ks->noncePrefix();
+        nonceBits = ks->nonceBitsOwned();
     } else if (isBc3) {
         // BitcoinIII to a pool. There is no solo path yet: solo would mean
         // getblocktemplate against a bitcoinIII node and assembling the
@@ -469,6 +535,10 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     "exercising the proof recheck. Nothing is submitted.");
         }
         job.valid = true;
+        // Anything this algorithm needs beyond the generic fields. Pearl's
+        // header stub lives in `extra`, and without this `--bench --algo
+        // pearl-pow` printed one line and exited.
+        algo->fillBenchJob(&job);
     }
 
     auto tEpoch = tStart;
@@ -684,28 +754,31 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
         // this a miner that is being refused every share looks identical to
         // one that is being paid for every share.
         //
-        // Both stratum sources are handled here. BitcoinStratumSource is a
-        // JobSource, not a StratumSource, so the single cast this used to do
-        // returned null for BC3: the pool accepted 367 shares in a minute and
-        // the readout sat at "accepted 0, rejected 0" the whole time, which is
-        // the exact confusion the paragraph above exists to prevent.
-        {
-            auto drain = [&](auto *src) {
-                if (!src) return false;
-                const std::string v = src->takeSubmitVerdict();
-                if (!v.empty())
-                    logLine(tty, "error", "pool REJECTED the share: " + v);
-                const std::string jw = src->takeJobWarning();
-                if (!jw.empty()) logLine(tty, "warn", jw);
-                uint64_t a = 0, r = 0, p = 0;
-                std::string le;
-                src->poolCounters(&a, &r, &p, &le);
+        // Straight through the JobSource interface, no casts. This used to be
+        // a dynamic_cast chain naming each stratum type, and adding a type
+        // without extending the chain left its counters at zero while the pool
+        // credited shares - which happened for BC3 (367 shares, readout said
+        // zero) and then again for KawPow (263 shares, readout said zero). A
+        // cast chain is a hand-maintained list of types; the interface is not.
+        // Guarded because benchmark mode has no JobSource at all: `source` is
+        // a unique_ptr that is simply never assigned. The dynamic_cast chain
+        // this block replaced was null-safe by accident - casting a null
+        // pointer yields null and the old code tested it - so removing the
+        // chain removed a guard nobody had written down. Bench mode segfaulted
+        // on the first stats interval, and the pool path masked it because
+        // that was the only path retested after the change.
+        if (source) {
+            const std::string v = source->takeRejectReason();
+            if (!v.empty())
+                logLine(tty, "error", "pool REJECTED the share: " + v);
+            const std::string jw = source->takeJobWarning();
+            if (!jw.empty()) logLine(tty, "warn", jw);
+            uint64_t a = 0, r = 0, p = 0;
+            std::string le;
+            if (source->poolCounters(&a, &r, &p, &le)) {
                 stats.accepted = a;
                 stats.rejected = hostRejected + r;
-                return true;
-            };
-            if (!drain(dynamic_cast<StratumSource *>(source.get())))
-                drain(dynamic_cast<BitcoinStratumSource *>(source.get()));
+            }
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -719,7 +792,12 @@ int runMiner(Algorithm *algo, const RunOptions &opt, const char *gpuName,
                     : 0.0;
             stats.epoch = job.epoch;
             stats.pushSample(stats.hashrate);
-            printReadout(stats, gpu.sample(), tty);
+            // Sampled ONCE and reused: calling gpu.sample() twice would
+            // accumulate one reading and display a different one.
+            const GpuTelemetry sample = gpu.sample();
+            if (sample.valid)
+                stats.addPowerSample(sample.powerMilliwatts / 1000.0, el);
+            printReadout(stats, sample, tty);
             intervalHashes = 0;
             tReport = now;
         }

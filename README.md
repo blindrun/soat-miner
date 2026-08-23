@@ -580,6 +580,84 @@ outside contributor mining into a live pool to find it. That is why the check
 is there, and it is why I am comfortable asking you to try this on a card I
 have never tested.
 
+## Ravencoin / KawPow (testing)
+
+Mines Ravencoin on NVIDIA via CUDA and on AMD via Vulkan. KawPow is ProgPoW
+0.9.4 over an Ethash dataset, so one algorithm covers eleven coins, and
+Ravencoin is the largest of them.
+
+Call this testing, and mean it more than for the others. The algorithm is
+pinned to Ravencoin's own thirteen published hash vectors and to real mainnet
+block 4,501,000 - header, mix hash, proof-of-work hash and target - reproduced
+on the host, on CUDA, and on Vulkan at the full 6.11 GB dataset. The stratum
+client is covered by twenty-two offline protocol checks built from replies
+captured off live pools. **But no share from this miner has been accepted by
+any KawPow pool yet**, so the first person to run it is testing it.
+
+### It needs a lot of memory, and that grows
+
+Ravencoin's dataset is **6.11 GB today** and gains about 8 MB every five days.
+A card with less than roughly 7 GB free cannot mine it at all, and the miner
+says so and stops rather than starting and failing later. Rebuilding the
+dataset when the epoch turns - about every five days - takes 11 seconds on a
+4090 and 25 on the Vulkan path, during which hashing pauses.
+
+### Speeds, and why the launcher picks CUDA on NVIDIA
+
+| card | backend | rate | power |
+|---|---|---|---|
+| RTX 4090 | CUDA | 11.9 MH/s | |
+| RTX 5080 | CUDA | 7.4 MH/s | 360 W |
+| RX 7900 XT | Vulkan | **34.0 MH/s** | 290 W |
+| RTX 5080 | Vulkan | 4.3 MH/s | 100 W |
+| RTX 4090 | Vulkan | 1.7 MH/s | 118 W |
+
+Two things in that table need saying plainly.
+
+**NVIDIA's Vulkan driver falls off a cliff on this algorithm** once the
+randomly-read working set passes roughly 3 GB, which Ravencoin's dataset is
+well past. The shader is not the problem - with the dataset read removed it
+runs at 113 MH/s, faster than the CUDA kernel - and AMD's driver does not do it
+at all. So the launcher picks CUDA on NVIDIA, including on RTX 50-series where
+it otherwise prefers Vulkan. You do not have to do anything; it just does it.
+
+**The CUDA numbers are about a fifth of what this card should do.** The random
+program that makes ProgPoW ASIC-resistant is interpreted here rather than
+compiled into the kernel, which keeps one implementation serving both backends
+and costs 5x - the same kernel with the program compiled in measures 60.3 MH/s
+on a 4090. Fixing that properly is the next piece of work on this algorithm.
+Until then, if you are on NVIDIA and want Ravencoin today, other miners are
+faster. AMD is competitive as it stands.
+
+### Mine it
+
+Open mine_rvn_herominers.sh in a text editor.
+Change WALLET to your own Ravencoin address, the one starting with R.
+Save it.
+Run it with command ./mine_rvn_herominers.sh
+
+If you would rather type it out, it is command ./soat-miner --algo kawpow --pool ravencoin.herominers.com:1140 --wallet RyourravencoinaddresshERE
+
+The address is checked properly before anything connects - a real Base58Check
+decode, not a shape test - because the mistake that costs you a day is two
+transposed characters in an address you copied by hand. That is still 34
+characters and still starts with R, and it pays nobody.
+
+### Which pools
+
+`mine_rvn_herominers.sh` and `mine_rvn_ravenminer.sh` ship because those
+endpoints were verified to answer and to speak a protocol this miner
+implements. Two more answer and are deliberately not shipped yet: suprnova
+replies in a shape this client does not handle, and 2miners replies in a shape
+nobody documents - the miner will warn loudly rather than guess quietly if you
+point it there by hand.
+
+`tools/probe-stratum.py` is how that was established, and it found something
+worth knowing if you are adding a pool: **the protocol flavour belongs to the
+port, not the pool.** HeroMiners answers differently on 1140 and 1150,
+reproducibly. The miner detects which from the subscribe reply, so both work,
+but you cannot infer one from the other.
+
 ## Bitcoin III (testing)
 
 Mines Bitcoin III on NVIDIA via CUDA and on AMD, Intel and NVIDIA via Vulkan.

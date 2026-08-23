@@ -79,6 +79,19 @@ fi
 # is a measurement and it is true for BC3 (4090: CUDA 1543 MH/s, Vulkan 1086).
 # It is NOT measured for Pearl, and printing it there would state a number
 # nobody has taken.
+#
+# KawPow is measured, and it is not a small margin. NVIDIA's Vulkan
+# driver falls off a cliff once the randomly-touched working set passes roughly
+# 3 GB, and Ravencoin's DAG is 6.11 GB and growing about 8 MB every five days:
+#
+#   RTX 5080   Vulkan  4.29 MH/s at 100 W    CUDA  7.38 MH/s at 360 W
+#   RTX 4090   Vulkan  1.68 MH/s at 118 W    CUDA 11.9  MH/s
+#   RX 7900XT  Vulkan 34.0  MH/s at 290 W    (AMD is unaffected and fine)
+#
+# The 100 W on a 5080 is the tell: stalled, not working. This is an NVIDIA
+# driver property, not a shader problem - the same shader beats CUDA when the
+# working set fits - so KawPow keeps its Vulkan backend for AMD and simply must
+# not be auto-selected onto it on NVIDIA, Blackwell included.
 PREFERS_CUDA_ON_NVIDIA=""
 PREFERS_CUDA_WHY=""
 for a in "$@" "${ALGO:-}"; do
@@ -86,6 +99,9 @@ for a in "$@" "${ALGO:-}"; do
     sha3-256t)
       PREFERS_CUDA_ON_NVIDIA="BC3"
       PREFERS_CUDA_WHY="it beats Vulkan here" ;;
+    kawpow)
+      PREFERS_CUDA_ON_NVIDIA="KawPow"
+      PREFERS_CUDA_WHY="NVIDIA's Vulkan driver stalls past a ~3 GB working set" ;;
     # Pearl on NVIDIA stays on CUDA. Not from a measurement - there is no
     # Vulkan Pearl throughput number yet - but from what the two paths are:
     # the CUDA one tunes its shape and tile configuration per card at startup
@@ -97,22 +113,55 @@ for a in "$@" "${ALGO:-}"; do
       PREFERS_CUDA_WHY="its shape tuner has no Vulkan equivalent yet" ;;
   esac
 done
-if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" && -x ./soat-miner ]]; then
+if [[ -n "$PREFERS_CUDA_ON_NVIDIA" && "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    BACKEND=cuda
-    echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, $PREFERS_CUDA_WHY"
+    if [[ -x ./soat-miner ]]; then
+      BACKEND=cuda
+      echo "auto: $PREFERS_CUDA_ON_NVIDIA on NVIDIA - CUDA, $PREFERS_CUDA_WHY"
+    else
+      # Without this the Blackwell rule below quietly picks Vulkan and the user
+      # mines at roughly half speed with nothing said. Declining to force CUDA
+      # when the binary is absent is right; doing it silently is not.
+      echo "warning: $PREFERS_CUDA_ON_NVIDIA is much faster on CUDA on this GPU,"
+      echo "         but ./soat-miner is not in this directory. Continuing on"
+      echo "         Vulkan, which is the SLOW path for it - get the full archive."
+    fi
   fi
 fi
 
 if [[ "$BACKEND" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    # Largest VRAM wins, which is the same rule the binaries use to pick a
-    # device - so the launcher and the miner agree which GPU this is about.
-    cap=$(nvidia-smi --query-gpu=memory.total,compute_cap \
-            --format=csv,noheader,nounits 2>/dev/null |
-          sort -t, -k1 -n | tail -1 | cut -d, -f2 | tr -d '[:space:]')
+    # This used to say largest VRAM wins, "the same rule the binaries use", and
+    # that was not true. The Vulkan build defaults to the largest-VRAM device;
+    # the CUDA build defaults to device 0. On a rig where those are different
+    # cards of different generations, the launcher read one card's capability
+    # and the miner then ran on the other - silently, and looking fine.
+    #
+    # Passing --device to force agreement is NOT the fix and must not be added
+    # later: nvidia-smi enumerates by PCI bus order while CUDA defaults to
+    # fastest-first, so an index handed across that boundary can name a
+    # different card again. Vulkan enumerates in its own order on top of that.
+    #
+    # So: only decide automatically when every NVIDIA GPU present reports the
+    # same capability, which is every single-GPU machine and every homogeneous
+    # rig. When they differ the automatic answer is not well defined, and the
+    # honest move is to say so and take the backend that works on all of them.
+    caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits \
+             2>/dev/null | tr -d '[:blank:]' | grep . | sort -u)
+    ncaps=$(printf '%s\n' "$caps" | grep -c . || true)
+    cap=$(printf '%s\n' "$caps" | head -1)
     major="${cap%%.*}"
-    if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )); then
+
+    if [[ "$ncaps" =~ ^[0-9]+$ ]] && (( ncaps > 1 )); then
+      BACKEND=cuda
+      echo "warning: this machine has NVIDIA GPUs of different compute"
+      echo "         capabilities ($(printf '%s' "$caps" | tr '\n' ' '))."
+      echo "         The CUDA build would mine on device 0 and the Vulkan"
+      echo "         build on the largest-VRAM card, which may not be the"
+      echo "         same GPU, so the automatic backend is not well defined."
+      echo "         Using CUDA, which is correct on all of them. Set"
+      echo "         BACKEND= and DEVICE= in config.txt to choose properly."
+    elif [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )); then
       BACKEND=vulkan
       echo "auto: compute capability $cap (Blackwell) - Vulkan, ~22% faster than CUDA here"
     else
@@ -155,13 +204,20 @@ elif [[ -n "${POOL:-}" ]]; then
   case "${ALGO:-autolykos2}" in
     pearl-pow) COIN="Pearl";       PLACEHOLDER="prl1YOUR_PEARL_ADDRESS_HERE"; SCRIPTS="mine_pearl_*.sh" ;;
     sha3-256t) COIN="Bitcoin III"; PLACEHOLDER="YOUR_BC3_ADDRESS_HERE";       SCRIPTS="mine_bc3_*.sh" ;;
+    kawpow)    COIN="Ravencoin";   PLACEHOLDER="RYOUR_RAVENCOIN_ADDRESS_HERE"; SCRIPTS="mine_rvn_*.sh" ;;
     *)         COIN="Ergo";        PLACEHOLDER="9YOUR_ERGO_ADDRESS_HERE";     SCRIPTS="mine_ergo_*.sh" ;;
   esac
   # Any coin's placeholder, not just this coin's. Switching ALGO and forgetting
   # to switch WALLET leaves the previous coin's placeholder sitting there, and
   # testing only the current one let that through to a confusing pool error.
+  #
+  # Matched by SHAPE, not by listing them. The list version needed every new
+  # coin added here as well as above, and a coin whose placeholder was
+  # forgotten would be caught only when it was the coin being mined - which
+  # is the one case that was already covered. No real address contains an
+  # underscore, so this cannot reject one.
   case "$WALLET" in
-    9YOUR_ERGO_ADDRESS_HERE|prl1YOUR_PEARL_ADDRESS_HERE|YOUR_BC3_ADDRESS_HERE) WALLET="" ;;
+    *YOUR_*ADDRESS_HERE) WALLET="" ;;
   esac
   if [[ -z "${WALLET:-}" || "$WALLET" == "$PLACEHOLDER" ]]; then
     echo "Set WALLET in config.txt to your $COIN address before pool mining."

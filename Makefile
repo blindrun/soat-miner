@@ -82,10 +82,15 @@ CXXFLAGS = -O3 --std=c++17 -Isrc -MMD -MP
 # PTX, which the driver JITs onto newer cards - that is what lets a build from
 # CUDA 12.4 (max sm_90) run on Blackwell at all. Measured: identical hashrate
 # (217.6 vs 217.5 MH/s on a 4090) and the same ~60 s build.
+PROGPOW_DEPS = src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+               src/algos/progpow/progpow.h
+
 CUDA_SRC  = src/core/miner.cu src/core/registry.cu src/algos/autolykos2/algo.cu \
-            src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu
+            src/algos/pearl-pow/algo.cu src/algos/sha3-256t/algo.cu \
+            src/algos/kawpow/algo.cu
 CUDA_SRC_CPP = src/core/run.cpp src/core/stratum.cpp \
-               src/core/stratum_btc.cpp
+               src/core/stratum_btc.cpp src/core/stratum_kawpow.cpp \
+               $(BUILD)/nvrtc_embed.cpp
 CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h \
             src/core/stratum.h src/core/blake2b.cuh \
             src/core/pearl_pool.h \
@@ -95,7 +100,14 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
             src/algos/autolykos2/mine.cuh src/algos/autolykos2/autolykos.cuh \
             src/algos/sha3-256t/sha3.h src/algos/sha3-256t/mine.cuh \
             src/algos/pearl-pow/job.h src/algos/pearl-pow/noisy_gemm.cuh \
-            src/algos/pearl-pow/blake3.cuh src/algos/pearl-pow/prepare.cuh
+            src/algos/pearl-pow/blake3.cuh src/algos/pearl-pow/prepare.cuh \
+            src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+            src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
+            src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+            src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
+            src/core/kawpow_address.h \
+            src/algos/kawpow/nvrtc_jit.h src/algos/kawpow/nvrtc_source.h \
+            src/algos/kawpow/nvrtc_headers.h
 
 # The Vulkan build carries one object per algorithm plus its embedded SPIR-V
 # module, and vk_common.o holds the registry and the shared device handling.
@@ -106,19 +118,20 @@ CUDA_DEPS = src/core/algo.h src/core/http.h src/core/run.h src/core/telemetry.h 
 #
 # This is structural, not tidiness. The Windows cross-build used to carry a
 # hand-written list of the same files, and adding an algorithm kept forgetting
-# it: BC3 broke the mingw link with an undefined BitcoinStratumSource, and the
-# next algorithm broke it again the same way, in a session where the comment
-# warning about the first was directly above the target. Both times the Linux
-# build was perfectly happy, so nothing caught it until someone ran the
-# cross-build by hand. Deriving both from one list is what makes a third
-# occurrence impossible rather than merely documented.
+# it: BC3 broke the mingw link with an undefined BitcoinStratumSource, and
+# KawPow broke it again with makeKawpowVK and KawpowStratumSource, in a
+# session where the comment warning about the first was directly above the
+# target. Both times the Linux build was perfectly happy, so nothing caught
+# it until someone ran the cross-build by hand. Deriving both from one list
+# is what makes a third occurrence impossible rather than merely documented.
 #
 # Adding a Vulkan algorithm is now: add its algo_vk.cpp to VK_SRC_ALGO, its
 # generated SPIR-V to VK_SRC_GEN, and any new core source to VK_SRC_CORE. Both
 # platforms pick it up.
 VK_SRC_CORE = src/core/vk_common.cpp src/core/vk_registry.cpp \
               src/core/miner_vk.cpp src/core/run.cpp \
-              src/core/stratum.cpp src/core/stratum_btc.cpp
+              src/core/stratum.cpp src/core/stratum_btc.cpp \
+              src/core/stratum_kawpow.cpp
 # Every algorithm that has a Vulkan backend, found rather than listed. A list
 # is the thing that drifted twice; a wildcard cannot.
 VK_SRC_ALGO = $(wildcard src/algos/*/algo_vk.cpp)
@@ -152,8 +165,12 @@ VK_OBJS  = $(patsubst %.cpp,$(BUILD)/lin/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(BUILD)/lin/gen/%.o,$(VK_SRC_GEN))
 
 .PHONY: all cuda vulkan clean test test-pearl test-telemetry test-pearl-pool \
-        test-pearl-cli test-pearl-e2e test-pearl-parity test-claim-guard test-ergo-pools test-btc-stratum test-bc3-destination \
+        test-pearl-cli test-pearl-e2e test-pearl-parity test-claim-guard \
+        test-ergo-pools test-btc-stratum test-bc3-destination \
         test-bc3-host test-bc3-cmake test-bc3-device test-bc3-vulkan \
+        test-nvrtc test-nvrtc-device test-nvrtc-precompile test-device \
+        test-kawpow test-kawpow-device test-kawpow-vulkan \
+        test-kawpow-vulkan-real \
         bench install dirs package
 
 all: cuda vulkan
@@ -215,6 +232,34 @@ $(BUILD)/lin/gen/%.o: $(BUILD)/%.cpp | dirs
 $(BIN_VK): $(VK_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -lvulkan -ldl -lpthread -o $@
 
+# --- does everything still LINK? -------------------------------------------
+# Builds every test binary and both platform binaries without running any of
+# them. No GPU, no pool, no network.
+#
+# This exists because three bugs in one day were the same shape: a target
+# nobody builds. The Windows cross-build broke twice, once for BC3 and once for
+# the next algorithm, and three test targets that link individual objects were
+# left naming object paths that no longer existed. None of it was visible to
+# `make cuda`, `make vulkan` or the offline test gate, because those targets
+# link a different set of objects. Each was found by someone running a target
+# by hand, which is not a system.
+#
+# Run this after any change to the build, to a shared header, or to anything
+# that adds or renames a source. It is the cheapest thing that catches
+# link-level drift across the whole tree.
+TEST_BINARIES = $(shell grep -oE '^tests/[a-z0-9_]+:' $(firstword $(MAKEFILE_LIST)) \
+                  | tr -d ':' | sort -u)
+
+.PHONY: build-tests
+build-tests: cuda vulkan $(TEST_BINARIES)
+	@echo "all $(words $(TEST_BINARIES)) test binaries and both platform binaries link"
+
+# The Windows cross-build is separate because it needs mingw, which a GPU box
+# may not have. Run it too when you have the toolchain - it is the target with
+# the worst track record in this file.
+.PHONY: build-all
+build-all: build-tests windows
+
 # --- correctness gates -----------------------------------------------------
 # test_hit is the one that matters: it rebuilds the real dataset and
 # reproduces a real mainnet block's hit from that block's winning nonce.
@@ -233,7 +278,7 @@ PEARL_VEC  = $(BUILD)/pearl_vectors.bin
 PEARL_VEC64 = $(BUILD)/pearl_vectors_r64.bin
 PEARL_JOBVEC = $(BUILD)/pearl_job_vectors.bin
 
-test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-pearl
+test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-pearl test-nvrtc
 	@echo "--- python reference vs real mainnet blocks ---"
 	@python3 tests/reference.py
 	@echo "--- device dataset elements vs python reference ---"
@@ -246,6 +291,232 @@ test: tests/test_element tests/test_hit tests/test_algo tests/test_vulkan test-p
 	@python3 tests/test_lithos.py
 	@echo "--- vulkan backend against the same pinned vector ---"
 	@./tests/test_vulkan $(HIT_MSG) $(HIT_HEIGHT) $(HIT_NONCE) $(HIT_EXPECT)
+
+# --- kawpow gates ---------------------------------------------------------
+# The host reference is the anchor for everything else in this algorithm: the
+# CUDA and Vulkan kernels are checked against it, so it is checked against
+# Ravencoin's own published vectors first.
+#
+# The mutants matter as much as the vectors. Four constants, each of which
+# produces a miner that runs at full speed and has every share rejected, are
+# overridable at compile time; each broken build must fail the same test. A
+# gate nobody has watched fail is not a gate.
+KAWPOW_MUTANTS = KAWPOW_PERIOD_LENGTH=50 KAWPOW_EPOCH_LENGTH=30000 \
+                 KAWPOW_RAVEN_TAIL=0 KAWPOW_KECCAK_PAD=0x06u
+
+# A real Ravencoin mainnet block, at a height whose DAG is the 6.1 GB one a
+# miner actually builds today. Regenerate with:
+#   python3 tests/kawpow_block.py <height>
+KAWPOW_BLK_HEADER = 8dc2a5086848cb872bb610d1a06294e3c41196bb04b041c8fe84da0153ba5db7
+KAWPOW_BLK_HEIGHT = 4501000
+KAWPOW_BLK_NONCE  = 329dd53ca526c2cd
+KAWPOW_BLK_MIX    = 7b1e003a71d7bf9f81d95c0c68126f72876de28b69b175c84e4c11234ad5d7c7
+KAWPOW_BLK_HASH   = 000000000001a5a2da8a4a4e8867948fd5958d98dc61521ea5f9906bf4b9e7b5
+KAWPOW_BLK_BITS   = 1b06292b
+
+
+tests/test_kawpow_hash: tests/test_kawpow_hash.cpp src/algos/kawpow/kawpow.h \
+                        $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_kawpow_block: tests/test_kawpow_block.cpp src/algos/kawpow/kawpow.h \
+                         $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# --- runtime kernel generation (NVRTC) ------------------------------------
+#
+# The header list lives in THIS RULE, so the Makefile itself is a prerequisite:
+# a generated artifact must depend on whatever determines its content, not just
+# on its inputs' timestamps. Adding a header here without that dependency would
+# reuse a stale embed and compile against a header set nobody asked for - the
+# same shape as the mingw import library that was silently reused after its
+# source list changed.
+NVRTC_HDRS = keccak.h=src/algos/progpow/keccak.h \
+             ethash.h=src/algos/progpow/ethash.h \
+             progpow.h=src/algos/progpow/progpow.h \
+             kawpow.h=src/algos/kawpow/kawpow.h \
+             progpow_mine.cuh=src/algos/progpow/mine.cuh \
+             kawpow_mine.cuh=src/algos/kawpow/mine.cuh
+
+$(BUILD)/nvrtc_embed.cpp: scripts/embed_headers.py Makefile \
+                          src/algos/progpow/keccak.h \
+                          src/algos/progpow/ethash.h \
+                          src/algos/progpow/progpow.h \
+                          src/algos/kawpow/kawpow.h \
+                          src/algos/progpow/mine.cuh \
+                          src/algos/kawpow/mine.cuh | dirs
+	@python3 scripts/embed_headers.py $@ $(NVRTC_HDRS)
+
+tests/test_nvrtc: tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
+                  src/algos/kawpow/nvrtc_source.h \
+                  src/algos/kawpow/nvrtc_headers.h $(PROGPOW_DEPS)
+	$(NVCC) -O2 -Isrc tests/test_nvrtc.cpp $(BUILD)/nvrtc_embed.cpp \
+		-lnvrtc -o $@
+
+tests/test_nvrtc_device: tests/test_nvrtc_device.cu $(BUILD)/nvrtc_embed.cpp \
+                        src/algos/kawpow/nvrtc_jit.h \
+                        src/algos/kawpow/nvrtc_source.h \
+                        src/algos/kawpow/mine.cuh $(PROGPOW_DEPS)
+	$(NVCC) $(NVFLAGS) -Isrc tests/test_nvrtc_device.cu \
+		$(BUILD)/nvrtc_embed.cpp -o $@
+
+# Runs BOTH directions. The forward check alone cannot tell a faithful kernel
+# from a comparison that never fails, so the mutation case - a kernel compiled
+# for the wrong period - has to be caught for the forward pass to mean anything.
+.PHONY: test-nvrtc-precompile
+# The only gate that runs the miner with --nvrtc. Everything else exercises
+# NvrtcJit directly or never enables it, so without this the whole runtime
+# compilation path could be deleted and the suite would stay green.
+test-nvrtc-precompile: cuda
+	@echo "--- nvrtc: the async precompile runs, and lands in time ---"
+	@sh tests/test_nvrtc_precompile.sh ./soat-miner
+
+.PHONY: test-nvrtc-device
+test-nvrtc-device: tests/test_nvrtc_device
+	@echo "--- nvrtc: generated kernel vs interpreted, on a real card ---"
+	@./tests/test_nvrtc_device $(KAWPOW_BLK_HEIGHT)
+	@echo "--- nvrtc: and the comparison itself is not vacuous ---"
+	@./tests/test_nvrtc_device $(KAWPOW_BLK_HEIGHT) --mutate
+
+.PHONY: test-nvrtc
+test-nvrtc: tests/test_nvrtc
+	@echo "--- nvrtc: the runtime-compilation chain, offline ---"
+	@./tests/test_nvrtc
+
+tests/test_kawpow_device: tests/test_kawpow_device.cu \
+                          src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+                          src/algos/progpow/mine.cuh $(PROGPOW_DEPS)
+	$(NVCC) $(NVFLAGS) -Isrc $< -o $@
+
+# The device gate needs a card and enough VRAM for the real 6.1 GB DAG, so it
+# is its own target rather than part of test-kawpow, which must pass on a build
+# machine with no GPU at all. It skips itself politely on a small card.
+# Every gate that needs a real GPU, in one place.
+#
+# These were reachable only by typing their exact names, which meant nobody ran
+# them and a segfault in `--bench` - the first command most people type - stayed
+# invisible while the offline gate reported 119 checks passing. A gate nobody
+# invokes is not a gate.
+test-device: test-bench-runs test-kawpow-device test-nvrtc-device test-nvrtc-precompile
+	@echo "device gates: all passed"
+
+test-bench-runs: cuda
+	@echo "--- bench mode starts and reports, on every algorithm ---"
+	@sh tests/test_bench_runs.sh ./soat-miner
+
+test-kawpow-device: tests/test_kawpow_device test-bench-runs
+	@echo "--- kawpow: CUDA kernels vs the host reference, on a real DAG ---"
+	@./tests/test_kawpow_device $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
+		$(KAWPOW_BLK_BITS) 8
+
+tests/test_kawpow_vulkan: tests/test_kawpow_vulkan.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -lvulkan -o $@
+
+# The whole path, against a mock pool built from replies captured off live
+# pools: binary, run loop, job parsing, dataset build, search, verify, submit.
+# Needs a GPU; uses height 100 so the dataset is ~1 GB rather than 6.11.
+#
+# This is the one that found the counter bug: 263 shares submitted and the
+# readout stuck at "accepted 0", because the run loop reached the counters
+# through a dynamic_cast chain that did not name KawPow's source.
+.PHONY: test-kawpow-pool
+test-kawpow-pool: cuda
+	@echo "--- kawpow: the real binary against a mock pool, end to end ---"
+	@python3 tests/test_kawpow_pool.py ./soat-miner
+
+# Needs a Vulkan GPU, so it is its own target like the CUDA device gate. It
+# skips itself politely when there is no usable device.
+test-kawpow-vulkan: tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
+                    $(BUILD)/kawpow_spec.spv
+	@echo "--- kawpow: the Vulkan DAG and mix shaders vs the host reference ---"
+	@./tests/test_kawpow_vulkan $(BUILD)/dag.spv $(BUILD)/kawpow.spv \
+		$(BUILD)/kawpow_spec.spv
+
+# The Vulkan backend at the geometry the miner really uses - a 6.11 GB DAG in
+# 2 GiB device-local buffers - rather than the harness's 16 MB. Needs ~7 GB of
+# VRAM; skips politely without it.
+VK_T_KAWPOW = $(call vkobj,src/algos/kawpow/algo_vk.cpp) \
+              $(call vkgen,spirv_kawpow) $(call vkgen,spirv_kawpow_spec) \
+              $(call vkgen,spirv_dag) $(call vkobj,src/core/vk_common.cpp)
+
+tests/test_kawpow_vk_real: tests/test_kawpow_vk_real.cpp $(VK_T_KAWPOW) \
+                           src/algos/kawpow/kawpow.h src/algos/kawpow/job.h
+	$(CXX) $(CXXFLAGS) $< $(VK_T_KAWPOW) -lvulkan -lpthread -o $@
+
+test-kawpow-vulkan-real: tests/test_kawpow_vk_real
+	@echo "--- kawpow: Vulkan at the real 6.11 GB geometry, vs a mainnet block ---"
+	@./tests/test_kawpow_vk_real $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_BITS)
+
+tests/test_progpow_stock: tests/test_progpow_stock.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_progpow_ops: tests/test_progpow_ops.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_progpow_092: tests/test_progpow_092.cpp $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+tests/test_kawpow_stratum: tests/test_kawpow_stratum.cpp \
+                           src/core/stratum_kawpow.cpp \
+                           src/core/stratum_kawpow.h src/core/json_lite.h \
+                           src/algos/kawpow/kawpow.h src/algos/kawpow/job.h \
+                           $(PROGPOW_DEPS)
+	$(CXX) $(CXXFLAGS) $< src/core/stratum_kawpow.cpp -lpthread -o $@
+
+tests/test_kawpow_address: tests/test_kawpow_address.cpp src/core/kawpow_address.h \
+                        src/core/sha256.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# test_algo_registry compares the binaries against the launcher, so both
+# binaries have to exist for it to say anything.
+# NOTE: this gate needs no GPU and therefore does NOT run the device gates.
+# It ends by saying so - see the last line of the recipe. An offline gate that
+# reports success without naming what it skipped is how "the tests pass" came
+# to mean less than it sounded.
+test-kawpow: cuda vulkan tests/test_kawpow_hash tests/test_kawpow_block \
+             tests/test_progpow_stock tests/test_progpow_ops \
+             tests/test_progpow_092 \
+             tests/test_kawpow_stratum tests/test_kawpow_address | dirs
+	@echo "--- kawpow: host reference vs Ravencoin's 13 published vectors ---"
+	@./tests/test_kawpow_hash
+	@echo "--- kawpow: four deliberately broken builds, each must fail it ---"
+	@for m in $(KAWPOW_MUTANTS); do \
+		$(CXX) $(CXXFLAGS) -D$$m tests/test_kawpow_hash.cpp \
+		  -o $(BUILD)/mutant_kawpow || exit 1; \
+		printf '  %-26s ' "$$m"; \
+		$(BUILD)/mutant_kawpow --expect-fail || exit 1; \
+	done
+	@echo "--- kawpow: end to end against a real Ravencoin mainnet block ---"
+	@./tests/test_kawpow_block $(KAWPOW_BLK_HEADER) $(KAWPOW_BLK_HEIGHT) \
+		$(KAWPOW_BLK_NONCE) $(KAWPOW_BLK_MIX) $(KAWPOW_BLK_HASH) \
+		$(KAWPOW_BLK_BITS)
+	@echo "--- progpow family: every operation, named, both revisions ---"
+	@./tests/test_progpow_ops
+	@echo "--- progpow family: the shared layer vs stock ProgPoW's vectors ---"
+	@./tests/test_progpow_stock
+	@echo "--- progpow family: and those vectors discriminate the parameters ---"
+	@for m in "--period 3" "--period 50" "--math092" "--ops 12 20"; do \
+		printf '  %-14s ' "$$m"; \
+		./tests/test_progpow_stock $$m --expect-fail || exit 1; \
+	done
+	@echo "--- progpow 0.9.2: the layers ProgPowZ needs, vs published vectors ---"
+	@./tests/test_progpow_092
+	@echo "--- kawpow: stratum, against shapes captured from live pools ---"
+	@./tests/test_kawpow_stratum
+	@echo "--- kawpow: Ravencoin address validation ---"
+	@./tests/test_kawpow_address
+	@echo "--- launcher: which backend each algorithm actually gets ---"
+	@./tests/test_launcher_backend.sh
+	@echo "--- registries: do the four lists describing an algorithm agree? ---"
+	@./tests/test_algo_registry.sh
+	@echo ""
+	@echo "NOT RUN by this gate, because they need a real GPU:"
+	@echo "  device kernels vs the host reference, and --bench on every algorithm."
+	@echo "  Run them with:  make test-device"
+	@echo "  A crash in --bench was invisible to CI until 2026-08-21 because"
+	@echo "  nothing here said it had not been checked."
 
 # --- pearl-pow gates ------------------------------------------------------
 # Split out because Pearl needs its own vectors emitted first, and because the
@@ -443,7 +714,12 @@ tests/test_hit: tests/test_hit.cu src/algos/autolykos2/mine.cuh src/core/blake2b
 
 tests/test_sha3_algo: tests/test_sha3_algo.cu tests/sha3_vectors.h \
                       src/algos/sha3-256t/algo.cu \
-                      src/algos/sha3-256t/mine.cuh src/algos/sha3-256t/sha3.h \
+                      src/algos/sha3-256t/mine.cuh \
+            src/algos/kawpow/mine.cuh src/algos/kawpow/kawpow.h \
+            src/algos/kawpow/job.h src/algos/progpow/mine.cuh \
+            src/algos/progpow/keccak.h src/algos/progpow/ethash.h \
+            src/algos/progpow/progpow.h src/core/stratum_kawpow.h \
+            src/core/kawpow_address.h src/algos/sha3-256t/sha3.h \
                       src/core/algo.h src/core/btc_job.h
 	$(NVCC) $(NVFLAGS) -Isrc $< src/algos/sha3-256t/algo.cu -o $@
 
@@ -542,10 +818,19 @@ $(WINDIR)/libvulkan-1.a: $(VK_SRC) | $(WINDIR)/include/vulkan
 	   | sed 's/^/    /'; } > $(WINDIR)/vulkan-1.def
 	x86_64-w64-mingw32-dlltool -d $(WINDIR)/vulkan-1.def -l $@
 
-# stratum_btc.cpp is here because run.cpp references BitcoinStratumSource
-# unconditionally. The Linux Vulkan target already links stratum_btc_vk.o; this
-# one did not, so adding BC3 broke the Windows cross-build at link time with an
-# undefined symbol and nothing else changed.
+# EVERY object in the Linux Vulkan build must appear here too, including the
+# per-algorithm stratum sources, because run.cpp and vk_registry.cpp reference
+# them unconditionally.
+#
+# This list has now been forgotten TWICE. Adding BC3 broke the cross-build with
+# an undefined BitcoinStratumSource; adding KawPow broke it again with
+# makeKawpowVK and KawpowStratumSource, in a session where the comment warning
+# about the first one was directly above the target. A warning nothing checks
+# does not prevent anything.
+#
+# So when adding an algorithm: build this target. `make windows` is the check,
+# it needs only mingw and takes seconds, and it is the ONLY thing that catches
+# this - the Linux build is perfectly happy either way.
 WIN_OBJS = $(patsubst %.cpp,$(WINDIR)/%.o,$(VK_SRC_CORE) $(VK_SRC_ALGO)) \
            $(patsubst $(BUILD)/%.cpp,$(WINDIR)/gen/%.o,$(VK_SRC_GEN))
 
@@ -560,11 +845,12 @@ $(WINDIR)/gen/%.o: $(BUILD)/%.cpp | $(WINDIR)/include/vulkan
 -include $(WIN_OBJS:.o=.d)
 
 # Derived from VK_SRC_* exactly as the Linux objects are, so an algorithm
-# cannot be added to one platform and forgotten on the other.
+# cannot be added to one platform and forgotten on the other. That happened
+# twice before this; see the comment on VK_SRC_CORE.
 windows: $(VK_SRC_GEN) $(WINDIR)/libvulkan-1.a $(WIN_OBJS)
 	$(WINCXX) $(WINFLAGS) $(WIN_OBJS) $(WINDIR)/libvulkan-1.a -lws2_32 \
 	    -o $(WINDIR)/soat-miner-vk.exe
-	@x86_64-w64-mingw32-objdump -p $(WINDIR)/soat-miner-vk.exe | grep -i "DLL Name" | sort -u
+	@echo "built: $(WINDIR)/soat-miner-vk.exe"
 
 windows-package: windows
 	@rm -rf $(BUILD)/$(WINPKG) && mkdir -p $(BUILD)/$(WINPKG)

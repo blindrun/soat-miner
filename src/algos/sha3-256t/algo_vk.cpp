@@ -98,6 +98,7 @@ const uint32_t kMaxPerDispatch = 1u << 22;
 class Sha3_256tVK : public Algorithm {
    public:
     const char *name() const override { return "sha3-256t"; }
+    std::string launcherGlob() const override { return "mine_bc3_*"; }
 
     size_t memoryBytes(const Job &) const override {
         return sizeof(uint64_t) * 5 * kMaxSolutions + sizeof(uint32_t);

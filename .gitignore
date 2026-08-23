@@ -1,53 +1,29 @@
 build/
 soat-miner
-tests/test_element
-tests/test_hit
 tests/__pycache__/
 *.o
 *.log
-tests/test_vulkan
-tests/test_algo
 
 # build-binary variants and experiment scratch binaries (never commit these)
 soat-miner-*
 sm-*
-tests/test_pearl_job
-tests/test_pearl_gateway
-tests/test_pearl_prepare
-tests/test_pearl_algo
-tests/test_pearl
 build13
 soat-miner-13
-tests/test_pearl_mining_shape
-tests/measure_launch_gap
-tests/test_pearl_vk
-
-# Build dirs and compiled test binaries (never commit these)
 build120/
 scratchpad/
 scripts/__pycache__/
 tools/__pycache__/
-tests/test_pearl_pool
-tests/test_telemetry
-tests/test_pearl_job
-tests/test_pearl_prepare
-tests/test_btc_stratum
-tests/test_bc3_destination
-tests/test_sha3_algo
-tests/test_sha3_vulkan
-# Compiler-generated dependency lists
 *.d
-tests/test_pearl_merkle_vk
-tests/test_pearl_vk
-tests/test_pearl_genmatrix_vk
-tests/test_pearl_transpose_vk
-tests/test_pearl_commitments_vk
-tests/test_pearl_noise_vk
-tests/test_pearl_apply_noise_vk
-tests/test_pearl_powscan_vk
 
-# Compiled test binaries. These were tracked by accident and one was 16.8 MB;
-# build artifacts do not belong in a repo people clone.
-tests/test_claim_guard
-tests/test_pearl_backend_parity
-tests/test_pearl_dp_vk
+# Compiled binaries in tests/. Matches on the ABSENCE of an extension rather
+# than on a name prefix, because the prefix version was still a list in
+# disguise. It also replaces ~25 hand-listed entries that used to sit here, one
+# of which had already been forgotten - a 39 KB ELF got committed as a result.
+# Sources and scripts carry an extension, so un-ignoring anything with a dot
+# keeps them tracked, and !tests/*/ keeps subdirectories.
+tests/*
+!tests/*.*
+!tests/*/
+# Re-ignored: the un-ignore above brings subdirectories back, including this
+# one, which an earlier explicit rule had covered.
+tests/__pycache__/

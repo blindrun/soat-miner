@@ -28,6 +28,15 @@ WHAT IS IN HERE
                       endpoint above was checked by hand: it answers
                       mining.subscribe, accepts a BC3 address and sends real
                       work on the live chain.
+  mine_rvn_*.bat      Ravencoin / KawPow pool scripts - edit WALLET and run:
+                        mine_rvn_herominers.bat  0.9%
+                        mine_rvn_ravenminer.bat  0.5%
+                      Both endpoints answer and speak a protocol this miner
+                      implements, but NO SHARE HAS BEEN ACCEPTED YET on any
+                      KawPow pool. The first run is a test.
+                      KawPow needs about 7 GB of free VRAM and that grows -
+                      Ravencoin's dataset is 6.11 GB and gains ~8 MB every
+                      five days. Under that, the miner says so and stops.
   benchmark.bat       benchmark, no pool or node needed
 
 WHICH ONE RUNS
@@ -37,6 +46,14 @@ WHICH ONE RUNS
     - NVIDIA 50-series         -> Vulkan, ~22% faster than CUDA on Blackwell
     - NVIDIA 40-series / older -> CUDA (soat-miner.exe), ~34% faster on Ada
   Override it with BACKEND=cuda or BACKEND=vulkan in config.txt.
+
+  KawPow is the exception to the 50-series line above: it always takes CUDA on
+  NVIDIA, Blackwell included. NVIDIA's Vulkan driver collapses on this one
+  algorithm once the dataset passes about 3 GB - 4.3 MH/s against 7.4 on CUDA
+  on a 5080 - while AMD is unaffected and is the fastest card we have measured
+  on it at 34 MH/s. You do not have to do anything; the launcher handles it.
+  If soat-miner.exe is missing it will warn you that Vulkan is the slow path
+  for KawPow rather than treating it as a free substitute.
 
 ABOUT THE CUDA BUILD
   It used to be missing from this archive because nvcc cannot cross-compile
