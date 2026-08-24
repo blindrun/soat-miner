@@ -42,8 +42,11 @@ POLL_SECONDS=1
 IDLE_SETTLE_POLLS=5
 
 # --- power -----------------------------------------------------------------
-# 183 W is the measured sweet spot on an RTX 4090: 217.2 MH/s at 167 W actual
-# draw, versus 217.5 MH/s at 221 W unlimited. 0.3 MH/s for 24% less power.
+# 183-185 W is the measured knee on an RTX 4090, and efficiency falls in BOTH
+# directions from it. Measured 2026-08-22 on the current build: 237.12 MH/s at
+# a 183 W cap (182.8 W actual), 241.99 at 200 W, 241.88 at stock 257 W. So 200 W
+# buys full stock rate for 57 W less. The pre-__ldcs figures this line used to
+# carry - 217.2 MH/s at 167 W - no longer hold; the card now saturates the cap.
 POWER_LIMIT_MINING_W=183
 POWER_LIMIT_IDLE_W=450
 

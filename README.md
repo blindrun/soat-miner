@@ -242,7 +242,7 @@ relative to the dataset. Vulkan is unchanged - GLSL has no clean equivalent.
 
 The only like for like comparison here is SRBMiner 3.5.5 on the same 4090 at
 the same 7.27GB. It does 237.7 gross and takes 1%, so it delivers 235.4 against
-our 217.5. That is 92%, with no fee and source you can read.
+our 235.5. That is parity, with no fee and source you can read.
 
 lolMiner takes 1.5% on Autolykos V2. Their own algorithm table says so.
 
@@ -271,9 +271,26 @@ the reward stepped down. We measured it rather than leaving the estimate up.
 Mine because you want the coin, or because you want to support the network.
 Not because it pays.
 
-Power limit it to the efficiency knee. On a 4090 set 183W and you still get
-217 MH/s while the card actually pulls 167W. That is 24% less power for 0.3
-MH/s.
+Power limit it to the efficiency knee. On a 4090 the knee is 183-185W, and
+efficiency falls in BOTH directions from there - starving it below 183W drops
+clocks faster than it drops power, because Autolykos2 is memory-bandwidth-bound.
+
+Measured 2026-08-22 on the current build:
+
+| cap | MH/s | MH/W |
+|---|---|---|
+| 150 W | 168.28 | 1.122 |
+| 183 W | 237.12 | 1.296 |
+| 185 W | 240.05 | 1.298 |
+| 200 W | 241.99 | 1.210 |
+| stock, 257 W | 241.88 | 0.941 |
+
+The useful number is 200W: full stock rate for 57W less. The knee at 185W gives
+up 0.8% of the rate for 38% better efficiency.
+
+An earlier version of this section said a 183W cap left the card drawing 167W
+for 217 MH/s, a 24% saving. That was true before the `__ldcs` change. It is not
+now - the card saturates the cap at 182.8W.
 
 Set it with command sudo nvidia-smi -pl 183
 
