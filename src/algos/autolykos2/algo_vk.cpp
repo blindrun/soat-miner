@@ -5,9 +5,10 @@
 // amdgpu-pro or Mesa rusticl and is often simply absent. The workload is
 // memory-bandwidth bound, so the API makes no difference to throughput.
 //
-// The dataset is split across four storage buffers. Vulkan only guarantees
+// The dataset is split across sixteen storage buffers. Vulkan only guarantees
 // maxStorageBufferRange per binding - 4 GB - 1 even on a 24 GB RTX 4090 -
-// against a 7.27 GB dataset, so one binding cannot hold it.
+// against a 7.27 GB dataset, so one binding cannot hold it. Sixteen rather
+// than four is a capacity change and not a speed one; see prepare().
 
 #include <vulkan/vulkan.h>
 
@@ -110,6 +111,20 @@ class Autolykos2VK : public Algorithm {
         // core/vk_common.cpp. It used to live here, which is fine with one
         // algorithm and a silent divergence with two.
         if (!vkPickPhysicalDevice(inst_, requestedIndex, &phys_)) return false;
+
+        // maxMemoryAllocationSize is a SEPARATE limit from maxStorageBufferRange
+        // and on real hardware it is the smaller of the two: AMD's Windows
+        // driver reports 2 GiB against a maxStorageBufferRange of 4 GB - 1,
+        // where the same silicon under RADV reports about 4 GiB for both. Only
+        // the binding limit used to be read, so a chunk could be sized from a
+        // number that says nothing about whether the allocation can succeed.
+        VkPhysicalDeviceMaintenance3Properties m3{};
+        m3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
+        VkPhysicalDeviceProperties2 props2{};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &m3;
+        vkGetPhysicalDeviceProperties2(phys_, &props2);
+        maxAllocBytes_ = m3.maxMemoryAllocationSize;
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
@@ -295,23 +310,49 @@ class Autolykos2VK : public Algorithm {
 
         // Power-of-two chunking so the shader can use shift+mask instead of an
         // integer division on every one of its 33 lookups per nonce.
-        uint32_t shift = 26;  // 2^26 elements = 2.15 GB, under the 4 GB limit
+        //
+        // SIXTEEN PIECES, WHICH IS A DEADLINE AND NOT A SPEED CHOICE.
+        // This used to start at shift 26 and bind four buffers, a ceiling of
+        // 8.59 GB. The dataset grows 5% every 51,200 blocks by consensus and
+        // reaches 8.84 GB at height 2,048,000 - from that block on, a
+        // four-buffer build refuses every job and this backend cannot mine
+        // Ergo at all. That is about 190,000 blocks out from the 7.27 GB the
+        // dataset stands at today. Sixteen pieces covers 17.18 GB and puts
+        // the limit back on how much the card can actually hold.
+        //
+        // The piece SIZE is not a throughput knob. It is capped at 1 GiB to
+        // stay clear of a 2 GiB maxMemoryAllocationSize, not because it is
+        // faster: 4 x 2 GiB, 7 x 1 GiB and 14 x 512 MiB all measure within
+        // 0.1% of each other on an RX 9070 XT. The 2 GiB read cliff the
+        // KawPow backend records for its DAG does not reproduce here.
+        uint32_t shift = kMaxChunkShift;
         while (((uint64_t)1 << shift) * 32ULL > (uint64_t)maxStorageRange_) shift--;
+        // Some drivers cap one allocation well below what they will bind.
+        while (maxAllocBytes_ && ((uint64_t)1 << shift) * 32ULL > maxAllocBytes_ &&
+               shift > kMinChunkShift)
+            shift--;
+        // Lets the split be varied without a rebuild, the way KawPow's
+        // SOAT_DAG_SHIFT does. It is how the paragraph above was measured.
+        if (const char *ov = getenv("SOAT_CHUNK_SHIFT")) {
+            const int v = atoi(ov);
+            if (v >= (int)kMinChunkShift && v <= 26) shift = (uint32_t)v;
+        }
         const uint32_t elemsPerChunk = 1u << shift;
         uint32_t chunks = (uint32_t)((N + elemsPerChunk - 1) / elemsPerChunk);
         chunkShift_ = shift;
-        if (chunks > 4) {
+        if (chunks > kMaxChunks) {
             fprintf(stderr,
-                    "dataset needs %u buffers but the shader binds 4 "
-                    "(maxStorageBufferRange %.2f GB)\n",
-                    chunks, maxStorageRange_ / 1e9);
+                    "dataset needs %u buffers but the shader binds %u "
+                    "(maxStorageBufferRange %.2f GB, chunk %.2f GB)\n",
+                    chunks, kMaxChunks, maxStorageRange_ / 1e9,
+                    elemsPerChunk * 32.0 / 1e9);
             return false;
         }
 
         if (N != n_ || chunks != chunks_) {
             release();
             chunkElems_ = elemsPerChunk;
-            for (uint32_t c = 0; c < 4; c++) {
+            for (uint32_t c = 0; c < kMaxChunks; c++) {
                 const uint32_t count =
                     (c < chunks) ? ((c == chunks - 1) ? (N - c * chunkElems_)
                                                       : chunkElems_)
@@ -397,7 +438,7 @@ class Autolykos2VK : public Algorithm {
     }
 
     void release() override {
-        for (int c = 0; c < 4; c++) destroyBuffer(&ds_[c]);
+        for (uint32_t c = 0; c < kMaxChunks; c++) destroyBuffer(&ds_[c]);
         n_ = 0;
         chunks_ = 0;
     }
@@ -420,7 +461,14 @@ class Autolykos2VK : public Algorithm {
 
    private:
     static const uint32_t kMaxSolutions = 32;
-    static const uint32_t kBindings = 6;
+    /** Dataset chunk bindings, then Out and Cnt. Must match kernel.comp. */
+    static const uint32_t kMaxChunks = 16;
+    static const uint32_t kBindings = kMaxChunks + 2;
+    /** 2^25 elements x 32 B = 1 GiB per piece. kMinChunkShift stops a device
+     *  with a small allocation limit shrinking the split until it needs more
+     *  than kMaxChunks pieces. */
+    static const uint32_t kMaxChunkShift = 25;
+    static const uint32_t kMinChunkShift = 20;
 
     Push pushFor(const Job &job) const {
         Push p{};
@@ -471,7 +519,7 @@ class Autolykos2VK : public Algorithm {
         // The Vulkan backend used to collapse as the dataset grew - on a 4090,
         // same code, only the height changing: 119 MH/s at 2.15 GB, 5.4 at
         // 3.86, 2.9 at 7.27, while CUDA stayed flat near 218 across all three.
-        // Two plausible causes were both wrong. It was not the four-way
+        // Two plausible causes were both wrong. It was not the (then four-way)
         // if/else that picks a chunk buffer on every gather: removing that
         // branch entirely changed nothing. It was not register spilling
         // either: an RTX 5080 with essentially no spilling (48 bytes, against
@@ -514,12 +562,14 @@ class Autolykos2VK : public Algorithm {
 
     void writeDescriptors() {
         VkDescriptorBufferInfo info[kBindings]{};
-        for (int c = 0; c < 4; c++) {
+        for (uint32_t c = 0; c < kMaxChunks; c++) {
             info[c].buffer = ds_[c].buf;
             info[c].range = VK_WHOLE_SIZE;
         }
-        info[4].buffer = out_.buf; info[4].range = VK_WHOLE_SIZE;
-        info[5].buffer = cnt_.buf; info[5].range = VK_WHOLE_SIZE;
+        info[kMaxChunks].buffer = out_.buf;
+        info[kMaxChunks].range = VK_WHOLE_SIZE;
+        info[kMaxChunks + 1].buffer = cnt_.buf;
+        info[kMaxChunks + 1].range = VK_WHOLE_SIZE;
 
         VkWriteDescriptorSet w[kBindings]{};
         for (uint32_t i = 0; i < kBindings; i++) {
@@ -587,9 +637,10 @@ class Autolykos2VK : public Algorithm {
     VkFence fence_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps_{};
 
-    Buffer ds_[4], out_, cnt_;
+    Buffer ds_[kMaxChunks], out_, cnt_;
     VkDeviceSize deviceLocalBytes_ = 0;
     double maxStorageRange_ = 0;
+    uint64_t maxAllocBytes_ = 0;
     char devName_[256] = {0};
     char driver_[64] = {0};
     uint32_t n_ = 0, chunks_ = 0, chunkElems_ = 0, chunkShift_ = 0, height_ = 0;
