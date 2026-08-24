@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -48,6 +49,12 @@ struct Push {
     uint32_t searchCount;
 };
 static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128 bytes");
+// "Must match kernel.comp exactly" is only worth writing if something checks
+// it. searchCount is the field the shader bounds its thread index against, so
+// a silent disagreement here is nonces skipped or nonces mined outside the
+// range this miner owns.
+static_assert(offsetof(Push, searchCount) == 104,
+              "searchCount must sit where kernel.comp's push block puts it");
 
 #define VKCHECK(x)                                                     \
     do {                                                               \
@@ -117,7 +124,7 @@ class Autolykos2VK : public Algorithm {
         // a 1.0 loader, so ask what it has first. Below 1.2 is unusable here
         // regardless: shaderInt8 and storageBuffer8BitAccess are 1.2 features
         // and this kernel needs both.
-        uint32_t loaderVersion_ = VK_API_VERSION_1_0;
+        loaderVersion_ = VK_API_VERSION_1_0;
         auto enumVersion = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(
             VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
         if (enumVersion && enumVersion(&loaderVersion_) != VK_SUCCESS)
@@ -154,6 +161,7 @@ class Autolykos2VK : public Algorithm {
         snprintf(devName_, sizeof(devName_), "%s", props.deviceName);
         maxStorageRange_ = props.limits.maxStorageBufferRange;
         deviceApiVersion_ = props.apiVersion;
+        maxWorkGroups_ = props.limits.maxComputeWorkGroupCount[0];
         snprintf(driver_, sizeof(driver_), "Vulkan %u.%u.%u",
                  VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
                  VK_VERSION_PATCH(props.apiVersion));
@@ -279,11 +287,17 @@ class Autolykos2VK : public Algorithm {
                 // Say so rather than attach a struct whose feature was never
                 // enabled. Silently ignoring it is what made this knob
                 // untrustworthy in the first place.
+                // Name the side that is actually limiting. Printing only
+                // the device version says "this device is Vulkan 1.3 and
+                // subgroup size control needs 1.3" when it is the loader
+                // that is older, which is worse than saying nothing.
+                const bool loaderOld = loaderVersion_ < VK_API_VERSION_1_3;
+                const uint32_t lim = loaderOld ? loaderVersion_ : deviceApiVersion_;
                 fprintf(stderr,
-                        "[vulkan] SOAT_SUBGROUP=%u ignored: this device is "
-                        "Vulkan %u.%u and subgroup size control needs 1.3\n",
-                        wantSg, VK_VERSION_MAJOR(deviceApiVersion_),
-                        VK_VERSION_MINOR(deviceApiVersion_));
+                        "[vulkan] SOAT_SUBGROUP=%u ignored: subgroup size "
+                        "control needs Vulkan 1.3 and the %s is %u.%u\n",
+                        wantSg, loaderOld ? "loader" : "device",
+                        VK_VERSION_MAJOR(lim), VK_VERSION_MINOR(lim));
             } else {
                 sgInfo.sType =
                     VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
@@ -377,7 +391,21 @@ class Autolykos2VK : public Algorithm {
         // SOAT_DAG_SHIFT does. It is how the paragraph above was measured.
         if (const char *ov = getenv("SOAT_CHUNK_SHIFT")) {
             const int v = atoi(ov);
-            if (v >= (int)kMinChunkShift && v <= 26) shift = (uint32_t)v;
+            // Clamped to the same two device limits the automatic path just
+            // applied. This is a knob for measuring the split, not a way to
+            // ask for a buffer the driver has already said it will not bind
+            // or allocate.
+            if (v >= (int)kMinChunkShift && v <= (int)kMaxChunkShift + 1) {
+                const uint64_t want = (uint64_t)1 << v;
+                if (want * 32ULL > (uint64_t)maxStorageRange_ ||
+                    (maxAllocBytes_ && want * 32ULL > maxAllocBytes_))
+                    fprintf(stderr,
+                            "SOAT_CHUNK_SHIFT=%d asks for a %.2f GB chunk, past "
+                            "this device's limits; ignoring\n",
+                            v, want * 32.0 / 1e9);
+                else
+                    shift = (uint32_t)v;
+            }
         }
         const uint32_t elemsPerChunk = 1u << shift;
         uint32_t chunks = (uint32_t)((N + elemsPerChunk - 1) / elemsPerChunk);
@@ -459,6 +487,25 @@ class Autolykos2VK : public Algorithm {
         // arbitrary. Rounding up WITHOUT the shader-side bound would be worse
         // than the gap it closes: it would hash past the end of the prefix we
         // own and submit shares the pool rejects.
+        // searchCount is 32-bit because the shader's thread index is. A batch
+        // past that would wrap and bound the search at count mod 2^32, hashing
+        // a fraction of the range while the caller advanced its counter by all
+        // of it - the same silently-wrong accounting this bound exists to fix.
+        // Two ceilings, and the smaller wins: the shader's thread index is
+        // 32-bit, and the dispatch cannot ask for more workgroups than the
+        // device advertises. Quoting a number that clears one but not the
+        // other would only move the failure.
+        uint64_t maxBatch = UINT32_MAX;
+        if (maxWorkGroups_ && (uint64_t)maxWorkGroups_ * kLocalSize < maxBatch)
+            maxBatch = (uint64_t)maxWorkGroups_ * kLocalSize;
+        maxBatch &= ~UINT64_C(255);
+        if (count > maxBatch) {
+            fprintf(stderr,
+                    "batch of %llu nonces is more than this device can "
+                    "dispatch; use --batch %llu or less\n",
+                    (unsigned long long)count, (unsigned long long)maxBatch);
+            return false;
+        }
         p.searchCount = (uint32_t)count;
         if (!dispatch(p, (uint32_t)((count + kLocalSize - 1) / kLocalSize)))
             return false;
@@ -699,6 +746,8 @@ class Autolykos2VK : public Algorithm {
     double maxStorageRange_ = 0;
     uint64_t maxAllocBytes_ = 0;
     uint32_t deviceApiVersion_ = 0;
+    uint32_t maxWorkGroups_ = 0;
+    uint32_t loaderVersion_ = VK_API_VERSION_1_0;
     bool haveSubgroupControl_ = false;
     char devName_[256] = {0};
     char driver_[64] = {0};
