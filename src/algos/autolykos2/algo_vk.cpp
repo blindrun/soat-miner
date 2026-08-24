@@ -162,6 +162,22 @@ class Autolykos2VK : public Algorithm {
         maxStorageRange_ = props.limits.maxStorageBufferRange;
         deviceApiVersion_ = props.apiVersion;
         maxWorkGroups_ = props.limits.maxComputeWorkGroupCount[0];
+
+        // The dataset needs kMaxChunks bindings plus Out and Cnt, and Vulkan
+        // only GUARANTEES four storage buffers per stage. Every desktop driver
+        // reports orders of magnitude more - this device reports 4294967295 -
+        // but "every driver we tried" is not the same as the spec, and binding
+        // past the limit is undefined rather than slow. Say so plainly instead
+        // of finding out through a device that computes the wrong hits.
+        if (props.limits.maxPerStageDescriptorStorageBuffers < kBindings) {
+            fprintf(stderr,
+                    "this shader binds %u storage buffers in one stage - %u for "
+                    "the dataset, plus the output and the counter - and this "
+                    "device allows %u. Autolykos on Vulkan cannot run here.\n",
+                    kBindings, kMaxChunks,
+                    props.limits.maxPerStageDescriptorStorageBuffers);
+            return false;
+        }
         snprintf(driver_, sizeof(driver_), "Vulkan %u.%u.%u",
                  VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
                  VK_VERSION_PATCH(props.apiVersion));
