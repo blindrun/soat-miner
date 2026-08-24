@@ -12,6 +12,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
 
 // Workgroup size is a specialization constant so the host is the single
 // source of truth. Hardcoding it in both places let them drift once already:
@@ -414,9 +415,50 @@ void computeHit(uint64_t nonce, out uint64_t hit[4]) {
     // to expose memory-level parallelism and measured SLOWER on RDNA2 (71.4 vs
     // 82.5 MH/s) - the extra live registers cost more occupancy than the
     // overlapping loads win back. Kept simple deliberately.
+    //
+    // DO NOT LET THIS LOOP BE UNROLLED, and the reason is the same occupancy
+    // argument one paragraph up - the compiler just reaches the wrong answer on
+    // its own. Thirty-two copies of a body that ends in a dependent global
+    // gather is a lot of live state, and the register pressure costs more
+    // occupancy than the unrolled schedule wins back. This kernel is bound by
+    // how many gathers it can keep in flight, so occupancy IS the throughput.
+    //
+    // THIS IS A FIX FOR ONE SHADER COMPILER, and the controls say so. Same
+    // binary, three driver stacks, 7.27 GB dataset:
+    //
+    //   RX 9070 XT, AMD Windows driver 26.5.2   54.8 -> 64.3 MH/s   +17%
+    //   RX 9070 XT, RADV/Mesa (ACO), Linux     130.8 -> 130.1       none
+    //   RTX 3060,   NVIDIA Windows driver       92.0 ->  91.6       none
+    //
+    // Only AMD's Windows compiler unrolls this loop, so only it is helped;
+    // the other two were already leaving it rolled and there is nothing for
+    // the hint to stop. The two small negatives are inside run-to-run noise.
+    //
+    // The RADV row is worth reading twice for a second reason: it is the same
+    // card as the row above it. AMD's Windows driver gives up 2.4x on this
+    // kernel against Mesa on identical silicon, and this attribute recovers
+    // only an eighth of that - 9.5 MH/s recovered out of a 76.0 MH/s
+    // deficit. The rest is not addressed here.
+    //
+    // On the AMD Windows driver the win also holds at a smaller dataset:
+    // 2.15 GB goes 62.2 -> 74.4 MH/s.
+    //
+    // It was found the long way round. Widening the chunk selector in
+    // loadElement from four buffers to sixteen sped the kernel up by the same
+    // 17%, which made no sense until the threshold turned out to sit between
+    // five and six branches and to survive at a dataset of ONE chunk, where
+    // nothing diverges and fifteen of those branches are dead code. The extra
+    // branches were not helping; they were bulking the loop body past the
+    // compiler's unroll limit. This says that directly instead.
+    //
+    // It is a hint (SPIR-V LoopControl DontUnroll), so a driver free to ignore
+    // it lands back on the current behaviour rather than something worse.
+    //
+    // NOT compressU, which must stay fully unrolled - see the note there; a
+    // dynamic index spills the message array to scratch and costs about 75x.
     uint64_t acc[4];
     acc[0] = 0UL; acc[1] = 0UL; acc[2] = 0UL; acc[3] = 0UL;
-    for (uint j = 0u; j < AL_K; j++) {
+    [[dont_unroll]] for (uint j = 0u; j < AL_K; j++) {
         uint v = (uint(ext[j]) << 24) | (uint(ext[j + 1u]) << 16) |
                  (uint(ext[j + 2u]) << 8) | uint(ext[j + 3u]);
         uint64_t e[4];
