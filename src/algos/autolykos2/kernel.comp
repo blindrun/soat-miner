@@ -77,6 +77,7 @@ layout(push_constant) uniform Push {
     uint buildCount;  // dataset build: elements in this chunk
     uint buildChunk;  // dataset build: which chunk buffer to write
     uint maxOut;
+    uint searchCount; // search: nonces this dispatch actually owns
 } pc;
 
 const uint AL_K = 32;
@@ -556,6 +557,14 @@ void main() {
     }
 
     // search
+    //
+    // The thread count is rounded UP to a whole workgroup, so the last group
+    // carries threads this batch does not own. They must not hash: at the end
+    // of a nonce range the host clamps the batch to what is left of the
+    // extranonce prefix, and a nonce past that belongs to another miner.
+    // Submitting one gets the share rejected, which is the quiet failure the
+    // clamp exists to prevent.
+    if (gid >= pc.searchCount) return;
     uint64_t nonce = pc.baseNonce + uint64_t(gid);
     uint64_t hit[4];
     computeHit(nonce, hit);

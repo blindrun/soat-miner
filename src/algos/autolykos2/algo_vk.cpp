@@ -45,6 +45,7 @@ struct Push {
     uint64_t baseNonce;
     uint32_t N, height, chunkShift, mode;
     uint32_t buildFirst, buildCount, buildChunk, maxOut;
+    uint32_t searchCount;
 };
 static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128 bytes");
 
@@ -100,7 +101,29 @@ class Autolykos2VK : public Algorithm {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "soat-miner";
-        app.apiVersion = VK_API_VERSION_1_2;
+        // 1.3 WHEN THE LOADER HAS IT.
+        //
+        // This asked for 1.2 and then used Vulkan 1.3 anyway:
+        // VkPhysicalDeviceVulkan13Features for subgroupSizeControl and
+        // computeFullSubgroups below, and a required-subgroup-size struct on
+        // the compute stage. An application may not use functionality above
+        // the version it declares, and the failure mode here is the quiet one
+        // - a driver is free to ignore a feature struct it was never told the
+        // application could use, which leaves SOAT_SUBGROUP accepted, printed,
+        // and doing nothing at all. The A/B test that flag exists for would
+        // then be comparing wave64 against wave64.
+        //
+        // Asking for a version the loader does not have is itself an error on
+        // a 1.0 loader, so ask what it has first. Below 1.2 is unusable here
+        // regardless: shaderInt8 and storageBuffer8BitAccess are 1.2 features
+        // and this kernel needs both.
+        uint32_t loaderVersion_ = VK_API_VERSION_1_0;
+        auto enumVersion = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(
+            VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+        if (enumVersion && enumVersion(&loaderVersion_) != VK_SUCCESS)
+            loaderVersion_ = VK_API_VERSION_1_0;
+        app.apiVersion = (loaderVersion_ >= VK_API_VERSION_1_3) ? VK_API_VERSION_1_3
+                                                               : VK_API_VERSION_1_2;
 
         VkInstanceCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -130,6 +153,7 @@ class Autolykos2VK : public Algorithm {
         vkGetPhysicalDeviceProperties(phys_, &props);
         snprintf(devName_, sizeof(devName_), "%s", props.deviceName);
         maxStorageRange_ = props.limits.maxStorageBufferRange;
+        deviceApiVersion_ = props.apiVersion;
         snprintf(driver_, sizeof(driver_), "Vulkan %u.%u.%u",
                  VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
                  VK_VERSION_PATCH(props.apiVersion));
@@ -170,11 +194,18 @@ class Autolykos2VK : public Algorithm {
         f12.shaderInt8 = VK_TRUE;
         f12.storageBuffer8BitAccess = VK_TRUE;
 
+        // Chained only when BOTH the instance and the device really are 1.3,
+        // so the feature is never requested on an instance that did not
+        // declare it. Recorded, because the pipeline must not then attach a
+        // required-subgroup-size struct the device was not told to support.
+        haveSubgroupControl_ = app.apiVersion >= VK_API_VERSION_1_3 &&
+                               deviceApiVersion_ >= VK_API_VERSION_1_3;
+
         VkPhysicalDeviceVulkan13Features f13{};
         f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
         f13.subgroupSizeControl = VK_TRUE;
         f13.computeFullSubgroups = VK_TRUE;
-        f12.pNext = &f13;
+        if (haveSubgroupControl_) f12.pNext = &f13;
 
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -244,11 +275,22 @@ class Autolykos2VK : public Algorithm {
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sgInfo{};
         const uint32_t wantSg = subgroupSizeOverride();
         if (wantSg == 32u || wantSg == 64u) {
-            sgInfo.sType =
-                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-            sgInfo.requiredSubgroupSize = wantSg;
-            stage.pNext = &sgInfo;
-            fprintf(stderr, "[vulkan] forcing subgroup size %u\n", wantSg);
+            if (!haveSubgroupControl_) {
+                // Say so rather than attach a struct whose feature was never
+                // enabled. Silently ignoring it is what made this knob
+                // untrustworthy in the first place.
+                fprintf(stderr,
+                        "[vulkan] SOAT_SUBGROUP=%u ignored: this device is "
+                        "Vulkan %u.%u and subgroup size control needs 1.3\n",
+                        wantSg, VK_VERSION_MAJOR(deviceApiVersion_),
+                        VK_VERSION_MINOR(deviceApiVersion_));
+            } else {
+                sgInfo.sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+                sgInfo.requiredSubgroupSize = wantSg;
+                stage.pNext = &sgInfo;
+                fprintf(stderr, "[vulkan] forcing subgroup size %u\n", wantSg);
+            }
         }
 
         VkComputePipelineCreateInfo cpci{};
@@ -405,7 +447,21 @@ class Autolykos2VK : public Algorithm {
         p.mode = 1;
         p.baseNonce = nonceBase;
         p.maxOut = kMaxSolutions;
-        if (!dispatch(p, (uint32_t)(count / kLocalSize))) return false;
+        // Round UP, and tell the shader the real count so the spare threads
+        // in the final group return without hashing.
+        //
+        // This divided and truncated, so a count that was not a multiple of
+        // the workgroup size left up to kLocalSize-1 nonces unhashed while the
+        // caller still advanced its counter by the full count and credited all
+        // of it to the hashrate. --batch is rounded to a multiple of 256 when
+        // it is parsed, but run.cpp also clamps the last batch of a range to
+        // whatever is left of the extranonce prefix, and that value is
+        // arbitrary. Rounding up WITHOUT the shader-side bound would be worse
+        // than the gap it closes: it would hash past the end of the prefix we
+        // own and submit shares the pool rejects.
+        p.searchCount = (uint32_t)count;
+        if (!dispatch(p, (uint32_t)((count + kLocalSize - 1) / kLocalSize)))
+            return false;
 
         uint32_t found = *(uint32_t *)cnt_.mapped;
         if (found == 0) return true;
@@ -426,6 +482,7 @@ class Autolykos2VK : public Algorithm {
         Push p = pushFor(job);
         p.mode = 2;
         p.baseNonce = sol.nonce;
+        p.searchCount = 1;
         if (!const_cast<Autolykos2VK *>(this)->dispatch(p, 1)) return false;
 
         const uint64_t *raw = (const uint64_t *)out_.mapped;
@@ -641,6 +698,8 @@ class Autolykos2VK : public Algorithm {
     VkDeviceSize deviceLocalBytes_ = 0;
     double maxStorageRange_ = 0;
     uint64_t maxAllocBytes_ = 0;
+    uint32_t deviceApiVersion_ = 0;
+    bool haveSubgroupControl_ = false;
     char devName_[256] = {0};
     char driver_[64] = {0};
     uint32_t n_ = 0, chunks_ = 0, chunkElems_ = 0, chunkShift_ = 0, height_ = 0;
