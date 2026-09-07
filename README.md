@@ -230,7 +230,54 @@ Measured at the current dataset size, 7.27GB.
 | RTX 4070 SUPER | CUDA | 117.6 |
 | RTX 4060 Ti | CUDA | 76.9 |
 | RX 7900 XT | Vulkan | 151.9 |
+| RX 9070 XT | Vulkan | 130.1 |
 | RX 6700 XT | Vulkan | 82.9 |
+
+The 9070 XT row is a Linux number. On Windows the same card does 64.3.
+
+### AMD on Windows is half speed, and it is not your card
+
+An RX 9070 XT does 130.1 MH/s on Linux and 64.3 on Windows. Same binary, same
+card, same 7.27GB dataset. The only thing that changes is the driver, which was
+Adrenalin 26.5.2 on the Windows side.
+
+That is one card. Nobody has run the same comparison on an RDNA2 or RDNA3 card
+under the Windows driver, so do not read it as a statement about every AMD
+card.
+
+The gap is not the dataset being too big for the card. It is there at every
+size, and it gets worse as the lookups spread further.
+
+A small Vulkan test that does nothing but random lookups over an 8.59GB
+allocation, built from the same source for both platforms, measures this on the
+same card. Only the range the lookups are confined to changes between rows:
+
+| lookups confined to | Windows | Linux | Linux is |
+|---|---|---|---|
+| all 8.59 GB | 2.10 | 4.57 | 2.18x |
+| 1.07 GB | 2.63 | 4.83 | 1.84x |
+| 134 MB | 4.90 | 9.04 | 1.84x |
+| 16.8 MB | 18.01 | 26.81 | 1.49x |
+
+(billions of lookups per second)
+
+Two things worth reading out of that. Windows is slower even at 16.8MB, which
+fits in cache and reaches nowhere - so about 1.5x of it has nothing to do with
+how far the lookups spread. And Linux slows down as the range grows too, just
+less: 5.9x across that table against 8.6x on Windows.
+
+So it is not one clean thing, and no claim is made here about which part of the
+driver is responsible.
+
+Nothing we have tried in the miner fixes it. The allocation already asks for a dedicated
+one, which is what fixed the same problem on NVIDIA, and carving the dataset
+differently changes nothing: 4 pieces of 2GB, 7 of 1GB and 14 of 512MB all
+measure the same.
+
+So on this card, if you care about the number, mine on Linux. And if you mine
+on Windows, be careful comparing against the AMD figures above before deciding
+something is wrong with your card: the 9070 XT row is a Linux number, and the
+others are not marked either way.
 
 The CUDA numbers went up 8-21% in v0.2.2 from a one-line change: the dataset
 reads use streaming loads (`__ldcs`), not the read-only data cache (`__ldg`).
@@ -757,15 +804,25 @@ Build both backends with command make
 
 Build one with command make cuda or command make vulkan
 
-**Windows.** You need the CUDA Toolkit and Visual Studio Build Tools with the
-C++ workload. Then use cmake.
+**Windows.** You need Visual Studio Build Tools with the C++ workload, and
+then whichever backend you want to build for:
+
+* the CUDA Toolkit, for soat-miner.exe
+* the Vulkan SDK and Python 3, for soat-miner-vk.exe - this is the one AMD and
+  Intel cards need, and it is what you want if you do not have an NVIDIA card.
+  Python is what embeds the compiled shaders into the binary
+
+Then use cmake. It builds whichever of the two it finds what it needs for, and
+says which it skipped and why.
 
 ```
 cmake -B build
 cmake --build build --config Release
 ```
 
-The binary lands in build\Release\soat-miner.exe
+Build only one with -DSOAT_BUILD_CUDA=OFF or -DSOAT_BUILD_VULKAN=OFF.
+
+The binaries land in build\Release\ as soat-miner.exe and soat-miner-vk.exe.
 
 BE WARNED: RTX 50-series needs CUDA Toolkit 12.8 or newer to get native code.
 Older toolkits still work. They fall back to PTX and the driver compiles it at

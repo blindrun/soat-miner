@@ -12,6 +12,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
 
 // Workgroup size is a specialization constant so the host is the single
 // source of truth. Hardcoding it in both places let them drift once already:
@@ -20,9 +21,23 @@
 // counter - a wrong result reported as a 72% speedup.
 layout(local_size_x_id = 0) in;
 
-// The dataset is split across four buffers. Vulkan only guarantees
+// The dataset is split across sixteen buffers. Vulkan only guarantees
 // maxStorageBufferRange per binding (4 GB - 1 even on a 24 GB RTX 4090)
 // against a 7.27 GB dataset, so a single binding cannot hold it.
+//
+// SIXTEEN RATHER THAN FOUR because four is a dated cap, not a comfortable one.
+// A binding holds at most 2^26 elements, so four of them hold 8.59 GB - and
+// the dataset grows 5% every 51,200 blocks by consensus. It reaches 8.84 GB at
+// height 2,048,000, where the fifth buffer this shader does not have becomes
+// required and the Vulkan backend stops mining Ergo at all. Sixteen pieces
+// covers 17.18 GB, which moves the limit back onto how much the card can hold.
+//
+// This is NOT a throughput change. It was first written believing a 2 GiB
+// storage buffer read slowly, the way the KawPow backend records for its DAG,
+// and that turned out not to reproduce here at all: 4 x 2 GiB, 7 x 1 GiB and
+// 14 x 512 MiB all measure the same on an RX 9070 XT. Speed on this kernel is
+// an unrolling question and is handled in computeHit().
+//
 // uvec4 rather than uint64_t[]: this gives two 16-byte vector loads per
 // element instead of four separate 8-byte loads. With 33 random lookups per
 // nonce that difference dominates everything else in the kernel.
@@ -30,13 +45,25 @@ layout(std430, binding = 0) buffer Chunk0 { uvec4 d[]; } c0;
 layout(std430, binding = 1) buffer Chunk1 { uvec4 d[]; } c1;
 layout(std430, binding = 2) buffer Chunk2 { uvec4 d[]; } c2;
 layout(std430, binding = 3) buffer Chunk3 { uvec4 d[]; } c3;
+layout(std430, binding = 4) buffer Chunk4 { uvec4 d[]; } c4;
+layout(std430, binding = 5) buffer Chunk5 { uvec4 d[]; } c5;
+layout(std430, binding = 6) buffer Chunk6 { uvec4 d[]; } c6;
+layout(std430, binding = 7) buffer Chunk7 { uvec4 d[]; } c7;
+layout(std430, binding = 8) buffer Chunk8 { uvec4 d[]; } c8;
+layout(std430, binding = 9) buffer Chunk9 { uvec4 d[]; } c9;
+layout(std430, binding = 10) buffer Chunk10 { uvec4 d[]; } c10;
+layout(std430, binding = 11) buffer Chunk11 { uvec4 d[]; } c11;
+layout(std430, binding = 12) buffer Chunk12 { uvec4 d[]; } c12;
+layout(std430, binding = 13) buffer Chunk13 { uvec4 d[]; } c13;
+layout(std430, binding = 14) buffer Chunk14 { uvec4 d[]; } c14;
+layout(std430, binding = 15) buffer Chunk15 { uvec4 d[]; } c15;
 
 // 5 words per solution: nonce followed by the 4 hit limbs.
-layout(std430, binding = 4) buffer Out { uint64_t v[]; } outbuf;
+layout(std430, binding = 16) buffer Out { uint64_t v[]; } outbuf;
 
 // Separate 32-bit counter. A 64-bit atomic would need GL_EXT_shader_atomic_int64,
 // which is not universally available on AMD drivers; a 32-bit atomicAdd is core.
-layout(std430, binding = 5) buffer Cnt { uint n; } cnt;
+layout(std430, binding = 17) buffer Cnt { uint n; } cnt;
 
 layout(push_constant) uniform Push {
     uint64_t msg0, msg1, msg2, msg3;   // 32-byte header digest, LE words
@@ -50,6 +77,7 @@ layout(push_constant) uniform Push {
     uint buildCount;  // dataset build: elements in this chunk
     uint buildChunk;  // dataset build: which chunk buffer to write
     uint maxOut;
+    uint searchCount; // search: nonces this dispatch actually owns
 } pc;
 
 const uint AL_K = 32;
@@ -324,10 +352,22 @@ void storeElement(uint chunk, uint slot, uint64_t limb[4]) {
     uint base = slot * 2u;
     uvec4 lo = packLo(limb[0], limb[1]);
     uvec4 hi = packLo(limb[2], limb[3]);
-    if (chunk == 0u)      { c0.d[base] = lo; c0.d[base + 1u] = hi; }
-    else if (chunk == 1u) { c1.d[base] = lo; c1.d[base + 1u] = hi; }
-    else if (chunk == 2u) { c2.d[base] = lo; c2.d[base + 1u] = hi; }
-    else                  { c3.d[base] = lo; c3.d[base + 1u] = hi; }
+    if (chunk ==  0u) { c0.d[base] = lo; c0.d[base + 1u] = hi; }
+    else if (chunk ==  1u) { c1.d[base] = lo; c1.d[base + 1u] = hi; }
+    else if (chunk ==  2u) { c2.d[base] = lo; c2.d[base + 1u] = hi; }
+    else if (chunk ==  3u) { c3.d[base] = lo; c3.d[base + 1u] = hi; }
+    else if (chunk ==  4u) { c4.d[base] = lo; c4.d[base + 1u] = hi; }
+    else if (chunk ==  5u) { c5.d[base] = lo; c5.d[base + 1u] = hi; }
+    else if (chunk ==  6u) { c6.d[base] = lo; c6.d[base + 1u] = hi; }
+    else if (chunk ==  7u) { c7.d[base] = lo; c7.d[base + 1u] = hi; }
+    else if (chunk ==  8u) { c8.d[base] = lo; c8.d[base + 1u] = hi; }
+    else if (chunk ==  9u) { c9.d[base] = lo; c9.d[base + 1u] = hi; }
+    else if (chunk == 10u) { c10.d[base] = lo; c10.d[base + 1u] = hi; }
+    else if (chunk == 11u) { c11.d[base] = lo; c11.d[base + 1u] = hi; }
+    else if (chunk == 12u) { c12.d[base] = lo; c12.d[base + 1u] = hi; }
+    else if (chunk == 13u) { c13.d[base] = lo; c13.d[base + 1u] = hi; }
+    else if (chunk == 14u) { c14.d[base] = lo; c14.d[base + 1u] = hi; }
+    else               { c15.d[base] = lo; c15.d[base + 1u] = hi; }
 }
 
 uint64_t joinLo(uvec4 v, int part) {
@@ -339,10 +379,22 @@ void loadElement(uint i, out uint64_t limb[4]) {
     uint which = i >> pc.chunkShift;
     uint base = (i & ((1u << pc.chunkShift) - 1u)) * 2u;
     uvec4 lo, hi;
-    if (which == 0u)      { lo = c0.d[base]; hi = c0.d[base + 1u]; }
-    else if (which == 1u) { lo = c1.d[base]; hi = c1.d[base + 1u]; }
-    else if (which == 2u) { lo = c2.d[base]; hi = c2.d[base + 1u]; }
-    else                  { lo = c3.d[base]; hi = c3.d[base + 1u]; }
+    if (which ==  0u) { lo = c0.d[base]; hi = c0.d[base + 1u]; }
+    else if (which ==  1u) { lo = c1.d[base]; hi = c1.d[base + 1u]; }
+    else if (which ==  2u) { lo = c2.d[base]; hi = c2.d[base + 1u]; }
+    else if (which ==  3u) { lo = c3.d[base]; hi = c3.d[base + 1u]; }
+    else if (which ==  4u) { lo = c4.d[base]; hi = c4.d[base + 1u]; }
+    else if (which ==  5u) { lo = c5.d[base]; hi = c5.d[base + 1u]; }
+    else if (which ==  6u) { lo = c6.d[base]; hi = c6.d[base + 1u]; }
+    else if (which ==  7u) { lo = c7.d[base]; hi = c7.d[base + 1u]; }
+    else if (which ==  8u) { lo = c8.d[base]; hi = c8.d[base + 1u]; }
+    else if (which ==  9u) { lo = c9.d[base]; hi = c9.d[base + 1u]; }
+    else if (which == 10u) { lo = c10.d[base]; hi = c10.d[base + 1u]; }
+    else if (which == 11u) { lo = c11.d[base]; hi = c11.d[base + 1u]; }
+    else if (which == 12u) { lo = c12.d[base]; hi = c12.d[base + 1u]; }
+    else if (which == 13u) { lo = c13.d[base]; hi = c13.d[base + 1u]; }
+    else if (which == 14u) { lo = c14.d[base]; hi = c14.d[base + 1u]; }
+    else               { lo = c15.d[base]; hi = c15.d[base + 1u]; }
     limb[0] = joinLo(lo, 0); limb[1] = joinLo(lo, 1);
     limb[2] = joinLo(hi, 0); limb[3] = joinLo(hi, 1);
 }
@@ -414,9 +466,50 @@ void computeHit(uint64_t nonce, out uint64_t hit[4]) {
     // to expose memory-level parallelism and measured SLOWER on RDNA2 (71.4 vs
     // 82.5 MH/s) - the extra live registers cost more occupancy than the
     // overlapping loads win back. Kept simple deliberately.
+    //
+    // DO NOT LET THIS LOOP BE UNROLLED, and the reason is the same occupancy
+    // argument one paragraph up - the compiler just reaches the wrong answer on
+    // its own. Thirty-two copies of a body that ends in a dependent global
+    // gather is a lot of live state, and the register pressure costs more
+    // occupancy than the unrolled schedule wins back. This kernel is bound by
+    // how many gathers it can keep in flight, so occupancy IS the throughput.
+    //
+    // THIS IS A FIX FOR ONE SHADER COMPILER, and the controls say so. Same
+    // binary, three driver stacks, 7.27 GB dataset:
+    //
+    //   RX 9070 XT, AMD Windows driver 26.5.2   54.8 -> 64.3 MH/s   +17%
+    //   RX 9070 XT, RADV/Mesa (ACO), Linux     130.8 -> 130.1       none
+    //   RTX 3060,   NVIDIA Windows driver       92.0 ->  91.6       none
+    //
+    // Only AMD's Windows compiler unrolls this loop, so only it is helped;
+    // the other two were already leaving it rolled and there is nothing for
+    // the hint to stop. The two small negatives are inside run-to-run noise.
+    //
+    // The RADV row is worth reading twice for a second reason: it is the same
+    // card as the row above it. AMD's Windows driver gives up 2.4x on this
+    // kernel against Mesa on identical silicon, and this attribute recovers
+    // only an eighth of that - 9.5 MH/s recovered out of a 76.0 MH/s
+    // deficit. The rest is not addressed here.
+    //
+    // On the AMD Windows driver the win also holds at a smaller dataset:
+    // 2.15 GB goes 62.2 -> 74.4 MH/s.
+    //
+    // It was found the long way round. Widening the chunk selector in
+    // loadElement from four buffers to sixteen sped the kernel up by the same
+    // 17%, which made no sense until the threshold turned out to sit between
+    // five and six branches and to survive at a dataset of ONE chunk, where
+    // nothing diverges and fifteen of those branches are dead code. The extra
+    // branches were not helping; they were bulking the loop body past the
+    // compiler's unroll limit. This says that directly instead.
+    //
+    // It is a hint (SPIR-V LoopControl DontUnroll), so a driver free to ignore
+    // it lands back on the current behaviour rather than something worse.
+    //
+    // NOT compressU, which must stay fully unrolled - see the note there; a
+    // dynamic index spills the message array to scratch and costs about 75x.
     uint64_t acc[4];
     acc[0] = 0UL; acc[1] = 0UL; acc[2] = 0UL; acc[3] = 0UL;
-    for (uint j = 0u; j < AL_K; j++) {
+    [[dont_unroll]] for (uint j = 0u; j < AL_K; j++) {
         uint v = (uint(ext[j]) << 24) | (uint(ext[j + 1u]) << 16) |
                  (uint(ext[j + 2u]) << 8) | uint(ext[j + 3u]);
         uint64_t e[4];
@@ -464,6 +557,14 @@ void main() {
     }
 
     // search
+    //
+    // The thread count is rounded UP to a whole workgroup, so the last group
+    // carries threads this batch does not own. They must not hash: at the end
+    // of a nonce range the host clamps the batch to what is left of the
+    // extranonce prefix, and a nonce past that belongs to another miner.
+    // Submitting one gets the share rejected, which is the quiet failure the
+    // clamp exists to prevent.
+    if (gid >= pc.searchCount) return;
     uint64_t nonce = pc.baseNonce + uint64_t(gid);
     uint64_t hit[4];
     computeHit(nonce, hit);

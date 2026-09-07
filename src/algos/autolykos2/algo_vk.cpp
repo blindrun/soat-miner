@@ -5,15 +5,17 @@
 // amdgpu-pro or Mesa rusticl and is often simply absent. The workload is
 // memory-bandwidth bound, so the API makes no difference to throughput.
 //
-// The dataset is split across four storage buffers. Vulkan only guarantees
+// The dataset is split across sixteen storage buffers. Vulkan only guarantees
 // maxStorageBufferRange per binding - 4 GB - 1 even on a 24 GB RTX 4090 -
-// against a 7.27 GB dataset, so one binding cannot hold it.
+// against a 7.27 GB dataset, so one binding cannot hold it. Sixteen rather
+// than four is a capacity change and not a speed one; see prepare().
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -44,8 +46,15 @@ struct Push {
     uint64_t baseNonce;
     uint32_t N, height, chunkShift, mode;
     uint32_t buildFirst, buildCount, buildChunk, maxOut;
+    uint32_t searchCount;
 };
 static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128 bytes");
+// "Must match kernel.comp exactly" is only worth writing if something checks
+// it. searchCount is the field the shader bounds its thread index against, so
+// a silent disagreement here is nonces skipped or nonces mined outside the
+// range this miner owns.
+static_assert(offsetof(Push, searchCount) == 104,
+              "searchCount must sit where kernel.comp's push block puts it");
 
 #define VKCHECK(x)                                                     \
     do {                                                               \
@@ -99,7 +108,29 @@ class Autolykos2VK : public Algorithm {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "soat-miner";
-        app.apiVersion = VK_API_VERSION_1_2;
+        // 1.3 WHEN THE LOADER HAS IT.
+        //
+        // This asked for 1.2 and then used Vulkan 1.3 anyway:
+        // VkPhysicalDeviceVulkan13Features for subgroupSizeControl and
+        // computeFullSubgroups below, and a required-subgroup-size struct on
+        // the compute stage. An application may not use functionality above
+        // the version it declares, and the failure mode here is the quiet one
+        // - a driver is free to ignore a feature struct it was never told the
+        // application could use, which leaves SOAT_SUBGROUP accepted, printed,
+        // and doing nothing at all. The A/B test that flag exists for would
+        // then be comparing wave64 against wave64.
+        //
+        // Asking for a version the loader does not have is itself an error on
+        // a 1.0 loader, so ask what it has first. Below 1.2 is unusable here
+        // regardless: shaderInt8 and storageBuffer8BitAccess are 1.2 features
+        // and this kernel needs both.
+        loaderVersion_ = VK_API_VERSION_1_0;
+        auto enumVersion = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(
+            VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+        if (enumVersion && enumVersion(&loaderVersion_) != VK_SUCCESS)
+            loaderVersion_ = VK_API_VERSION_1_0;
+        app.apiVersion = (loaderVersion_ >= VK_API_VERSION_1_3) ? VK_API_VERSION_1_3
+                                                               : VK_API_VERSION_1_2;
 
         VkInstanceCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -111,10 +142,42 @@ class Autolykos2VK : public Algorithm {
         // algorithm and a silent divergence with two.
         if (!vkPickPhysicalDevice(inst_, requestedIndex, &phys_)) return false;
 
+        // maxMemoryAllocationSize is a SEPARATE limit from maxStorageBufferRange
+        // and on real hardware it is the smaller of the two: AMD's Windows
+        // driver reports 2 GiB against a maxStorageBufferRange of 4 GB - 1,
+        // where the same silicon under RADV reports about 4 GiB for both. Only
+        // the binding limit used to be read, so a chunk could be sized from a
+        // number that says nothing about whether the allocation can succeed.
+        VkPhysicalDeviceMaintenance3Properties m3{};
+        m3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
+        VkPhysicalDeviceProperties2 props2{};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &m3;
+        vkGetPhysicalDeviceProperties2(phys_, &props2);
+        maxAllocBytes_ = m3.maxMemoryAllocationSize;
+
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
         snprintf(devName_, sizeof(devName_), "%s", props.deviceName);
         maxStorageRange_ = props.limits.maxStorageBufferRange;
+        deviceApiVersion_ = props.apiVersion;
+        maxWorkGroups_ = props.limits.maxComputeWorkGroupCount[0];
+
+        // The dataset needs kMaxChunks bindings plus Out and Cnt, and Vulkan
+        // only GUARANTEES four storage buffers per stage. Every desktop driver
+        // reports orders of magnitude more - this device reports 4294967295 -
+        // but "every driver we tried" is not the same as the spec, and binding
+        // past the limit is undefined rather than slow. Say so plainly instead
+        // of finding out through a device that computes the wrong hits.
+        if (props.limits.maxPerStageDescriptorStorageBuffers < kBindings) {
+            fprintf(stderr,
+                    "this shader binds %u storage buffers in one stage - %u for "
+                    "the dataset, plus the output and the counter - and this "
+                    "device allows %u. Autolykos on Vulkan cannot run here.\n",
+                    kBindings, kMaxChunks,
+                    props.limits.maxPerStageDescriptorStorageBuffers);
+            return false;
+        }
         snprintf(driver_, sizeof(driver_), "Vulkan %u.%u.%u",
                  VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
                  VK_VERSION_PATCH(props.apiVersion));
@@ -155,11 +218,18 @@ class Autolykos2VK : public Algorithm {
         f12.shaderInt8 = VK_TRUE;
         f12.storageBuffer8BitAccess = VK_TRUE;
 
+        // Chained only when BOTH the instance and the device really are 1.3,
+        // so the feature is never requested on an instance that did not
+        // declare it. Recorded, because the pipeline must not then attach a
+        // required-subgroup-size struct the device was not told to support.
+        haveSubgroupControl_ = app.apiVersion >= VK_API_VERSION_1_3 &&
+                               deviceApiVersion_ >= VK_API_VERSION_1_3;
+
         VkPhysicalDeviceVulkan13Features f13{};
         f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
         f13.subgroupSizeControl = VK_TRUE;
         f13.computeFullSubgroups = VK_TRUE;
-        f12.pNext = &f13;
+        if (haveSubgroupControl_) f12.pNext = &f13;
 
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -229,11 +299,28 @@ class Autolykos2VK : public Algorithm {
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sgInfo{};
         const uint32_t wantSg = subgroupSizeOverride();
         if (wantSg == 32u || wantSg == 64u) {
-            sgInfo.sType =
-                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-            sgInfo.requiredSubgroupSize = wantSg;
-            stage.pNext = &sgInfo;
-            fprintf(stderr, "[vulkan] forcing subgroup size %u\n", wantSg);
+            if (!haveSubgroupControl_) {
+                // Say so rather than attach a struct whose feature was never
+                // enabled. Silently ignoring it is what made this knob
+                // untrustworthy in the first place.
+                // Name the side that is actually limiting. Printing only
+                // the device version says "this device is Vulkan 1.3 and
+                // subgroup size control needs 1.3" when it is the loader
+                // that is older, which is worse than saying nothing.
+                const bool loaderOld = loaderVersion_ < VK_API_VERSION_1_3;
+                const uint32_t lim = loaderOld ? loaderVersion_ : deviceApiVersion_;
+                fprintf(stderr,
+                        "[vulkan] SOAT_SUBGROUP=%u ignored: subgroup size "
+                        "control needs Vulkan 1.3 and the %s is %u.%u\n",
+                        wantSg, loaderOld ? "loader" : "device",
+                        VK_VERSION_MAJOR(lim), VK_VERSION_MINOR(lim));
+            } else {
+                sgInfo.sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+                sgInfo.requiredSubgroupSize = wantSg;
+                stage.pNext = &sgInfo;
+                fprintf(stderr, "[vulkan] forcing subgroup size %u\n", wantSg);
+            }
         }
 
         VkComputePipelineCreateInfo cpci{};
@@ -295,23 +382,63 @@ class Autolykos2VK : public Algorithm {
 
         // Power-of-two chunking so the shader can use shift+mask instead of an
         // integer division on every one of its 33 lookups per nonce.
-        uint32_t shift = 26;  // 2^26 elements = 2.15 GB, under the 4 GB limit
+        //
+        // SIXTEEN PIECES, WHICH IS A DEADLINE AND NOT A SPEED CHOICE.
+        // This used to start at shift 26 and bind four buffers, a ceiling of
+        // 8.59 GB. The dataset grows 5% every 51,200 blocks by consensus and
+        // reaches 8.84 GB at height 2,048,000 - from that block on, a
+        // four-buffer build refuses every job and this backend cannot mine
+        // Ergo at all. That is about 190,000 blocks out from the 7.27 GB the
+        // dataset stands at today. Sixteen pieces covers 17.18 GB and puts
+        // the limit back on how much the card can actually hold.
+        //
+        // The piece SIZE is not a throughput knob. It is capped at 1 GiB to
+        // stay clear of a 2 GiB maxMemoryAllocationSize, not because it is
+        // faster: 4 x 2 GiB, 7 x 1 GiB and 14 x 512 MiB all measure within
+        // 0.1% of each other on an RX 9070 XT. The 2 GiB read cliff the
+        // KawPow backend records for its DAG does not reproduce here.
+        uint32_t shift = kMaxChunkShift;
         while (((uint64_t)1 << shift) * 32ULL > (uint64_t)maxStorageRange_) shift--;
+        // Some drivers cap one allocation well below what they will bind.
+        while (maxAllocBytes_ && ((uint64_t)1 << shift) * 32ULL > maxAllocBytes_ &&
+               shift > kMinChunkShift)
+            shift--;
+        // Lets the split be varied without a rebuild, the way KawPow's
+        // SOAT_DAG_SHIFT does. It is how the paragraph above was measured.
+        if (const char *ov = getenv("SOAT_CHUNK_SHIFT")) {
+            const int v = atoi(ov);
+            // Clamped to the same two device limits the automatic path just
+            // applied. This is a knob for measuring the split, not a way to
+            // ask for a buffer the driver has already said it will not bind
+            // or allocate.
+            if (v >= (int)kMinChunkShift && v <= (int)kMaxChunkShift + 1) {
+                const uint64_t want = (uint64_t)1 << v;
+                if (want * 32ULL > (uint64_t)maxStorageRange_ ||
+                    (maxAllocBytes_ && want * 32ULL > maxAllocBytes_))
+                    fprintf(stderr,
+                            "SOAT_CHUNK_SHIFT=%d asks for a %.2f GB chunk, past "
+                            "this device's limits; ignoring\n",
+                            v, want * 32.0 / 1e9);
+                else
+                    shift = (uint32_t)v;
+            }
+        }
         const uint32_t elemsPerChunk = 1u << shift;
         uint32_t chunks = (uint32_t)((N + elemsPerChunk - 1) / elemsPerChunk);
         chunkShift_ = shift;
-        if (chunks > 4) {
+        if (chunks > kMaxChunks) {
             fprintf(stderr,
-                    "dataset needs %u buffers but the shader binds 4 "
-                    "(maxStorageBufferRange %.2f GB)\n",
-                    chunks, maxStorageRange_ / 1e9);
+                    "dataset needs %u buffers but the shader binds %u "
+                    "(maxStorageBufferRange %.2f GB, chunk %.2f GB)\n",
+                    chunks, kMaxChunks, maxStorageRange_ / 1e9,
+                    elemsPerChunk * 32.0 / 1e9);
             return false;
         }
 
         if (N != n_ || chunks != chunks_) {
             release();
             chunkElems_ = elemsPerChunk;
-            for (uint32_t c = 0; c < 4; c++) {
+            for (uint32_t c = 0; c < kMaxChunks; c++) {
                 const uint32_t count =
                     (c < chunks) ? ((c == chunks - 1) ? (N - c * chunkElems_)
                                                       : chunkElems_)
@@ -364,7 +491,40 @@ class Autolykos2VK : public Algorithm {
         p.mode = 1;
         p.baseNonce = nonceBase;
         p.maxOut = kMaxSolutions;
-        if (!dispatch(p, (uint32_t)(count / kLocalSize))) return false;
+        // Round UP, and tell the shader the real count so the spare threads
+        // in the final group return without hashing.
+        //
+        // This divided and truncated, so a count that was not a multiple of
+        // the workgroup size left up to kLocalSize-1 nonces unhashed while the
+        // caller still advanced its counter by the full count and credited all
+        // of it to the hashrate. --batch is rounded to a multiple of 256 when
+        // it is parsed, but run.cpp also clamps the last batch of a range to
+        // whatever is left of the extranonce prefix, and that value is
+        // arbitrary. Rounding up WITHOUT the shader-side bound would be worse
+        // than the gap it closes: it would hash past the end of the prefix we
+        // own and submit shares the pool rejects.
+        // searchCount is 32-bit because the shader's thread index is. A batch
+        // past that would wrap and bound the search at count mod 2^32, hashing
+        // a fraction of the range while the caller advanced its counter by all
+        // of it - the same silently-wrong accounting this bound exists to fix.
+        // Two ceilings, and the smaller wins: the shader's thread index is
+        // 32-bit, and the dispatch cannot ask for more workgroups than the
+        // device advertises. Quoting a number that clears one but not the
+        // other would only move the failure.
+        uint64_t maxBatch = UINT32_MAX;
+        if (maxWorkGroups_ && (uint64_t)maxWorkGroups_ * kLocalSize < maxBatch)
+            maxBatch = (uint64_t)maxWorkGroups_ * kLocalSize;
+        maxBatch &= ~UINT64_C(255);
+        if (count > maxBatch) {
+            fprintf(stderr,
+                    "batch of %llu nonces is more than this device can "
+                    "dispatch; use --batch %llu or less\n",
+                    (unsigned long long)count, (unsigned long long)maxBatch);
+            return false;
+        }
+        p.searchCount = (uint32_t)count;
+        if (!dispatch(p, (uint32_t)((count + kLocalSize - 1) / kLocalSize)))
+            return false;
 
         uint32_t found = *(uint32_t *)cnt_.mapped;
         if (found == 0) return true;
@@ -385,6 +545,7 @@ class Autolykos2VK : public Algorithm {
         Push p = pushFor(job);
         p.mode = 2;
         p.baseNonce = sol.nonce;
+        p.searchCount = 1;
         if (!const_cast<Autolykos2VK *>(this)->dispatch(p, 1)) return false;
 
         const uint64_t *raw = (const uint64_t *)out_.mapped;
@@ -397,7 +558,7 @@ class Autolykos2VK : public Algorithm {
     }
 
     void release() override {
-        for (int c = 0; c < 4; c++) destroyBuffer(&ds_[c]);
+        for (uint32_t c = 0; c < kMaxChunks; c++) destroyBuffer(&ds_[c]);
         n_ = 0;
         chunks_ = 0;
     }
@@ -420,7 +581,14 @@ class Autolykos2VK : public Algorithm {
 
    private:
     static const uint32_t kMaxSolutions = 32;
-    static const uint32_t kBindings = 6;
+    /** Dataset chunk bindings, then Out and Cnt. Must match kernel.comp. */
+    static const uint32_t kMaxChunks = 16;
+    static const uint32_t kBindings = kMaxChunks + 2;
+    /** 2^25 elements x 32 B = 1 GiB per piece. kMinChunkShift stops a device
+     *  with a small allocation limit shrinking the split until it needs more
+     *  than kMaxChunks pieces. */
+    static const uint32_t kMaxChunkShift = 25;
+    static const uint32_t kMinChunkShift = 20;
 
     Push pushFor(const Job &job) const {
         Push p{};
@@ -471,7 +639,7 @@ class Autolykos2VK : public Algorithm {
         // The Vulkan backend used to collapse as the dataset grew - on a 4090,
         // same code, only the height changing: 119 MH/s at 2.15 GB, 5.4 at
         // 3.86, 2.9 at 7.27, while CUDA stayed flat near 218 across all three.
-        // Two plausible causes were both wrong. It was not the four-way
+        // Two plausible causes were both wrong. It was not the (then four-way)
         // if/else that picks a chunk buffer on every gather: removing that
         // branch entirely changed nothing. It was not register spilling
         // either: an RTX 5080 with essentially no spilling (48 bytes, against
@@ -514,12 +682,14 @@ class Autolykos2VK : public Algorithm {
 
     void writeDescriptors() {
         VkDescriptorBufferInfo info[kBindings]{};
-        for (int c = 0; c < 4; c++) {
+        for (uint32_t c = 0; c < kMaxChunks; c++) {
             info[c].buffer = ds_[c].buf;
             info[c].range = VK_WHOLE_SIZE;
         }
-        info[4].buffer = out_.buf; info[4].range = VK_WHOLE_SIZE;
-        info[5].buffer = cnt_.buf; info[5].range = VK_WHOLE_SIZE;
+        info[kMaxChunks].buffer = out_.buf;
+        info[kMaxChunks].range = VK_WHOLE_SIZE;
+        info[kMaxChunks + 1].buffer = cnt_.buf;
+        info[kMaxChunks + 1].range = VK_WHOLE_SIZE;
 
         VkWriteDescriptorSet w[kBindings]{};
         for (uint32_t i = 0; i < kBindings; i++) {
@@ -587,9 +757,14 @@ class Autolykos2VK : public Algorithm {
     VkFence fence_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps_{};
 
-    Buffer ds_[4], out_, cnt_;
+    Buffer ds_[kMaxChunks], out_, cnt_;
     VkDeviceSize deviceLocalBytes_ = 0;
     double maxStorageRange_ = 0;
+    uint64_t maxAllocBytes_ = 0;
+    uint32_t deviceApiVersion_ = 0;
+    uint32_t maxWorkGroups_ = 0;
+    uint32_t loaderVersion_ = VK_API_VERSION_1_0;
+    bool haveSubgroupControl_ = false;
     char devName_[256] = {0};
     char driver_[64] = {0};
     uint32_t n_ = 0, chunks_ = 0, chunkElems_ = 0, chunkShift_ = 0, height_ = 0;

@@ -30,6 +30,19 @@ static BOOL WINAPI consoleHandler(DWORD type) {
 int main(int argc, char **argv) {
     using namespace om;
 
+    // UNBUFFER stderr, because on Windows it is not unbuffered by default the
+    // moment it stops being a console.
+    //
+    // Every diagnostic this miner prints goes to stderr - the Pearl self-check
+    // refusal, the KawPow slow-backend warning, the subgroup override notice.
+    // Redirect the miner to a log, which is exactly what `--plain` invites and
+    // what a service does, and the C runtime block-buffers stderr into a 4 KB
+    // buffer that is only flushed at exit. A miner that is killed, or that is
+    // still running while someone reads the log to find out what is wrong,
+    // shows none of it. The messages that matter most are the ones printed
+    // just before something goes wrong for a long time.
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     RunOptions opt;
     opt.backendLabel = "Vulkan";
     int deviceIndex = -1;

@@ -26,6 +26,12 @@ static BOOL WINAPI consoleHandler(DWORD type) {
 #endif
 
 int main(int argc, char **argv) {
+    // Same reason as the Vulkan main: on Windows the C runtime block-buffers
+    // stderr the moment it is not a console, so every diagnostic this binary
+    // prints vanishes into a buffer flushed at exit whenever it is redirected
+    // to a log - which is what --plain invites and what a service does.
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     using namespace om;
 
     std::string algoName = "autolykos2";
